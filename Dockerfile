@@ -7,7 +7,7 @@
 # CUDA_ARCHITECTURES: 86 = RTX 30, 89 = RTX 40, 120 = RTX 50 (the last one also gets PTX). BUILD_JOBS: each nvcc job
 # can take several GB of RAM; raise it when the machine has the memory free.
 #
-# The compile flags are upstream's (its root Dockerfile, "engine-build" stage). vendor/ comes from ./extract.sh.
+# The compile flags are upstream's (its root Dockerfile, "engine-build" stage). vendor/ comes from scripts/extract.sh.
 # The engine stage copies only the engine's sources, so a change to the server, the tools or launch.py does not
 # recompile it; and ccache (a BuildKit cache mount) keeps object files between builds, so a new upstream release
 # recompiles only the sources that changed.

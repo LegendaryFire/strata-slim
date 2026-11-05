@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Take one upstream Strata release into vendor/: only the paths in manifest.txt.
 #
-#   ./extract.sh v0.2.10                         # from the cached mirror in .upstream/ (cloned on first use)
-#   UPSTREAM_GIT=/srv/llm/strata/repo ./extract.sh v0.2.10    # from a clone you already have (no download)
+#   ./scripts/extract.sh v0.2.10                         # from the cached mirror in .upstream/ (cloned on first use)
+#   UPSTREAM_GIT=/srv/llm/strata/repo ./scripts/extract.sh v0.2.10    # from a clone you already have (no download)
 #
 # vendor/ is replaced as a whole, so `git diff vendor/` afterwards shows exactly what upstream changed in the
 # parts this image uses. Nothing is built here; docker build is next.
 set -euo pipefail
 
-here=$(cd "$(dirname "$0")" && pwd)
+here=$(cd "$(dirname "$0")/.." && pwd)     # the project root: manifest.txt, vendor/, .upstream/
 cd "$here"
 
 tag=${1:-}
