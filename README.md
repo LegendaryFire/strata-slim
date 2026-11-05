@@ -8,155 +8,66 @@
 <h3 align="center">Run powerful AI on your own computer.</h3>
 <p align="center">Chat, code and work with images, locally.</p>
 
-**strata-slim** is the Strata engine and its API server in a Docker image, built from upstream [Niko1221/Strata](https://github.com/Niko1221/Strata) with
-everything else left out: no desktop app, Terminal/TUI, harness, setup, benchmarks, docs or tests. The run config is
-built from environment variables on every start.
+**strata-slim** is [Strata](https://github.com/Niko1221/Strata), the real one, built straight from its releases, with
+everything a server doesn't need left on the cutting room floor. No desktop app, no installer, no terminal UI, no
+benchmark suites, no test farm. Just the engine, the API server and the tools that get a model ready, packed into a
+Docker image and nothing else.
 
-| | upstream repo | vendor/ |
-|---|---|---|
-| files | ~6,000 | ~880 |
-| size | 100 MB | 23 MB |
+It's made for containers. Every setting lives in one `.env` file, and every start builds the config fresh from it, so
+what you see in that file is exactly what runs: no presets, no leftover state, no clicking through setup. Pick NVIDIA
+or AMD, name a model, run `docker compose up -d`, and it downloads, checks, packs and serves it on its own.
 
-`vendor/UPSTREAM` says which tag and commit `vendor/` is.
+## Docker Compose
 
-## Quick start (Docker Compose)
-
-    cp example.env .env        # pick nvidia or amd, your card and a models folder
-    docker compose build
-    docker compose up -d && docker compose logs -f
-
-Step by step: [docs/docker-compose.md](docs/docker-compose.md).
-
-## Layout
-
-| file | what it is |
-|---|---|
-| `manifest.txt` | the upstream paths taken (everything else stays out) |
-| `scripts/extract.sh` | upstream tag → `vendor/` |
-| `launch.py` | the entrypoint: env vars → run config → `serve.server` |
-| `prepare.py` | download the model, build the pack and the MTP layer (whatever is missing) |
-| `hf.py` | Hugging Face: list files at a commit, verified resumable downloads |
-| `common.py` | what launch.py and prepare.py share (variables, messages, finding model files) |
-| `Dockerfile` | NVIDIA: stage 1 compiles the engine (upstream's flags); stage 2 is CUDA runtime + Python + server |
-| `Dockerfile.rocm` | AMD Radeon (RDNA): the same with the HIP backend; stage 2 is plain Ubuntu + the ROCm libraries the engine loads |
-| `compose.yaml` | Docker Compose: an `nvidia` and an `amd` service, settings from `.env` |
-| `example.env` | the settings file to copy to `.env` |
-| `docs/docker-compose.md` | how to run it with Compose |
-| `vendor/` | the extracted source (committed, so a diff between versions is a `git diff`) |
-
-## A new upstream release
-
-    ./scripts/extract.sh v0.2.11  # vendor/ replaced; fails if a manifest entry no longer exists
-    git diff --stat vendor/       # what changed in the parts you use
-    docker build -t strata-slim:0.2.11 .   # installs upstream's requirements.txt; checks the server starts
-    docker build -f Dockerfile.rocm -t strata-slim:0.2.11-rocm .     # if you build the AMD image
-    git add -A && git commit -m "Upstream v0.2.11"
-
-Roll back: start the previous image tag (images stay until you remove them), or `git checkout` the earlier commit and
-build it again.
-
-`./scripts/extract.sh` keeps a bare clone of upstream in `.upstream/` (git-ignored). `UPSTREAM_GIT=/path/to/clone` uses a clone
-you already have instead.
-
-The compile flags in `Dockerfile` and `Dockerfile.rocm` are copied by hand from upstream's own build files (its root
-`Dockerfile` and `packaging/build_hip_linux.sh`), so nothing checks them: look at upstream's diff of those two files
-on each release.
-
-## AMD Radeon (RDNA)
-
-`Dockerfile.rocm` builds the HIP engine, upstream's backend for wave32 RDNA cards:
-
-    docker build -f Dockerfile.rocm -t strata-slim:0.2.10-rocm .
-    docker build -f Dockerfile.rocm -t strata-slim:0.2.10-rocm --build-arg HIP_ARCHITECTURES=gfx1201 .   # one card: faster
-
-| `HIP_ARCHITECTURES` | cards | upstream's status |
-|---|---|---|
-| gfx1100 | RX 7900 XT / XTX | tested by the maintainers |
-| gfx1201 | RX 9070 / 9070 XT, Radeon AI PRO R9700 | tested by the maintainers |
-| gfx1101 | RX 7800 XT / 7700 XT | validated by owners |
-| gfx1200 | RX 9060 XT | validated by owners |
-| gfx1102 | RX 7600 | reported working |
-| gfx1030, gfx1031 | RX 6800 / 6900, RX 6700 XT (RDNA2) | builds, not run on a card by upstream |
-
-The default is the first five (RDNA3 and RDNA4). Every architecture is compiled into every kernel, so naming only
-yours cuts the build time. An engine on a card it has no code for stops at start with a message naming what it has.
-The older Instinct MI50 / Radeon VII (gfx906) is a separate upstream backend and is not built here.
-
-The build image is `rocm/dev-ubuntu-24.04:7.14.1-full` (`--build-arg ROCM_IMAGE=` for another). The runtime image is
-plain Ubuntu: upstream's `packaging/collect_libs.py` copies every ROCm library the engine and picture readers load,
-and the rocBLAS / hipBLASLt kernel data for the built architectures only, into `/opt/strata/engine`. The host needs
-the kernel's amdgpu driver and nothing from ROCm.
-
-Run it with the AMD devices instead of `--gpus` (Compose: `devices:`):
-
-    docker run --device /dev/kfd --device /dev/dri --env-file x.env -v ... strata-slim:0.2.10-rocm
-
-What differs from the NVIDIA image (`launch.py` reads `engine/BUILD.json` and does it):
-
-- the config gets `"backend": "hip"`, so the server sets `HIP_VISIBLE_DEVICES` instead of `CUDA_VISIBLE_DEVICES`
-- `GPUS` are HIP's numbers (the KFD order). Unset, the server asks `strata-device --list-devices` and takes a card the
-  engine has code for, skipping integrated chips
-- `VISION=gpu` runs `strata-vision-hip`, and the server falls back to the CPU reader when it does not start
-- the Monitor's card readings come from the amdgpu sysfs files (no ROCm tool needed)
-- hipBLASLt tuning tables (`STRATA_HIPBLASLT_TABLE`) are not shipped; upstream leaves them off on these cards anyway
-
-## Model prep: download, pack, MTP
-
-On a start, `prepare.py` makes whatever is missing, then the server starts (`PREPARE=off` skips it; the `prepare`
-command does only this and exits, no GPU needed):
-
-1. **Download:** `MODEL_REPO` + `MODEL_QUANT` (a missing or wrong one lists the repository's quantizations with
-   their sizes) go into the `MODEL_GGUF` folder. With `VISION` on, the mmproj comes from `MMPROJ_REPO` (default
-   `MODEL_REPO`), chosen by itself when the repository has one (`MMPROJ` otherwise), and is saved beside the
-   model folder. Each file is checked against the size and SHA-256 Hugging Face publishes, resumes where it stopped,
-   and gets a `.done` mark (the mark upstream's setup writes, so its downloads count as done).
-
-   The first download writes `.source.json` into the model folder: the commit and every file's SHA-256. From then on
-   that folder is that version, even when the repository replaces its files (Unsloth did for Qwen3.8-Flash-Next), and
-   a start with all files present needs no network. A newer version goes into a new folder with a new pack. A folder
-   downloaded earlier without a record is adopted: the commit whose files match its `.done` marks is found and recorded.
-2. **Pack:** `tools/iq_pack.py` with `PACK_ARGS` (`--compat-bf16` for Unsloth's UD-* files).
-3. **MTP draft layer** (when `MTP` is set and `$MTP/experts.bin` is missing): `tools/mtp_fetch.py` fetches the 31 MTP
-   tensors (~5 GB) of the Qwen3.8-Flash-Next checkpoint, `mtp_pack.py` (`MTP_EXPERTS`, default q2_0) and `mtp_rt.py`
-   build the runtime files, and `DRAFT_VOCAB` (cjk, en, cyrillic, fr) picks the draft token subset.
-
-4. **DFlash2 drafter** (`DRAFTER=dflash2` or `auto`): upstream's own `strata_control/drafting_fetch.py` downloads the
-   pinned `incoai/Qwen3.8-Flash-Next-DFlash2` files (1.2 GB), checks them, packs them to Q4_0 (0.5 GB, checked against
-   the exact bytes upstream measured) into `<models>/dflash2/`, with the draft vocabulary beside it.
-
-The MTP fetch and DFlash2 are specific to Qwen3.8-Flash-Next (upstream pins both).
-
-### Which drafter
-
-`DRAFTER` (`mtp` by default, `dflash2`, `auto`, `off`) is written to the config as `drafting`, and the server turns it
-into engine flags at each start: for DFlash2 it drops `--mtp` and adds `--draft dflash2 --spec 6 --draft-conf ...`
-(upstream's tuned values; a `--spec` in `ENGINE_ARGS` is replaced by DFlash2's window). It is always written: left
-unset, the server's default `auto` would switch to DFlash2 by itself as soon as its files exist. DFlash2 runs one
-request at a time (a start with `--parallel` falls back to MTP) and, per upstream's tests, is slower than MTP on RTX 30
-cards (sm_86). With `DRAFTER=dflash2` the MTP layer is not built or used.
-
-## Configuration
-
-Every start writes `/data/run/config.json` fresh from the environment; nothing from an earlier start is reused.
-`docker run --rm --env-file x.env -v ... strata-slim:0.2.10 print-config` shows the config without starting
-anything (no GPU needed). Every variable, with its default, is in [`example.env`](example.env).
-
-## Volumes
-
-The image reads model files from wherever you mount them, and writes only to `/data` (the generated config,
-logs). `compose.yaml` mounts one folder at `/models` (`MODELS_PATH`); separate mounts work too:
+`docker-compose.yml`:
 
 ```yaml
-volumes:
-  - ./strata/data-slim:/data
-  - /mnt/models/strata/models:/models/models:ro
-  - /mnt/models/strata-slim/packs:/models/packs
-  - /mnt/models/strata-slim/mtp:/models/mtp
+services:
+  strata-slim:
+    image: strata-slim:0.2.10
+    build:
+      context: https://github.com/LegendaryFire/strata-slim.git
+      args:
+        CUDA_ARCHITECTURES: "86"        # 86 = RTX 30, 89 = RTX 40, 120 = RTX 50
+    env_file: strata-slim.env
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./models:/models
+      - ./data:/data
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 ```
 
-## What it does not do
+`strata-slim.env`:
 
-- Pick a model for your hardware, or know model families: you name the repository, the files and the pack flags.
-- Other pack paths of upstream's setup: the Q2_0 AVX-512 repack (`strata_pack.py`), NVFP4 and DeepSeek packs. Add the
-  tool to `manifest.txt` and a step to `prepare.py` if you need one.
-- Tuning (`TUNE` / calibrate), which is part of upstream's setup.
+```ini
+MODEL_REPO=unsloth/Qwen3.8-Flash-Next-GGUF
+MODEL_QUANT=UD-Q4_K_XL
+PACK_ARGS=--compat-bf16
+DRAFTER=mtp
+
+CONTEXT=64k
+KV=int8
+GPUS=0
+
+VISION=off
+API_KEY=change-me
+```
+
+Then:
+
+```sh
+docker compose up -d --build
+docker compose logs -f
+```
+
+The first start downloads and prepares the model (well over 100 GB), then the API is at `http://localhost:8080/v1`.
+Every setting is in [`example.env`](example.env); AMD cards, network access and troubleshooting are in
+[docs/docker-compose.md](docs/docker-compose.md).
