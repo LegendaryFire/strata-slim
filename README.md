@@ -122,7 +122,7 @@ GPUS=0
 VISION=off
 
 # Repository providing the mmproj file. Default: MODEL_REPO.
-# MMPROJ_REPO=ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF
+MMPROJ_REPO=ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF
 
 # CPU threads for VISION=cpu.
 # VISION_THREADS=8
