@@ -1,0 +1,6 @@
+.git
+.upstream
+vendor.new
+patches
+**/__pycache__
+*.md

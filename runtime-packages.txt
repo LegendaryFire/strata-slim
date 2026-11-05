@@ -1,0 +1,18 @@
+# Python packages the server image installs. Names only: extract.sh takes each one's pinned version
+# from upstream's requirements.txt, so the pins move with upstream. ./check.py lists what the server
+# imports that is not in the standard library, so you can tell when this list needs another name.
+numpy
+jinja2
+markupsafe
+regex
+pillow
+psutil
+certifi
+truststore
+# llama.cpp's gguf-py (the pack and MTP tools read and write GGUF through it)
+pyyaml
+tqdm
+requests
+charset-normalizer
+idna
+urllib3

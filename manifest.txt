@@ -1,0 +1,51 @@
+# What strata-slim takes from upstream Strata (https://github.com/Niko1221/Strata).
+#
+# One git pathspec per line, relative to the upstream repo root. A trailing "/" takes the folder.
+# A line starting with "!" excludes. Everything not listed stays out (apps/, bench/, docs/, tests/,
+# the Terminal/TUI, setup.py, SYCL, Metal, ...).
+#
+# After editing: ./extract.sh <tag> and ./check.py tell you if anything the server needs went missing.
+
+# ---- engine (C++/CUDA) ----------------------------------------------------------------------------
+CMakeLists.txt
+cmake/
+include/
+src/
+third_party/
+LICENSE
+requirements-build.txt
+# picture reader (strata-vision): built against the same pinned llama.cpp
+tools/vision/
+# single files the top-level CMakeLists names outside src/ (configure fails without them, even
+# though only the `strata` and `strata_kq` targets are built)
+tools/trellis/tqenc.cpp
+bench/gdn_chunk_bench.cpp
+bench/qsa_prompt_attn_sm70_bench.cpp
+bench/gfx906_qsa_query_swizzle_probe.cpp
+# two test programs CMakeLists adds outside its "tests/ present" check (v0.2.10)
+tests/core/dma_batch_parity.cu
+tests/cuda/hc_q8_stream_test.cu
+
+# ---- server (OpenAI / Anthropic API + web page) ---------------------------------------------------
+serve/
+!serve/test_*.py
+!serve/fixtures/
+!serve/mcp_fake_server.py
+strata_control/
+!strata_control/test_*.py
+strata_cli/__init__.py
+strata_cli/client.py
+tools/strata_tokenizer.py
+requirements.txt
+
+# ---- model prep (prepare.py): the pack and the MTP draft layer ------------------------------------
+tools/iq_pack.py
+tools/mtp_fetch.py
+tools/mtp_pack.py
+tools/mtp_rt.py
+tools/gguf_reader.py
+tools/_paths.py
+# the DFlash2 drafter (strata_control/drafting_fetch.py loads it to pack the download)
+tools/dflash2_pack.py
+# expert profiles and draft vocabularies the engine args point at (--expert-profile, ...)
+data/

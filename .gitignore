@@ -1,0 +1,4 @@
+# cached bare clone of upstream (extract.sh)
+.upstream/
+vendor.new/
+__pycache__/
