@@ -24,8 +24,7 @@ Step by step: [docs/docker-compose.md](docs/docker-compose.md).
 | file | what it is |
 |---|---|
 | `manifest.txt` | the upstream paths taken (everything else stays out) |
-| `extract.sh` | upstream tag → `vendor/`, then `patches/` on top |
-| `patches/` | your own changes to upstream code, reapplied on every extract |
+| `extract.sh` | upstream tag → `vendor/` |
 | `launch.py` | the entrypoint: env vars → run config → `serve.server` |
 | `prepare.py` | download the model, build the pack and the MTP layer (whatever is missing) |
 | `hf.py` | Hugging Face: list files at a commit, verified resumable downloads |
@@ -39,7 +38,7 @@ Step by step: [docs/docker-compose.md](docs/docker-compose.md).
 
 ## A new upstream release
 
-    ./extract.sh v0.2.11          # vendor/ replaced; fails if a manifest entry or a patch no longer fits
+    ./extract.sh v0.2.11          # vendor/ replaced; fails if a manifest entry no longer exists
     git diff --stat vendor/       # what changed in the parts you use
     docker build -t strata-slim:0.2.11 .   # installs upstream's requirements.txt; checks the server starts
     docker build -f Dockerfile.rocm -t strata-slim:0.2.11-rocm .     # if you build the AMD image

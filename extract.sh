@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Take one upstream Strata release into vendor/: only the paths in manifest.txt, then patches/*.patch on top.
+# Take one upstream Strata release into vendor/: only the paths in manifest.txt.
 #
 #   ./extract.sh v0.2.10                         # from the cached mirror in .upstream/ (cloned on first use)
 #   UPSTREAM_GIT=/srv/llm/strata/repo ./extract.sh v0.2.10    # from a clone you already have (no download)
@@ -54,17 +54,6 @@ done
 new=$here/vendor.new
 rm -rf "$new"; mkdir -p "$new"
 git -C "$src" archive --format=tar "$commit" -- "${specs[@]}" | tar -x -C "$new"
-
-# patches/*.patch, in name order, made against the upstream tree (git diff / git format-patch -p1)
-shopt -s nullglob
-for p in patches/*.patch; do
-  echo "[extract] applying $p"
-  if ! git apply --directory=vendor.new -p1 --whitespace=nowarn "$p"; then
-    echo "[extract] $p does not apply to $tag. Port it, or move it out of patches/ to skip it." >&2
-    rm -rf "$new"; exit 1
-  fi
-done
-shopt -u nullglob
 
 # the config keys the server reads (cfg.get("key") / cfg["key"] in serve/): launch.py warns about a CONFIG_<KEY> not among them
 grep -rhoE 'cfg(\.get\(|\[)"[a-z_][a-z0-9_]*"' "$new"/serve/*.py | sed -E 's/.*"(.*)"/\1/' | LC_ALL=C sort -u > "$new/.config-keys"
