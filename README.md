@@ -19,16 +19,15 @@ or AMD, name a model, run `docker compose up -d`, and it downloads, checks, pack
 
 ## Docker Compose
 
+Images are published for NVIDIA (`cuda`: RTX 30, 40 and 50) and AMD (`rocm`: RX 7000 and 9000). Each release is
+also tagged with its version, such as `0.2.10-1-cuda`, for pinning.
+
 `docker-compose.yml`:
 
 ```yaml
 services:
   strata-slim:
-    image: strata-slim:0.2.10
-    build:
-      context: https://github.com/LegendaryFire/strata-slim.git
-      args:
-        CUDA_ARCHITECTURES: "86"        # 86 = RTX 30, 89 = RTX 40, 120 = RTX 50
+    image: ghcr.io/legendaryfire/strata-slim:cuda
     env_file: strata-slim.env
     ports:
       - "127.0.0.1:8080:8080"
@@ -43,6 +42,15 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+```
+
+On AMD, use the `rocm` image and pass the GPU devices instead of the `deploy` section:
+
+```yaml
+    image: ghcr.io/legendaryfire/strata-slim:rocm
+    devices:
+      - /dev/kfd
+      - /dev/dri
 ```
 
 `strata-slim.env`:
@@ -136,13 +144,13 @@ API_KEY=change-me
 Then:
 
 ```sh
-docker compose up -d --build
+docker compose up -d
 docker compose logs -f
 ```
 
 The first start downloads and prepares the model (well over 100 GB), then the API is at `http://localhost:8080/v1`.
-Every setting is in [`example.env`](example.env); AMD cards, network access and troubleshooting are in
-[docs/docker-compose.md](docs/docker-compose.md).
+Every setting is in [`example.env`](example.env); network access, troubleshooting and building the images yourself are
+in [docs/docker-compose.md](docs/docker-compose.md).
 
 ## Common settings
 
