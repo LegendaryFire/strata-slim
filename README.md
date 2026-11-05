@@ -173,3 +173,7 @@ in [docs/docker-compose.md](docs/docker-compose.md).
 | `MODEL_NAME` | the name `/v1/models` lists | from the file name |
 | `PREPARE` | `auto`, `off` | `auto` |
 | `ENGINE_ARGS` | any other engine flags, e.g. `--spec 4 --expert-cache auto` | none |
+
+## License
+
+[MIT](LICENSE). The upstream Strata source in `vendor/` keeps its own [MIT license](vendor/LICENSE).
