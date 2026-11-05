@@ -1,6 +1,14 @@
-# strata-slim
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/media/strata-lockup-dark.svg">
+    <img src="docs/media/strata-lockup-light.svg" alt="Strata" width="340">
+  </picture>
+</p>
 
-The Strata engine and its API server, built from upstream [Niko1221/Strata](https://github.com/Niko1221/Strata) with
+<h3 align="center">Run powerful AI on your own computer.</h3>
+<p align="center">Chat, code and work with images, locally.</p>
+
+**strata-slim** is the Strata engine and its API server in a Docker image, built from upstream [Niko1221/Strata](https://github.com/Niko1221/Strata) with
 everything else left out: no desktop app, Terminal/TUI, harness, setup, benchmarks, docs or tests. The run config is
 built from environment variables on every start.
 
