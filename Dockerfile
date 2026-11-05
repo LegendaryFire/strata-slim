@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1
 # strata-slim: the Strata engine, its API server and model prep (download, pack, MTP), nothing else.
 #
-#   docker build -t strata-slim:0.2.10 .                                     # RTX 30 (sm_86), 4 compile jobs
-#   docker build -t strata-slim:0.2.10 --build-arg CUDA_ARCHITECTURES="86;89" --build-arg BUILD_JOBS=8 .
+#   docker build -t strata-slim:0.2.11 .                                     # RTX 30 (sm_86), 4 compile jobs
+#   docker build -t strata-slim:0.2.11 --build-arg CUDA_ARCHITECTURES="86;89" --build-arg BUILD_JOBS=8 .
 #
 # CUDA_ARCHITECTURES: 86 = RTX 30, 89 = RTX 40, 120 = RTX 50 (the last one also gets PTX). BUILD_JOBS: each nvcc job
 # can take several GB of RAM; raise it when the machine has the memory free.

@@ -23,7 +23,7 @@ services:
   strata-nvidia:
     <<: *strata
     profiles: [nvidia]
-    image: "strata-slim:${STRATA_TAG:-0.2.10}"
+    image: "strata-slim:${STRATA_TAG:-0.2.11}"
     build:
       context: .
       dockerfile: Dockerfile
@@ -41,7 +41,7 @@ services:
   strata-amd:
     <<: *strata
     profiles: [amd]
-    image: "strata-slim:${STRATA_TAG:-0.2.10}-rocm"
+    image: "strata-slim:${STRATA_TAG:-0.2.11}-rocm"
     build:
       context: .
       dockerfile: Dockerfile.rocm
