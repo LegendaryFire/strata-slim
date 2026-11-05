@@ -24,7 +24,8 @@ built from environment variables on every start.
 | `prepare.py` | download the model, build the pack and the MTP layer (whatever is missing) |
 | `hf.py` | Hugging Face: list files at a commit, verified resumable downloads |
 | `common.py` | what launch.py and prepare.py share (variables, messages, finding model files) |
-| `Dockerfile` | stage 1 compiles the engine (upstream's flags); stage 2 is CUDA runtime + Python + server |
+| `Dockerfile` | NVIDIA: stage 1 compiles the engine (upstream's flags); stage 2 is CUDA runtime + Python + server |
+| `Dockerfile.rocm` | AMD Radeon (RDNA): the same with the HIP backend; stage 2 is plain Ubuntu + the ROCm libraries the engine loads |
 | `example.env` | a full env file |
 | `vendor/` | the extracted source (committed, so a diff between versions is a `git diff`) |
 
@@ -34,6 +35,7 @@ built from environment variables on every start.
     ./check.py                    # fails if the server now imports something vendor/ lacks
     git diff --stat vendor/       # what changed in the parts you use
     docker build -t strata-slim:0.2.11 .
+    docker build -f Dockerfile.rocm -t strata-slim:0.2.11-rocm .     # if you build the AMD image
     git add -A && git commit -m "Upstream v0.2.11"
 
 Roll back: start the previous image tag (images stay until you remove them), or `git checkout` the earlier commit and
@@ -41,6 +43,48 @@ build it again.
 
 `./extract.sh` keeps a bare clone of upstream in `.upstream/` (git-ignored). `UPSTREAM_GIT=/path/to/clone` uses a clone
 you already have instead.
+
+The compile flags in `Dockerfile` and `Dockerfile.rocm` are copied by hand from upstream's own build files (its root
+`Dockerfile` and `packaging/build_hip_linux.sh`), so nothing checks them: look at upstream's diff of those two files
+on each release.
+
+## AMD Radeon (RDNA)
+
+`Dockerfile.rocm` builds the HIP engine, upstream's backend for wave32 RDNA cards:
+
+    docker build -f Dockerfile.rocm -t strata-slim:0.2.10-rocm .
+    docker build -f Dockerfile.rocm -t strata-slim:0.2.10-rocm --build-arg HIP_ARCHITECTURES=gfx1201 .   # one card: faster
+
+| `HIP_ARCHITECTURES` | cards | upstream's status |
+|---|---|---|
+| gfx1100 | RX 7900 XT / XTX | tested by the maintainers |
+| gfx1201 | RX 9070 / 9070 XT, Radeon AI PRO R9700 | tested by the maintainers |
+| gfx1101 | RX 7800 XT / 7700 XT | validated by owners |
+| gfx1200 | RX 9060 XT | validated by owners |
+| gfx1102 | RX 7600 | reported working |
+| gfx1030, gfx1031 | RX 6800 / 6900, RX 6700 XT (RDNA2) | builds, not run on a card by upstream |
+
+The default is the first five (RDNA3 and RDNA4). Every architecture is compiled into every kernel, so naming only
+yours cuts the build time. An engine on a card it has no code for stops at start with a message naming what it has.
+The older Instinct MI50 / Radeon VII (gfx906) is a separate upstream backend and is not built here.
+
+The build image is `rocm/dev-ubuntu-24.04:7.14.1-full` (`--build-arg ROCM_IMAGE=` for another). The runtime image is
+plain Ubuntu: upstream's `packaging/collect_libs.py` copies every ROCm library the engine and picture readers load,
+and the rocBLAS / hipBLASLt kernel data for the built architectures only, into `/opt/strata/engine`. The host needs
+the kernel's amdgpu driver and nothing from ROCm.
+
+Run it with the AMD devices instead of `--gpus` (Compose: `devices:`):
+
+    docker run --device /dev/kfd --device /dev/dri --env-file x.env -v ... strata-slim:0.2.10-rocm
+
+What differs from the NVIDIA image (`launch.py` reads `engine/BUILD.json` and does it):
+
+- the config gets `"backend": "hip"`, so the server sets `HIP_VISIBLE_DEVICES` instead of `CUDA_VISIBLE_DEVICES`
+- `GPUS` are HIP's numbers (the KFD order). Unset, the server asks `strata-device --list-devices` and takes a card the
+  engine has code for, skipping integrated chips
+- `VISION=gpu` runs `strata-vision-hip`, and the server falls back to the CPU reader when it does not start
+- the Monitor's card readings come from the amdgpu sysfs files (no ROCm tool needed)
+- hipBLASLt tuning tables (`STRATA_HIPBLASLT_TABLE`) are not shipped; upstream leaves them off on these cards anyway
 
 ## Model prep: download, pack, MTP
 

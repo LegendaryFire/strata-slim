@@ -26,9 +26,10 @@ Variables (the download, pack and MTP ones are in prepare.py):
     ENGINE_ARGS       every other engine flag, as on a command line: --spec 4 --expert-cache auto
     STRATA_*, FNX_*, DS4_*   engine switches: they reach the engine unchanged (the container's environment)
   GPUs
-    GPUS              0,1: the cards (as nvidia-smi numbers them inside the container)
+    GPUS              0,1: the cards (NVIDIA: as nvidia-smi numbers them inside the container; AMD: as HIP numbers
+                      them, the KFD order). Unset on AMD: the engine picks a card it has code for (strata-device)
   pictures
-    VISION            off (default), cpu or gpu
+    VISION            off (default), cpu or gpu (AMD: strata-vision-hip, with the CPU reader to fall back on)
     MMPROJ            the mmproj GGUF. Default: the one mmproj*.gguf in or beside the model folder
     VISION_THREADS    CPU threads for VISION=cpu
     VISION_MAX_TOKENS tokens per picture
@@ -60,6 +61,18 @@ import prepare
 from common import ROOT, ModelPaths, drafter, env, fail, first_shard, mmproj_near, model_paths, say, vision_on
 
 ENGINE = ROOT / "engine"
+
+
+def engine_backend() -> str:
+    """The engine's GPU backend, from the build record the Dockerfile writes beside it: "cuda" (./Dockerfile; also when
+    there is no record) or "hip" (Dockerfile.rocm)."""
+    try:
+        return str(json.loads((ENGINE / "BUILD.json").read_text(encoding="utf-8")).get("backend") or "cuda")
+    except (OSError, ValueError, AttributeError):
+        return "cuda"
+
+
+BACKEND = engine_backend()
 SECRET_KEYS = {"api_key"}
 # engine flags that have a variable of their own, so ENGINE_ARGS must not set them a second time
 FLAGS_WITH_A_VARIABLE = ("--pack", "--native", "--expert-profile", "--mtp", "--max-context", "--kv",
@@ -118,10 +131,17 @@ def engine_args(model: Path, paths: ModelPaths) -> list[str]:
 
 
 def vision_section(model: Path, mmproj: Path) -> dict:
-    section = {"exe": str(must_exist("vision reader", ENGINE / "strata-vision", "file")),
+    gpu = env("VISION", "").lower() == "gpu"
+    cpu_reader = must_exist("vision reader", ENGINE / "strata-vision", "file")
+    # NVIDIA: one program reads on the GPU or, without --gpu, the CPU. AMD: the GPU reader is its own program
+    # (strata-vision-hip), and the server falls back to the CPU one (cpu_exe) when it does not start.
+    exe = must_exist("vision reader", ENGINE / "strata-vision-hip", "file") if gpu and BACKEND == "hip" else cpu_reader
+    section = {"exe": str(exe),
                "mmproj": str(must_exist("MMPROJ", mmproj, "file")),
                "model": str(model),
-               "gpu": env("VISION", "").lower() == "gpu"}
+               "gpu": gpu}
+    if exe != cpu_reader:
+        section["cpu_exe"] = str(cpu_reader)
     if (threads := env("VISION_THREADS")):
         section["threads"] = int(threads)
     if (tokens := env("VISION_MAX_TOKENS")):
@@ -160,6 +180,8 @@ def build_config(paths: ModelPaths, model: Path, mmproj: Path | None) -> dict:
         "log": env("LOG_FILE") or "/data/logs/engine.log",
         "lib_dirs": [],
     }
+    if BACKEND != "cuda":
+        cfg["backend"] = BACKEND     # the server's default is NVIDIA: "hip" makes it number cards for HIP (HIP_VISIBLE_DEVICES)
     if (gpus := env("GPUS")):
         try:
             cfg["gpu"] = [int(g) for g in gpus.replace(" ", "").split(",")]

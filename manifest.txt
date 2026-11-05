@@ -25,6 +25,29 @@ bench/gfx906_qsa_query_swizzle_probe.cpp
 # two test programs CMakeLists adds outside its "tests/ present" check (v0.2.10)
 tests/core/dma_batch_parity.cu
 tests/cuda/hc_q8_stream_test.cu
+# the HIP build (Dockerfile.rocm) adds these tests and tuning tools outside the "tests/ present" check too (v0.2.10);
+# configure needs them to exist, only `strata` and `strata-device` are built
+tests/cuda/pa_bench.cpp
+tests/cuda/prefill_fused_iq_test.cpp
+tests/cuda/prefill_fused_moe_test.cpp
+tests/hip/expert_cache_staging.cpp
+tests/hip/gdn_chunked.cpp
+tests/hip/gdn_rec_head.cpp
+tests/hip/gdn_stage_bench.cpp
+tests/hip/gemm_f16_io_parity.cpp
+tests/hip/ple_iq4.cpp
+tests/hip/prefill_gemm.cpp
+tests/hip/prefill_gr_write_bench.cpp
+tests/hip/prefill_hcd_exact_parity.cpp
+tests/hip/prefill_mmq_parity.cpp
+tests/hip/prefill_rocblas_gemm.cpp
+tests/hip/prefill_wmma_gemm_parity.cpp
+tests/hip/q2_zero.cpp
+tests/hip/router_fast.cpp
+tools/hip/tune_hipblaslt.cpp
+tools/hip/tune_rocblas.cpp
+# the AMD image (Dockerfile.rocm): upstream's own collector of the ROCm libraries and kernel data the engine loads
+packaging/collect_libs.py
 
 # ---- server (OpenAI / Anthropic API + web page) ---------------------------------------------------
 serve/

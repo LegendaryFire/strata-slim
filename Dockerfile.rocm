@@ -1,0 +1,144 @@
+# syntax=docker/dockerfile:1
+# strata-slim for AMD Radeon (RDNA, the HIP backend): the same engine, server and model prep as ./Dockerfile.
+#
+#   docker build -f Dockerfile.rocm -t strata-slim:0.2.10-rocm .                         # RDNA3 + RDNA4, 4 compile jobs
+#   docker build -f Dockerfile.rocm -t strata-slim:0.2.10-rocm --build-arg HIP_ARCHITECTURES=gfx1201 --build-arg BUILD_JOBS=8 .
+#
+# HIP_ARCHITECTURES (upstream's table, cmake/hip_backend.cmake and docs/AMD_HIP.md):
+#   gfx1100 RX 7900 XT/XTX, gfx1201 RX 9070/9070 XT and Radeon AI PRO R9700   (tested by upstream's maintainers)
+#   gfx1101 RX 7800 XT/7700 XT, gfx1200 RX 9060 XT                            (validated by their owners)
+#   gfx1102 RX 7600                                                           (reported working)
+#   gfx1030 / gfx1031 RX 6800/6900 / 6700 XT (RDNA2)                          (builds; upstream has not run it on a card)
+# Every architecture is compiled into every kernel, so naming only your card's builds much faster. An engine started
+# on a card it has no code for stops with a message naming the architectures it has.
+#
+# The compile flags are upstream's (packaging/build_hip_linux.sh). The runtime image is plain Ubuntu: the ROCm
+# libraries the engine and the picture reader load, and rocBLAS / hipBLASLt kernel data for the chosen architectures
+# only, are collected next to the engine by upstream's packaging/collect_libs.py. The host needs only the amdgpu
+# kernel driver, no ROCm install.
+#
+# Run with the AMD devices instead of --gpus:  docker run --device /dev/kfd --device /dev/dri ...
+
+ARG ROCM_IMAGE=rocm/dev-ubuntu-24.04:7.14.1-full
+ARG RUNTIME_IMAGE=ubuntu:24.04
+
+# ---- 1. engine ---------------------------------------------------------------------------------------------------
+FROM ${ROCM_IMAGE} AS build
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ENV DEBIAN_FRONTEND=noninteractive PIP_DISABLE_PIP_VERSION_CHECK=1 CCACHE_DIR=/ccache CCACHE_MAXSIZE=10G \
+    ROCM_PATH=/opt/rocm HIP_PATH=/opt/rocm HIP_PLATFORM=amd
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates ccache curl unzip python3 python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+RUN python3 -m venv /tools
+WORKDIR /src
+COPY vendor/requirements-build.txt /src/requirements-build.txt
+RUN /tools/bin/pip install --no-cache-dir -r requirements-build.txt
+
+# llama.cpp at upstream's pinned commit: ggml for the engine, mtmd and ggml-hip for the picture reader, gguf-py for the prep tools
+COPY vendor/third_party/ggml/VERSION.txt /tmp/llama-pin
+RUN set -e; commit=$(awk 'NR==1{print $1}' /tmp/llama-pin); \
+    curl -fsSL -o /tmp/llama.zip "https://github.com/ggml-org/llama.cpp/archive/${commit}.zip"; \
+    unzip -q /tmp/llama.zip -d /tmp/llama; mkdir -p /opt; mv /tmp/llama/llama.cpp-${commit} /opt/llama.cpp; \
+    rm -rf /tmp/llama /tmp/llama.zip
+
+COPY vendor/CMakeLists.txt vendor/UPSTREAM /src/
+COPY vendor/cmake/       /src/cmake/
+COPY vendor/include/     /src/include/
+COPY vendor/src/         /src/src/
+COPY vendor/third_party/ /src/third_party/
+COPY vendor/bench/       /src/bench/
+COPY vendor/tests/       /src/tests/
+COPY vendor/tools/vision/  /src/tools/vision/
+COPY vendor/tools/trellis/ /src/tools/trellis/
+COPY vendor/tools/hip/     /src/tools/hip/
+ARG HIP_ARCHITECTURES="gfx1100;gfx1101;gfx1102;gfx1200;gfx1201"
+ARG BUILD_JOBS=4
+ARG BUILD_VISION=1
+RUN --mount=type=cache,target=/ccache,id=strata-slim-ccache-rocm set -e; export PATH=/tools/bin:$PATH; R=$ROCM_PATH; \
+    archs=$(echo "$HIP_ARCHITECTURES" | tr ', ' ';;'); \
+    sysdeps=""; [ -d "$R/lib/rocm_sysdeps" ] && sysdeps=";$R/lib/rocm_sysdeps"; \
+    hip=(-DCMAKE_HIP_COMPILER=$R/llvm/bin/clang++ -DCMAKE_HIP_COMPILER_ROCM_ROOT=$R "-DCMAKE_PREFIX_PATH=$R$sysdeps" \
+         "-DCMAKE_HIP_FLAGS=--rocm-path=$R --rocm-device-lib-path=$R/lib/llvm/amdgcn/bitcode"); \
+    cc=(-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_HIP_COMPILER_LAUNCHER=ccache); \
+    cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_BUILD_TESTS=OFF \
+        -DSTRATA_PREFILL_MMQ=ON "-DCMAKE_HIP_ARCHITECTURES=$archs" "${hip[@]}" "${cc[@]}" \
+        -DSTRATA_GGML_DIR=/opt/llama.cpp -DSTRATA_PORTABLE=ON; \
+    cmake --build build --target strata strata-device -j "$BUILD_JOBS"; \
+    if [ "$BUILD_VISION" = "1" ]; then \
+      cmake -G Ninja -S tools/vision -B build-vision -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=/opt/llama.cpp "${cc[@]}" \
+          -DSTRATA_VISION_CUDA=OFF -DSTRATA_PORTABLE=ON; \
+      cmake --build build-vision --target strata-vision -j "$BUILD_JOBS"; \
+      cmake -G Ninja -S tools/vision -B build-vision-hip -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=/opt/llama.cpp "${cc[@]}" \
+          -DSTRATA_VISION_HIP=ON "-DSTRATA_VISION_HIP_ARCHS=$archs" -DSTRATA_PORTABLE=ON "${hip[@]}"; \
+      cmake --build build-vision-hip --target strata-vision -j "$BUILD_JOBS"; \
+    fi; \
+    ccache --show-stats --verbose | grep -E 'Hits|Misses' | head -4 || true
+
+# the binaries, every ROCm library they load (plus the ones HIP opens with dlopen), and the rocBLAS / hipBLASLt kernel
+# data of the built architectures only, into one folder (packaging/build_hip_linux.sh does the same for upstream's package)
+COPY vendor/packaging/collect_libs.py /src/packaging/collect_libs.py
+RUN set -e; R=$ROCM_PATH; O=/out/engine; mkdir -p $O; \
+    archs=$(echo "$HIP_ARCHITECTURES" | tr ';, ' '   ' | xargs); \
+    search=(--search $R/lib --search $R/lib/llvm/lib); [ -d "$R/lib/rocm_sysdeps/lib" ] && search+=(--search $R/lib/rocm_sysdeps/lib); \
+    data=(--data "$R/lib/rocblas/library=rocblas/library" --data "$R/lib/hipblaslt/library=hipblaslt/library" --data-arch "${archs// /,}"); \
+    bins=(build/strata build/strata-device); \
+    [ -f build-vision/bin/strata-vision ] && bins+=(build-vision/bin/strata-vision build-vision-hip/bin/strata-vision-hip); \
+    for b in "${bins[@]}"; do \
+      python3 packaging/collect_libs.py --binary "$b" "${search[@]}" --also 'libamd_comgr.so*' --also 'libhiprtc*.so*' \
+          --out $O "${data[@]}"; \
+      data=(); cp "$b" $O/; \
+    done; \
+    . ./UPSTREAM; vision=$([ -f $O/strata-vision-hip ] && echo gpu || echo none); \
+    ENGINE_VERSION="$engine_version" TAG="$tag" COMMIT="$commit" ARCHS="$archs" ROCM="$(cat $R/.info/version 2>/dev/null || echo unknown)" \
+    VISION="$vision" python3 -c '\
+import json, os; \
+archs = os.environ["ARCHS"].split(); \
+print(json.dumps({"version": os.environ["ENGINE_VERSION"], "source": "strata-slim " + os.environ["TAG"], \
+                  "commit": os.environ["COMMIT"], "backend": "hip", "rocm": os.environ["ROCM"], "portable": True, \
+                  "archs": archs, "vision": os.environ["VISION"], "vision_cpu": "strata-vision", "vision_gpu": "strata-vision-hip", \
+                  "vision_archs": archs}))' > $O/BUILD.json; \
+    cat $O/BUILD.json; echo "engine folder: $(du -sh $O | cut -f1)"
+
+# ---- 2. runtime --------------------------------------------------------------------------------------------------
+FROM ${RUNTIME_IMAGE}
+ENV DEBIAN_FRONTEND=noninteractive PIP_DISABLE_PIP_VERSION_CHECK=1 PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
+    PATH=/venv/bin:$PATH STRATA_GGUF_PY=/opt/strata/third_party/llama.cpp/gguf-py
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates python3 python3-venv libgomp1 libatomic1 tini curl \
+    && rm -rf /var/lib/apt/lists/*
+COPY vendor/requirements.runtime.txt /tmp/requirements.runtime.txt
+RUN python3 -m venv /venv && /venv/bin/pip install --no-cache-dir -r /tmp/requirements.runtime.txt
+
+WORKDIR /opt/strata
+COPY --from=build /out/engine/ /opt/strata/engine/
+COPY --from=build /opt/llama.cpp/gguf-py/ /opt/strata/third_party/llama.cpp/gguf-py/
+COPY vendor/serve/          /opt/strata/serve/
+COPY vendor/strata_control/ /opt/strata/strata_control/
+COPY vendor/strata_cli/     /opt/strata/strata_cli/
+COPY vendor/data/           /opt/strata/data/
+COPY vendor/tools/*.py      /opt/strata/tools/
+COPY vendor/UPSTREAM vendor/.config-keys vendor/LICENSE /opt/strata/
+COPY launch.py prepare.py hf.py common.py /opt/strata/
+
+# build-time checks (no GPU here): every library the engine and the readers link resolves (the ROCm ones from the
+# engine folder; nothing comes from the host but the kernel driver); the server and every prep tool import
+RUN set -e; for b in /opt/strata/engine/strata /opt/strata/engine/strata-device /opt/strata/engine/strata-vision \
+                     /opt/strata/engine/strata-vision-hip; do \
+      [ -f "$b" ] || continue; \
+      miss=$(LD_LIBRARY_PATH=/opt/strata/engine ldd "$b" | grep 'not found' || true); \
+      [ -z "$miss" ] || { echo "$b: missing libraries:"; echo "$miss"; exit 1; }; done; \
+    cd /opt/strata && python -c "import sys; sys.path[:0] = ['/opt/strata', '/opt/strata/tools']; import serve.server; print('serve.server imports')"; \
+    for t in iq_pack mtp_fetch mtp_pack mtp_rt strata_tokenizer; do python tools/$t.py --help >/dev/null || { echo "tools/$t.py does not start"; exit 1; }; done; \
+    python -c "import sys; sys.path[:0] = ['/opt/strata', '/opt/strata/tools']; import dflash2_pack, launch, prepare"; \
+    echo "prep tools start"
+
+ENV LD_LIBRARY_PATH=/opt/strata/engine
+VOLUME ["/data"]
+EXPOSE 8080
+# start-period: a first start may download the model (100+ GB) and build the pack and MTP layer before it listens
+HEALTHCHECK --interval=30s --timeout=5s --start-period=6h --retries=3 \
+    CMD curl -fs "http://127.0.0.1:${PORT:-8080}/health" || exit 1
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/bin/tini", "--", "python", "/opt/strata/launch.py"]
+CMD ["serve"]
