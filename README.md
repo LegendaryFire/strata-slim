@@ -11,6 +11,14 @@ built from environment variables on every start.
 
 `vendor/UPSTREAM` says which tag and commit `vendor/` is.
 
+## Quick start (Docker Compose)
+
+    cp example.env .env        # pick nvidia or amd, your card and a models folder
+    docker compose build
+    docker compose up -d && docker compose logs -f
+
+Step by step: [docs/docker-compose.md](docs/docker-compose.md).
+
 ## Layout
 
 | file | what it is |
@@ -26,7 +34,9 @@ built from environment variables on every start.
 | `common.py` | what launch.py and prepare.py share (variables, messages, finding model files) |
 | `Dockerfile` | NVIDIA: stage 1 compiles the engine (upstream's flags); stage 2 is CUDA runtime + Python + server |
 | `Dockerfile.rocm` | AMD Radeon (RDNA): the same with the HIP backend; stage 2 is plain Ubuntu + the ROCm libraries the engine loads |
-| `example.env` | a full env file |
+| `compose.yaml` | Docker Compose: an `nvidia` and an `amd` service, settings from `.env` |
+| `example.env` | the settings file to copy to `.env` |
+| `docs/docker-compose.md` | how to run it with Compose |
 | `vendor/` | the extracted source (committed, so a diff between versions is a `git diff`) |
 
 ## A new upstream release
@@ -141,7 +151,7 @@ anything (no GPU needed). The variables are listed at the top of `launch.py`; in
 ## Volumes
 
 The image reads model files from wherever you mount them, and writes only to `/data` (the generated config,
-logs). For example, with `example.env`:
+logs). `compose.yaml` mounts one folder at `/models` (`MODELS_PATH`); separate mounts work too:
 
 ```yaml
 volumes:

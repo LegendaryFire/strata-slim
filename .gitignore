@@ -2,3 +2,8 @@
 .upstream/
 vendor.new/
 __pycache__/
+# your settings (may hold HF_TOKEN / API_KEY)
+.env
+# what compose.yaml creates by default
+/models/
+/data/

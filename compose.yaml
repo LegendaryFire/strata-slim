@@ -1,0 +1,53 @@
+# strata-slim with Docker Compose. Everything you set lives in .env (copy example.env); see docs/docker-compose.md.
+#
+#   cp example.env .env      # then edit it
+#   docker compose build     # once, and again after an upstream update
+#   docker compose up -d
+#   docker compose logs -f
+#
+# COMPOSE_PROFILES in .env picks the service: nvidia or amd.
+
+name: strata-slim
+
+x-strata: &strata
+  env_file: .env
+  restart: unless-stopped
+  stop_grace_period: 60s
+  ports:
+    - "${LISTEN:-127.0.0.1}:${HOST_PORT:-8080}:8080"
+  volumes:
+    - "${MODELS_PATH:-./models}:/models"     # downloads, packs, MTP layer, DFlash2 (written on the first start)
+    - "${DATA_PATH:-./data}:/data"           # the generated config and the logs
+
+services:
+  strata-nvidia:
+    <<: *strata
+    profiles: [nvidia]
+    image: "strata-slim:${STRATA_TAG:-0.2.10}"
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CUDA_ARCHITECTURES: "${CUDA_ARCHITECTURES:-86}"
+        BUILD_JOBS: "${BUILD_JOBS:-4}"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  strata-amd:
+    <<: *strata
+    profiles: [amd]
+    image: "strata-slim:${STRATA_TAG:-0.2.10}-rocm"
+    build:
+      context: .
+      dockerfile: Dockerfile.rocm
+      args:
+        HIP_ARCHITECTURES: "${HIP_ARCHITECTURES:-gfx1100;gfx1101;gfx1102;gfx1200;gfx1201}"
+        BUILD_JOBS: "${BUILD_JOBS:-4}"
+    devices:
+      - /dev/kfd
+      - /dev/dri
