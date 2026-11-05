@@ -8,45 +8,7 @@ runs: nothing is read from an earlier config, there are no presets.
     docker run ... strata-slim prepare         # only download / pack / MTP, then exit (no GPU needed)
     docker run ... strata-slim print-config    # write and print the config, do not start (no GPU needed)
 
-Variables (the download, pack and MTP ones are in prepare.py):
-
-  PREPARE           auto (default): run prepare.py's steps before the server starts; off: never
-  model files: derived from MODEL_REPO + MODEL_QUANT under MODELS_DIR (common.model_paths); each can be set instead:
-    MODELS_DIR        default /models: models/<owner>-<quant>/, packs/<owner>-<quant>/, mtp/rt/, dflash2/
-    MODEL_GGUF        the model's GGUF: a file, or a folder (its *-00001-of-*.gguf, or its only .gguf)
-    PACK              the pack folder (holds tokenizer/ unless TOKENIZER says otherwise)
-  drafter
-    DRAFTER           mtp (default), dflash2, auto or off (written to the config as "drafting")
-    TOKENIZER         default: <pack>/tokenizer
-    EXPERT_PROFILE    default: /opt/strata/data/expert-profile.bin. "none": no --expert-profile
-  engine
-    CONTEXT           --max-context: 262144, 256k, 32k (k = 1024)
-    KV                --kv: int8, q4, f16, ...
-    VRAM_RESERVE_MIB  --vram-reserve-mib
-    ENGINE_ARGS       every other engine flag, as on a command line: --spec 4 --expert-cache auto
-    STRATA_*, FNX_*, DS4_*   engine switches: they reach the engine unchanged (the container's environment)
-  GPUs
-    GPUS              0,1: the cards (NVIDIA: as nvidia-smi numbers them inside the container; AMD: as HIP numbers
-                      them, the KFD order). Unset on AMD: the engine picks a card it has code for (strata-device)
-  pictures
-    VISION            off (default), cpu or gpu (AMD: strata-vision-hip, with the CPU reader to fall back on)
-    MMPROJ            the mmproj GGUF. Default: the one mmproj*.gguf in or beside the model folder
-    VISION_THREADS    CPU threads for VISION=cpu
-    VISION_MAX_TOKENS tokens per picture
-  server
-    MODEL_NAME        the name /v1/models lists (default: from the GGUF file name)
-    HOST, PORT        default 0.0.0.0 and 8080 (inside the container)
-    API_KEY / API_KEY_FILE   the key clients send. Unset: no key (keep the port private then)
-    SERVER_ARGS       more serve.server flags: --parallel 2 --api-monitor
-  any other config key
-    CONFIG_<KEY>      sets config key <key> (lowercase). The value is JSON when it parses as JSON, else a string:
-                      CONFIG_IDLE_UNLOAD_S=600  CONFIG_LAYER_SPLIT=auto  CONFIG_ALIASES=["qwen"]
-                      A key the server does not read is a warning (the list is /opt/strata/.config-keys).
-  output
-    PROGRESS_INTERVAL seconds between progress lines of downloads and checks (default 5; 0.5 in a terminal)
-  files
-    CONFIG_OUT        where the config is written (default /data/run/config.json)
-    LOG_FILE          the engine log (default /data/logs/engine.log)
+Every variable, with its default, is in example.env.
 """
 from __future__ import annotations
 
@@ -245,7 +207,7 @@ def start_server(config: Path) -> None:
 def main() -> int:
     command = sys.argv[1] if len(sys.argv) > 1 else "serve"
     if command not in ("serve", "prepare", "print-config"):
-        os.execvp(sys.argv[1], sys.argv[1:])     # a shell or another program, for debugging
+        fail(f"unknown command {command}: serve (default), prepare or print-config")
 
     paths = model_paths()
     model, mmproj = model_files(command, paths)

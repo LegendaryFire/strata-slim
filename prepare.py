@@ -5,27 +5,7 @@
   3. mtp        tools/mtp_fetch.py, mtp_pack.py, mtp_rt.py: the MTP draft layer (speculative decoding), from the 31 MTP
                 tensors of the Qwen3.8-Flash-Next BF16 checkpoint (about 5 GB, read with range requests)
 
-Variables
-  download (only when MODEL_REPO is set)
-    MODEL_REPO      the Hugging Face repository, e.g. unsloth/Qwen3.8-Flash-Next-GGUF
-    MODEL_QUANT     which quantization, e.g. UD-Q4_K_XL: the folder of that name, or the files whose name ends in it.
-                    Not needed when the repository has only one; a wrong or missing one lists the choices.
-    MODEL_FILES     instead of MODEL_QUANT: globs of paths in the repository, comma-separated
-    MODEL_REVISION  a commit or branch for the first download (default main); see "Which version"
-    MMPROJ_REPO     the picture reader's repository (default MODEL_REPO), used when VISION is on
-    MMPROJ_FILE     which mmproj file, when that repository has more than one
-    HF_TOKEN, HF_ENDPOINT   see hf.py
-  where the files go: see common.model_paths (MODELS_DIR, with MODEL_GGUF and PACK as overrides)
-  pack
-    PACK_ARGS       iq_pack.py flags: --compat-bf16 for Unsloth's UD-* files, --experts-bin for the low-RAM modes
-  drafter
-    DRAFTER         mtp (default), dflash2, auto or off: see common.drafter
-    MTP_BUILD       auto (default): build the MTP layer when experts.bin is missing; off: never
-    MTP_EXPERTS     q2_0 (default) or another quantization mtp_pack.py knows
-    DRAFT_VOCAB     the draft token subset: cjk (default), en, cyrillic, fr (for the MTP layer and for DFlash2)
-
-  4. dflash2    (DRAFTER=dflash2 or auto) the DFlash2 drafter in <models>/dflash2/, by upstream's drafting_fetch: the pinned
-                incoai/Qwen3.8-Flash-Next-DFlash2 files (1.2 GB), checked, packed to Q4_0 (0.5 GB), checked again
+The variables are in example.env.
 
 Which version
   The first download writes <model folder>/.source.json: the repository, the commit (a branch resolved to a fixed
@@ -33,13 +13,9 @@ Which version
   no network when every file is there, and are not affected when the repository replaces files under the same names.
   A MODEL_REVISION that is another commit stops the start: a new version goes into a new folder, with a new pack
   (the pack is built from these exact files).
-
-  A folder of downloaded files without a record (for example from upstream's setup) is adopted: the repository's
-  recent commits are searched for the one whose files match the SHA-256 in the .done marks, and that is recorded.
 """
 from __future__ import annotations
 
-import fnmatch
 import json
 import re
 import shlex
@@ -59,7 +35,6 @@ TOOLS = ROOT / "tools"
 DRAFT_VOCABS = {"cjk": "draft_vocab.bin", "en": "draft_vocab_en.bin", "cyrillic": "draft_vocab_cyrillic.bin",
                 "fr": "draft_vocab_fr.bin"}
 RECORD_FILE = ".source.json"
-ADOPT_SEARCH_COMMITS = 200     # how far back to look for the commit of a folder downloaded without a record
 
 
 @dataclass
@@ -99,14 +74,6 @@ def quant_of(f: RemoteFile) -> str:
     return re.sub(r"-\d{5}-of-\d{5}$", "", f.name.removesuffix(".gguf"))
 
 
-def files_by_glob(files: list[RemoteFile], repo: str, globs: str) -> list[RemoteFile]:
-    patterns = [g.strip() for g in globs.split(",") if g.strip()]
-    chosen = [f for f in files if any(fnmatch.fnmatch(f.path, p) for p in patterns)]
-    if not chosen:
-        fail(f"{repo}: no file matches MODEL_FILES={globs}")
-    return chosen
-
-
 def files_by_quant(files: list[RemoteFile], repo: str, quant: str | None) -> tuple[str, list[RemoteFile]]:
     """The files of one quantization: MODEL_QUANT, or the only one the repository has."""
     groups: dict[str, list[RemoteFile]] = {}
@@ -130,27 +97,19 @@ def files_by_quant(files: list[RemoteFile], repo: str, quant: str | None) -> tup
     return matches[0], groups[matches[0]]
 
 
-def choose_model_files(repo: str, commit: str) -> tuple[str | None, list[RemoteFile]]:
-    """(quantization or None, files) at a commit, by MODEL_FILES or MODEL_QUANT."""
-    files = hf.list_files(repo, commit)
-    if (globs := env("MODEL_FILES")):
-        return None, files_by_glob(files, repo, globs)
-    return files_by_quant(files, repo, env("MODEL_QUANT"))
+def choose_model_files(repo: str, commit: str) -> tuple[str, list[RemoteFile]]:
+    """(quantization, files) at a commit, by MODEL_QUANT."""
+    return files_by_quant(hf.list_files(repo, commit), repo, env("MODEL_QUANT"))
 
 
 def choose_mmproj(repo: str, commit: str) -> RemoteFile:
     candidates = [f for f in hf.list_files(repo, commit) if is_mmproj(f)]
-    if (wanted := env("MMPROJ_FILE")):
-        for f in candidates:
-            if wanted in (f.path, f.name):
-                return f
-        fail(f"{repo}: no mmproj file {wanted}; there are: {', '.join(f.path for f in candidates) or 'none'}")
     if len(candidates) == 1:
         return candidates[0]
     if not candidates:
         fail(f"{repo} has no mmproj*.gguf file; set MMPROJ_REPO to a repository with one, or VISION=off")
-    fail(f"{repo} has {len(candidates)} mmproj files; set MMPROJ_FILE to one of: "
-         + ", ".join(f"{f.path} ({size_text(f.size)})" for f in candidates))
+    fail(f"{repo} has {len(candidates)} mmproj files ({', '.join(f.path for f in candidates)}): "
+         "download the one you want beside the model folder, or set MMPROJ to it")
 
 
 # ---- the record of a download (.source.json) ----------------------------------------------------------------------
@@ -159,7 +118,7 @@ def choose_mmproj(repo: str, commit: str) -> RemoteFile:
 class Record:
     repo: str
     commit: str
-    quant: str | None          # None when the files were chosen with MODEL_FILES
+    quant: str
     files: list[RemoteFile]
 
     @staticmethod
@@ -192,19 +151,6 @@ def folder_holds_other_files(folder: Path, files: list[RemoteFile]) -> bool:
     return False
 
 
-def find_commit_of(folder: Path, repo: str) -> str | None:
-    """The newest commit whose files match every SHA-256 in this folder's .done marks."""
-    marks = {name: sha for name, sha in marked_files(folder).items() if sha}
-    if not marks:
-        return None
-    say(f"{folder.name}: downloaded files but no {RECORD_FILE}; looking for their commit in {repo} ...")
-    for commit in hf.recent_commits(repo, ADOPT_SEARCH_COMMITS):
-        published = {f.name: f.sha256 for f in hf.list_files(repo, commit)}
-        if all(published.get(name) == sha for name, sha in marks.items()):
-            return commit
-    return None
-
-
 # ---- step 1: download -------------------------------------------------------------------------------------------
 
 def download_model(folder: Path) -> None:
@@ -216,15 +162,6 @@ def download_model(folder: Path) -> None:
         first_download(folder, repo)
 
 
-def same_files(repo: str, commit: str, record: Record) -> bool:
-    """Does this commit have exactly the recorded files (same names, sizes and SHA-256)? Two commits often do:
-    a repository's later commits that change other files keep these ones unchanged."""
-    if commit == record.commit:
-        return True
-    published = {f.name: (f.size, f.sha256) for f in hf.list_files(repo, commit)}
-    return all(published.get(f.name) == (f.size, f.sha256) for f in record.files)
-
-
 def complete_recorded(folder: Path, record: Record, repo: str) -> None:
     """The folder has a record: check the variables still ask for that version, then fetch any missing file."""
     if record.repo != repo:
@@ -233,9 +170,9 @@ def complete_recorded(folder: Path, record: Record, repo: str) -> None:
     if quant and record.quant and quant.lower() != record.quant.lower():
         fail(f"{folder} holds {record.quant}, not {quant}: use another folder (and pack) for another quantization")
     pinned = env("MODEL_REVISION")
-    if pinned and pinned != record.commit and not same_files(repo, hf.resolve_commit(repo, pinned), record):
-        fail(f"{folder} holds {repo}@{record.commit[:12]}, and MODEL_REVISION={pinned} has other files under these "
-             "names. Use a new folder (and pack) for another version, or unset MODEL_REVISION to keep this one.")
+    if pinned and pinned != record.commit and hf.resolve_commit(repo, pinned) != record.commit:
+        fail(f"{folder} holds {repo}@{record.commit[:12]}, not MODEL_REVISION={pinned}. Use a new folder (and pack) "
+             "for another version, or unset MODEL_REVISION to keep this one.")
 
     missing = [f for f in record.files if not hf.is_done(folder / f.name, f)]
     if not missing:
@@ -253,13 +190,8 @@ def first_download(folder: Path, repo: str) -> None:
     quant, files = choose_model_files(repo, commit)
 
     if folder_holds_other_files(folder, files):
-        found = None if pinned else find_commit_of(folder, repo)
-        if not found:
-            fail(f"{folder}: the files there are not {repo}@{commit[:12]}'s, and their commit is not among the last "
-                 f"{ADOPT_SEARCH_COMMITS}. Set MODEL_REVISION to the commit they came from, or use an empty folder.")
-        say(f"{folder.name}: the files there are {repo}@{found[:12]}; keeping that version")
-        commit = found
-        quant, files = choose_model_files(repo, commit)
+        fail(f"{folder}: the files there are not {repo}@{commit[:12]}'s {quant}. Use an empty folder, or set "
+             "MODEL_REVISION to the commit they came from.")
 
     say(f"{repo}@{commit[:12]}{' ' + quant if quant else ''}: {len(files)} file(s), "
         f"{size_text(sum(f.size for f in files))} -> {folder}")
@@ -280,7 +212,7 @@ def get_mmproj(model_folder: Path) -> Path:
     repo = env("MMPROJ_REPO") or env("MODEL_REPO")
     if not repo:
         fail("VISION is on and no mmproj file was found: set MMPROJ to it, or MMPROJ_REPO to download one")
-    commit = hf.resolve_commit(repo, env("MMPROJ_REVISION") or "main")
+    commit = hf.resolve_commit(repo, "main")
     f = choose_mmproj(repo, commit)
     path = Path(given) if given else model_folder.parent / f.name     # beside the model folders, as upstream keeps it
     say(f"picture reader: {repo}@{commit[:12]} {f.path} -> {path}")
@@ -313,7 +245,7 @@ def build_pack(model: Path, pack: Path) -> None:
 
 
 def build_mtp(rt: Path) -> None:
-    if not (rt / "experts.bin").is_file() and (env("MTP_BUILD") or "auto").lower() != "off":
+    if not (rt / "experts.bin").is_file():
         root, experts = rt.parent, env("MTP_EXPERTS") or "q2_0"
         say(f"building the MTP draft layer in {root} (about 5 GB of tensors from the Qwen3.8-Flash-Next checkpoint)")
         root.mkdir(parents=True, exist_ok=True)
@@ -357,20 +289,15 @@ def build_dflash2(data_dir: Path) -> None:
 
 
 def set_draft_vocab(rt: Path) -> None:
-    """Copy the chosen draft token subset into the MTP folder: when it is missing, or when DRAFT_VOCAB asks for
-    another shipped subset. A subset made by hand is kept unless DRAFT_VOCAB is set."""
+    """Put the draft token subset into the MTP folder: the default (cjk) when there is none, or the one DRAFT_VOCAB names."""
     if not rt.is_dir():
         return
-    choice = (env("DRAFT_VOCAB") or "cjk").lower()
+    target = rt / "draft_vocab.bin"
+    choice = (env("DRAFT_VOCAB") or "").lower()
+    if target.exists() and not choice:
+        return
+    choice = choice or "cjk"
     if choice not in DRAFT_VOCABS:
         fail(f"DRAFT_VOCAB={choice}: one of {', '.join(DRAFT_VOCABS)}")
-    source, target = ROOT / "data" / DRAFT_VOCABS[choice], rt / "draft_vocab.bin"
-    if target.exists():
-        current = target.read_bytes()
-        if current == source.read_bytes():
-            return
-        shipped = {(ROOT / "data" / name).read_bytes() for name in DRAFT_VOCABS.values()}
-        if current not in shipped and not env("DRAFT_VOCAB"):
-            return
-    shutil.copyfile(source, target)
+    shutil.copyfile(ROOT / "data" / DRAFT_VOCABS[choice], target)
     say(f"draft layer token subset: {choice}")

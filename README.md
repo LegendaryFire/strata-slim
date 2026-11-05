@@ -100,7 +100,7 @@ command does only this and exits, no GPU needed):
 
 1. **Download:** `MODEL_REPO` + `MODEL_QUANT` (a missing or wrong one lists the repository's quantizations with
    their sizes) go into the `MODEL_GGUF` folder. With `VISION` on, the mmproj comes from `MMPROJ_REPO` (default
-   `MODEL_REPO`), chosen by itself when the repository has one (`MMPROJ_FILE` otherwise), and is saved beside the
+   `MODEL_REPO`), chosen by itself when the repository has one (`MMPROJ` otherwise), and is saved beside the
    model folder. Each file is checked against the size and SHA-256 Hugging Face publishes, resumes where it stopped,
    and gets a `.done` mark (the mark upstream's setup writes, so its downloads count as done).
 
@@ -132,18 +132,7 @@ cards (sm_86). With `DRAFTER=dflash2` the MTP layer is not built or used.
 
 Every start writes `/data/run/config.json` fresh from the environment; nothing from an earlier start is reused.
 `docker run --rm --env-file x.env -v ... strata-slim:0.2.10 print-config` shows the config without starting
-anything (no GPU needed). The variables are listed at the top of `launch.py`; in short:
-
-- **Model files:** derived from `MODEL_REPO` + `MODEL_QUANT` under `MODELS_DIR` (default `/models`):
-  `models/<owner>-<quant>/`, `packs/<owner>-<quant>/`, `mtp/rt/`, `dflash2/` (upstream's layout and naming).
-  `MODEL_GGUF` and `PACK` override the first two; `TOKENIZER`, `EXPERT_PROFILE`
-- **Engine:** `CONTEXT`, `KV`, `VRAM_RESERVE_MIB`, and `ENGINE_ARGS` for every other engine flag
-- **Engine switches:** `STRATA_*` / `FNX_*` / `DS4_*` reach the engine unchanged
-- **GPUs:** `GPUS=0,1`
-- **Pictures:** `VISION=off|cpu|gpu`, `MMPROJ`, `VISION_THREADS`, `VISION_MAX_TOKENS`
-- **Server:** `MODEL_NAME`, `HOST`, `PORT`, `API_KEY` / `API_KEY_FILE`, `SERVER_ARGS`
-- **Any other config key:** `CONFIG_<KEY>=<json or string>`, e.g. `CONFIG_IDLE_UNLOAD_S=600`. A key the server does
-  not read is a warning (the list is `vendor/.config-keys`, made by `extract.sh`).
+anything (no GPU needed). Every variable, with its default, is in [`example.env`](example.env).
 
 ## Volumes
 

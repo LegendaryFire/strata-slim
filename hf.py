@@ -84,11 +84,6 @@ def list_files(repo: str, commit: str) -> list[RemoteFile]:
     return files
 
 
-def recent_commits(repo: str, limit: int) -> list[str]:
-    """The newest commits on main, newest first."""
-    return [c["id"] for c in api(f"models/{repo}/commits/main")[:limit]]
-
-
 # ---- the .done mark ---------------------------------------------------------------------------------------------
 # A finished, checked file has <file>.done beside it holding "sha256 <hex>" (the mark upstream's setup writes too).
 
@@ -138,8 +133,7 @@ def download(repo: str, commit: str, f: RemoteFile, dst: Path) -> None:
     if is_done(dst, f):
         return
     if dst.exists():
-        adopt_unmarked(repo, commit, f, dst)
-        return
+        fail(f"{dst}: there without a .done mark, so it was not checked. Move it away to download it.")
 
     dst.parent.mkdir(parents=True, exist_ok=True)
     part = dst.with_name(dst.name + ".part")
@@ -189,12 +183,3 @@ def _fetch_rest(url: str, part: Path, f: RemoteFile, label: str) -> None:
                 written += len(block)
                 progress.update(written)
         progress.finish("downloaded")
-
-
-def adopt_unmarked(repo: str, commit: str, f: RemoteFile, dst: Path) -> None:
-    """A file already there without a .done mark (copied by hand): keep it if it is the right one."""
-    say(f"{dst.name}: present without a .done mark")
-    got = sha256_of(dst, dst.name)
-    if f.sha256 and got != f.sha256:
-        fail(f"{dst}: a different file than {repo}@{commit[:12]} has under this name. Move it away to download it.")
-    done_mark(dst).write_text(f"sha256 {got}", encoding="utf-8")

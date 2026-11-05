@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 
@@ -35,57 +35,29 @@ def duration_text(seconds: float) -> str:
     return f"{s // 3600}h{s % 3600 // 60:02d}m" if s >= 3600 else f"{s // 60}m{s % 60:02d}s" if s >= 60 else f"{s}s"
 
 
-@dataclass
 class Progress:
-    """A progress line for a long transfer or check: a bar, how much is done, the speed and the time left.
+    """A progress line for a long download or check, printed every 5 seconds: how much is done, the speed, the time left."""
+    INTERVAL = 5.0
 
-    In a terminal the line is redrawn in place. Without one (docker logs) a new line is printed every
-    PROGRESS_INTERVAL seconds (default 5), since a redrawn line would pile up in the log."""
-    label: str
-    total: int
-    done: int = 0                  # bytes already there when it starts (a resumed download)
-    width: int = 24
-    started: float = field(default_factory=time.monotonic)
-    last_print: float = 0.0
-    samples: list = field(default_factory=list)   # (time, bytes) over the last few seconds, for the speed
-
-    def __post_init__(self):
-        self.first = self.done
-        self.last_print = self.started        # the first line after one interval, when there is a speed to show
-        self.tty = sys.stdout.isatty()
-        self.interval = float(env("PROGRESS_INTERVAL") or (0.5 if self.tty else 5))
+    def __init__(self, label: str, total: int, done: int = 0):
+        self.label, self.total, self.done, self.first = label, total, done, done
+        self.started = self.last_print = time.monotonic()
 
     def update(self, done: int) -> None:
-        now = time.monotonic()
         self.done = done
-        self.samples.append((now, done))
-        while len(self.samples) > 2 and now - self.samples[0][0] > 10:
-            self.samples.pop(0)
-        if now - self.last_print >= self.interval:
+        now = time.monotonic()
+        if now - self.last_print >= self.INTERVAL:
             self.last_print = now
-            self._show(self._line())
+            speed = (done - self.first) / (now - self.started)
+            left = f", {duration_text((self.total - done) / speed)} left" if speed > 0 else ""
+            percent = 100 * done / self.total if self.total else 0
+            say(f"{self.label}  {percent:3.0f}%  {size_text(done)} / {size_text(self.total)}  {speed / 1e6:.0f} MB/s{left}")
 
     def finish(self, what: str = "done") -> None:
         elapsed = time.monotonic() - self.started
         moved = self.done - self.first
         rate = f", {moved / elapsed / 1e6:.0f} MB/s" if elapsed > 1 and moved > 0 else ""
-        self._show(f"{self.label}  {what}: {size_text(self.done)} in {duration_text(elapsed)}{rate}", final=True)
-
-    def _line(self) -> str:
-        fraction = min(self.done / self.total, 1.0) if self.total else 0.0
-        filled = int(fraction * self.width)
-        bar = "█" * filled + "░" * (self.width - filled)
-        (t0, d0), (t1, d1) = self.samples[0], self.samples[-1]
-        speed = (d1 - d0) / (t1 - t0) if t1 > t0 else 0.0
-        rate = f"  {speed / 1e6:.0f} MB/s  {duration_text((self.total - self.done) / speed)} left" if speed > 0 else ""
-        return f"{self.label}  [{bar}] {fraction * 100:3.0f}%  {size_text(self.done)} / {size_text(self.total)}{rate}"
-
-    def _show(self, line: str, final: bool = False) -> None:
-        if self.tty:
-            sys.stdout.write(f"\r[strata-slim] {line}\x1b[K" + ("\n" if final else ""))
-            sys.stdout.flush()
-        else:
-            say(line)
+        say(f"{self.label}  {what}: {size_text(self.done)} in {duration_text(elapsed)}{rate}")
 
 
 DRAFTERS = ("mtp", "dflash2", "auto", "off")
