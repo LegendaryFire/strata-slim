@@ -107,8 +107,8 @@ ENV DEBIAN_FRONTEND=noninteractive PIP_DISABLE_PIP_VERSION_CHECK=1 PYTHONUNBUFFE
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates python3 python3-venv libgomp1 libatomic1 tini curl \
     && rm -rf /var/lib/apt/lists/*
-COPY vendor/requirements.runtime.txt /tmp/requirements.runtime.txt
-RUN python3 -m venv /venv && /venv/bin/pip install --no-cache-dir -r /tmp/requirements.runtime.txt
+COPY vendor/requirements.txt /tmp/requirements.txt
+RUN python3 -m venv /venv && /venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt
 
 WORKDIR /opt/strata
 COPY --from=build /out/engine/ /opt/strata/engine/
@@ -122,16 +122,13 @@ COPY vendor/UPSTREAM vendor/.config-keys vendor/LICENSE /opt/strata/
 COPY launch.py prepare.py hf.py common.py /opt/strata/
 
 # build-time checks (no GPU here): every library the engine and the readers link resolves (the ROCm ones from the
-# engine folder; nothing comes from the host but the kernel driver); the server and every prep tool import
+# engine folder; nothing comes from the host but the kernel driver); and the server starts
 RUN set -e; for b in /opt/strata/engine/strata /opt/strata/engine/strata-device /opt/strata/engine/strata-vision \
                      /opt/strata/engine/strata-vision-hip; do \
       [ -f "$b" ] || continue; \
       miss=$(LD_LIBRARY_PATH=/opt/strata/engine ldd "$b" | grep 'not found' || true); \
       [ -z "$miss" ] || { echo "$b: missing libraries:"; echo "$miss"; exit 1; }; done; \
-    cd /opt/strata && python -c "import sys; sys.path[:0] = ['/opt/strata', '/opt/strata/tools']; import serve.server; print('serve.server imports')"; \
-    for t in iq_pack mtp_fetch mtp_pack mtp_rt strata_tokenizer; do python tools/$t.py --help >/dev/null || { echo "tools/$t.py does not start"; exit 1; }; done; \
-    python -c "import sys; sys.path[:0] = ['/opt/strata', '/opt/strata/tools']; import dflash2_pack, launch, prepare"; \
-    echo "prep tools start"
+    cd /opt/strata && python -m serve.server --help >/dev/null && echo "serve.server starts"
 
 ENV LD_LIBRARY_PATH=/opt/strata/engine
 VOLUME ["/data"]

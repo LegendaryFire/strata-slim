@@ -4,7 +4,8 @@
 # A line starting with "!" excludes. Everything not listed stays out (apps/, bench/, docs/, tests/,
 # the Terminal/TUI, setup.py, SYCL, Metal, ...).
 #
-# After editing: ./extract.sh <tag> and ./check.py tell you if anything the server needs went missing.
+# After editing: ./extract.sh <tag>, then docker build. A Python file that needs one left out here stops with
+# Python's own ModuleNotFoundError naming it: add that path here.
 
 # ---- engine (C++/CUDA) ----------------------------------------------------------------------------
 CMakeLists.txt

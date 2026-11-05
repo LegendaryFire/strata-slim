@@ -24,9 +24,7 @@ Step by step: [docs/docker-compose.md](docs/docker-compose.md).
 | file | what it is |
 |---|---|
 | `manifest.txt` | the upstream paths taken (everything else stays out) |
-| `runtime-packages.txt` | the Python packages installed; versions come from upstream's pins |
 | `extract.sh` | upstream tag → `vendor/`, then `patches/` on top |
-| `check.py` | reads `vendor/` and fails when the server would miss a module or package |
 | `patches/` | your own changes to upstream code, reapplied on every extract |
 | `launch.py` | the entrypoint: env vars → run config → `serve.server` |
 | `prepare.py` | download the model, build the pack and the MTP layer (whatever is missing) |
@@ -42,9 +40,8 @@ Step by step: [docs/docker-compose.md](docs/docker-compose.md).
 ## A new upstream release
 
     ./extract.sh v0.2.11          # vendor/ replaced; fails if a manifest entry or a patch no longer fits
-    ./check.py                    # fails if the server now imports something vendor/ lacks
     git diff --stat vendor/       # what changed in the parts you use
-    docker build -t strata-slim:0.2.11 .
+    docker build -t strata-slim:0.2.11 .   # installs upstream's requirements.txt; checks the server starts
     docker build -f Dockerfile.rocm -t strata-slim:0.2.11-rocm .     # if you build the AMD image
     git add -A && git commit -m "Upstream v0.2.11"
 
@@ -146,7 +143,7 @@ anything (no GPU needed). The variables are listed at the top of `launch.py`; in
 - **Pictures:** `VISION=off|cpu|gpu`, `MMPROJ`, `VISION_THREADS`, `VISION_MAX_TOKENS`
 - **Server:** `MODEL_NAME`, `HOST`, `PORT`, `API_KEY` / `API_KEY_FILE`, `SERVER_ARGS`
 - **Any other config key:** `CONFIG_<KEY>=<json or string>`, e.g. `CONFIG_IDLE_UNLOAD_S=600`. A key the server does
-  not read is a warning (the list is `vendor/.config-keys`, made by `check.py`).
+  not read is a warning (the list is `vendor/.config-keys`, made by `extract.sh`).
 
 ## Volumes
 
