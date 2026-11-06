@@ -86,7 +86,8 @@ for p in patches/*.patch; do
     echo "[extract] patch does not apply to $tag: $p (rebase it on the new vendor/)" >&2; exit 1
   fi
 done
-[ ${#applied[@]} -eq 0 ] || echo "patches=${applied[*]}" >> vendor/UPSTREAM
+# comma-separated, no spaces: the Dockerfile sources UPSTREAM as shell
+[ ${#applied[@]} -eq 0 ] || (IFS=,; echo "patches=${applied[*]}") >> vendor/UPSTREAM
 
 echo "[extract] vendor/ = $tag ($commit), engine $engine_ver, $(find vendor -type f | wc -l) files, $(du -sh vendor | cut -f1)"
 echo "[extract] next: git diff --stat vendor/, then docker build"
