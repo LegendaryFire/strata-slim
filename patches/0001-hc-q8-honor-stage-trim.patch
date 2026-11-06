@@ -1,0 +1,31 @@
+From f2f05ee25a4023cb594724964d0aee33d7d470f7 Mon Sep 17 00:00:00 2001
+From: LegendaryFire <tristan.balon@outlook.com>
+Date: Fri, 6 Nov 2026 12:45:25 -0700
+Subject: [PATCH] Only load HC Q8 weights for each GPU's own layers when
+ trimming
+
+With STRATA_STAGE_TRIM, each GPU in a layer split loads only the dense
+weights for its own layers. The HC Q8 copies from the GGUF were missed,
+so every GPU still loaded them for all 48 layers. Skip the ones outside
+the GPU's layer range, like the other weight loading code already does.
+---
+ vendor/src/core/native_dense.cpp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/vendor/src/core/native_dense.cpp b/vendor/src/core/native_dense.cpp
+index 160f7ce..295b3e6 100644
+--- a/vendor/src/core/native_dense.cpp
++++ b/vendor/src/core/native_dense.cpp
+@@ -433,6 +433,9 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
+                     static const bool q8_inject = [] { const char* v = std::getenv("STRATA_HC_Q8_INJECT"); return v && v[0] == '1'; }();
+                     const bool f32_inject = q8_inject && tensor.type == 0 && tensor.name.ends_with("_inject.weight");
+                     if ((tensor.type != 8 && !f32_inject) || !hc_q8_name(tensor.name) || tensor.shape.size() != 2) continue;
++                    // a trimmed layer-split stage (set_layer_range) takes only its own layers' Q8_0 copies, like the
++                    // bf16 quantize path below; without this every card held all 48 layers' (~0.63 GiB)
++                    if (!in_range(tensor.name)) continue;
+                     auto found = table.table_.find(tensor.name);
+                     if (found == table.table_.end() || found->second.hc_q8 != nullptr) continue;
+                     auto& ref = found->second;
+-- 
+2.56.0
+

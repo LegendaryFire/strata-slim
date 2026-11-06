@@ -5,7 +5,8 @@
 #   UPSTREAM_GIT=/srv/llm/strata/repo ./scripts/extract.sh v0.2.10    # from a clone you already have (no download)
 #
 # vendor/ is replaced as a whole, so `git diff vendor/` afterwards shows exactly what upstream changed in the
-# parts this image uses. Nothing is built here; docker build is next.
+# parts this image uses. patches/*.patch (local fixes) are then applied on top and listed in vendor/UPSTREAM.
+# Nothing is built here; docker build is next.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")/.." && pwd)     # the project root: manifest.txt, vendor/, .upstream/
@@ -70,5 +71,22 @@ EOF
 
 rm -rf vendor
 mv "$new" vendor
+
+# local fixes on top of upstream (patches/*.patch, paths relative to the project root: vendor/...), in name order.
+# One upstream already has (it applies in reverse) is skipped with a note - drop it from patches/. One that applies
+# neither way stops here: upstream changed that code, so the patch needs a rebase.
+applied=()
+for p in patches/*.patch; do
+  [ -e "$p" ] || continue
+  if git apply --check "$p" 2>/dev/null; then
+    git apply "$p"; applied+=("$(basename "$p")"); echo "[extract] patch applied: $p"
+  elif git apply --reverse --check "$p" 2>/dev/null; then
+    echo "[extract] patch already in $tag, skipped (remove it): $p"
+  else
+    echo "[extract] patch does not apply to $tag: $p (rebase it on the new vendor/)" >&2; exit 1
+  fi
+done
+[ ${#applied[@]} -eq 0 ] || echo "patches=${applied[*]}" >> vendor/UPSTREAM
+
 echo "[extract] vendor/ = $tag ($commit), engine $engine_ver, $(find vendor -type f | wc -l) files, $(du -sh vendor | cut -f1)"
 echo "[extract] next: git diff --stat vendor/, then docker build"
