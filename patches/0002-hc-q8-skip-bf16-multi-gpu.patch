@@ -1,0 +1,34 @@
+From ac166d2a0a9ccb7c06192a0ea48b10b8cbb308e1 Mon Sep 17 00:00:00 2001
+From: LegendaryFire <tristan.balon@outlook.com>
+Date: Fri, 6 Nov 2026 12:50:17 -0700
+Subject: [PATCH] Skip the BF16 HC weights on multi-GPU when STRATA_HC_Q8 is on
+
+Single GPU already skips the BF16 copy of the HC down/up weights when
+STRATA_HC_Q8 is on and rebuilds BF16 from the Q8 copy when needed. The
+scratch buffers for that are per GPU, so allow it on a layer split too.
+Saves about 600 MiB per GPU.
+---
+ vendor/src/program/generate.cpp | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/vendor/src/program/generate.cpp b/vendor/src/program/generate.cpp
+index bfe8374..ade85a1 100644
+--- a/vendor/src/program/generate.cpp
++++ b/vendor/src/program/generate.cpp
+@@ -4947,9 +4947,10 @@ int main(int argc, char** argv) {
+             return 1;
+         }
+         if (native_pack) skip.insert("token_embd.weight");
+-        // STRATA_HC_Q8=1 (single GPU): the layers' hyper-connection down / up projections live only as Q8_0 (NativeDense
+-        // quantizes them from the pack file), so their bf16 copy is not loaded
+-        if (!o.native_dense_gguf.empty() && !multi_gpu && strata::core::NativeDense::hc_q8_requested())
++        // STRATA_HC_Q8=1: the layers' hyper-connection down / up projections live only as Q8_0 (NativeDense
++        // quantizes them from the pack file), so their bf16 copy is not loaded. On a layer split too: the dequant
++        // scratch is per device, allocated by each stage's own load
++        if (!o.native_dense_gguf.empty() && strata::core::NativeDense::hc_q8_requested())
+             strata::core::NativeDense::add_hc_skip(o.pack, skip);
+     }
+     // Layer split: every GPU holds only the dense weights of ITS layers (the PLE tensors stay everywhere).
+-- 
+2.56.0
+

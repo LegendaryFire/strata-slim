@@ -11,3 +11,4 @@ New patch: commit the change to `vendor/`, then `git format-patch -1 <commit> --
 | Patch | What |
 |---|---|
 | `0001-hc-q8-honor-stage-trim.patch` | `STRATA_HC_Q8` + `STRATA_STAGE_TRIM`: each layer-split card loads only its own layers' Q8_0 hyper-connection copies, not all 48 (~0.3 GiB per card on 2x RTX 3060, +357 resident experts) |
+| `0002-hc-q8-skip-bf16-multi-gpu.patch` | `STRATA_HC_Q8` on a layer split: don't load the BF16 copy of the HC down/up weights, as single GPU already does (~600 MiB per card) |
