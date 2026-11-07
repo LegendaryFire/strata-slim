@@ -108,7 +108,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates python3 python3-venv libgomp1 libatomic1 tini curl \
     && rm -rf /var/lib/apt/lists/*
 COPY vendor/requirements.txt /tmp/requirements.txt
-RUN python3 -m venv /venv && /venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt
+COPY requirements.txt /tmp/requirements-slim.txt
+RUN python3 -m venv /venv && /venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt -r /tmp/requirements-slim.txt
 
 WORKDIR /opt/strata
 COPY --from=build /out/engine/ /opt/strata/engine/
@@ -119,7 +120,7 @@ COPY vendor/strata_cli/     /opt/strata/strata_cli/
 COPY vendor/data/           /opt/strata/data/
 COPY vendor/tools/*.py      /opt/strata/tools/
 COPY vendor/UPSTREAM vendor/.config-keys vendor/LICENSE /opt/strata/
-COPY launch.py prepare.py hf.py common.py /opt/strata/
+COPY launch.py prepare.py hf.py common.py settings.py /opt/strata/
 
 # build-time checks (no GPU here): every library the engine and the readers link resolves (the ROCm ones from the
 # engine folder; nothing comes from the host but the kernel driver); and the server starts

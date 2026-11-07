@@ -1,0 +1,2 @@
+# strata-slim's own Python packages (launch.py and friends), installed beside vendor/requirements.txt (upstream's)
+python-dotenv==1.2.1
