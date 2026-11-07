@@ -51,36 +51,78 @@ RUN python3 /usr/local/bin/apply_patches.py /patches /src "$PATCHES"
 ARG CUDA_ARCHITECTURES=86
 ARG BUILD_JOBS=4
 ARG BUILD_VISION=1
-RUN --mount=type=cache,target=/ccache set -e; export PATH=/tools/bin:$PATH; \
-    real=""; for a in $(echo "$CUDA_ARCHITECTURES" | tr ';,' '  '); do real="$real;${a}-real"; done; real=${real#;}; \
-    last=$(echo "$CUDA_ARCHITECTURES" | tr ';,' '  ' | awk '{print $NF}'); \
-    sm60=OFF; for a in $(echo "$CUDA_ARCHITECTURES" | tr ';,' '  '); do [ "$a" -lt 75 ] && sm60=ON || true; done; \
-    cc="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache"; \
-    cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF $cc \
-        -DSTRATA_EXPERIMENTAL_SM60=$sm60 \
-        -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PORTABLE=ON -DSTRATA_Q6K_EXPERTS=ON -DSTRATA_MMQ_KQUANTS=ON \
-        "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual" -DSTRATA_GGML_DIR=/opt/llama.cpp; \
-    cmake --build build --target strata strata_kq -j "$BUILD_JOBS"; \
-    if [ "$BUILD_VISION" = "1" ]; then \
-      cmake -G Ninja -S tools/vision -B build-vision -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=/opt/llama.cpp $cc \
-          -DSTRATA_VISION_CUDA=ON -DSTRATA_PORTABLE=ON -DGGML_CUDA_NCCL=OFF "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual"; \
-      cmake --build build-vision --target strata-vision -j "$BUILD_JOBS"; \
-    fi; \
-    ccache --show-stats --verbose | grep -E 'Hits|Misses' | head -4 || true
-RUN set -e; mkdir -p /out/engine; \
-    cp build/strata /out/engine/; \
-    [ -f build/libstrata_kq.so ] && cp build/libstrata_kq.so /out/engine/ || true; \
-    [ -f build-vision/bin/strata-vision ] && cp build-vision/bin/strata-vision /out/engine/ || true; \
-    . ./UPSTREAM; cuda=$(nvcc --version | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1); \
-    ENGINE_VERSION="$engine_version" TAG="$tag" COMMIT="$commit" CUDA="$cuda" ARCHS="$CUDA_ARCHITECTURES" \
-    APPLIED="$(cat PATCHES)" python3 -c '\
-import json, os, re; \
-archs = [a for a in re.split(r"[;,\s]+", os.environ["ARCHS"]) if a]; \
-print(json.dumps({"version": os.environ["ENGINE_VERSION"], "source": "strata-slim " + os.environ["TAG"], \
-                  "commit": os.environ["COMMIT"], "cuda": os.environ["CUDA"], "portable": True, \
-                  "archs": archs, "vision_archs": archs, "ptx": True, \
-                  "patches": [p for p in os.environ["APPLIED"].split(",") if p]}))' > /out/engine/BUILD.json; \
-    cat /out/engine/BUILD.json
+RUN --mount=type=cache,target=/ccache <<'EOF'
+set -e
+export PATH=/tools/bin:$PATH
+
+# every architecture as real code, plus PTX for the last one; anything before sm_75 needs upstream's SM60 path
+archs=$(echo "$CUDA_ARCHITECTURES" | tr ';,' '  ')
+real=""
+sm60=OFF
+for a in $archs; do
+    real="$real;${a}-real"
+    if [ "$a" -lt 75 ]; then sm60=ON; fi
+done
+last=$(echo "$archs" | awk '{print $NF}')
+cuda_archs="${real#;};${last}-virtual"
+ccache="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache"
+
+cmake -G Ninja -S . -B build $ccache \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CUDA_ARCHITECTURES="$cuda_archs" \
+    -DSTRATA_ENABLE_CUDA=ON \
+    -DSTRATA_BUILD_TESTS=OFF \
+    -DSTRATA_EXPERIMENTAL_SM60=$sm60 \
+    -DSTRATA_NATIVE_EXPERTS=ON \
+    -DSTRATA_PORTABLE=ON \
+    -DSTRATA_Q6K_EXPERTS=ON \
+    -DSTRATA_MMQ_KQUANTS=ON \
+    -DSTRATA_GGML_DIR=/opt/llama.cpp
+cmake --build build --target strata strata_kq -j "$BUILD_JOBS"
+
+if [ "$BUILD_VISION" = "1" ]; then
+    cmake -G Ninja -S tools/vision -B build-vision $ccache \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CUDA_ARCHITECTURES="$cuda_archs" \
+        -DLLAMA_DIR=/opt/llama.cpp \
+        -DSTRATA_VISION_CUDA=ON \
+        -DSTRATA_PORTABLE=ON \
+        -DGGML_CUDA_NCCL=OFF
+    cmake --build build-vision --target strata-vision -j "$BUILD_JOBS"
+fi
+
+ccache --show-stats --verbose | grep -E 'Hits|Misses' | head -4 || true
+EOF
+
+# the engine folder, and BUILD.json beside it: what was built, from which release, with which patches
+RUN <<'EOF'
+set -e
+mkdir -p /out/engine
+cp build/strata /out/engine/
+if [ -f build/libstrata_kq.so ]; then cp build/libstrata_kq.so /out/engine/; fi
+if [ -f build-vision/bin/strata-vision ]; then cp build-vision/bin/strata-vision /out/engine/; fi
+
+. ./UPSTREAM
+export ENGINE_VERSION="$engine_version" TAG="$tag" COMMIT="$commit" APPLIED="$(cat PATCHES)"
+export CUDA="$(nvcc --version | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1)"
+python3 - > /out/engine/BUILD.json <<'PY'
+import json, os, re
+env = os.environ
+archs = [a for a in re.split(r"[;,\s]+", env["CUDA_ARCHITECTURES"]) if a]
+print(json.dumps({
+    "version": env["ENGINE_VERSION"],
+    "source": "strata-slim " + env["TAG"],
+    "commit": env["COMMIT"],
+    "cuda": env["CUDA"],
+    "portable": True,
+    "archs": archs,
+    "vision_archs": archs,
+    "ptx": True,
+    "patches": [p for p in env["APPLIED"].split(",") if p],
+}))
+PY
+cat /out/engine/BUILD.json
+EOF
 
 # ---- 2. runtime --------------------------------------------------------------------------------------------------
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-${UBUNTU}
@@ -106,11 +148,24 @@ COPY launch.py prepare.py hf.py common.py settings.py /opt/strata/
 
 # build-time checks (no GPU here): every library the engine links resolves except the driver's own (libcuda, from the
 # host at run time); and the server starts
-RUN set -e; for b in /opt/strata/engine/strata /opt/strata/engine/strata-vision; do \
-      [ -f "$b" ] || continue; \
-      miss=$(LD_LIBRARY_PATH=/opt/strata/engine ldd "$b" | grep 'not found' | grep -v -E 'libcuda\.so|libnvidia-ml' || true); \
-      [ -z "$miss" ] || { echo "$b: missing libraries:"; echo "$miss"; exit 1; }; done; \
-    cd /opt/strata && python -m serve.server --help >/dev/null && echo "serve.server starts"
+RUN <<'EOF'
+set -e
+for b in /opt/strata/engine/strata /opt/strata/engine/strata-vision; do
+    if [ ! -f "$b" ]; then continue; fi
+    missing=$(LD_LIBRARY_PATH=/opt/strata/engine ldd "$b" \
+        | grep 'not found' \
+        | grep -v -E 'libcuda\.so|libnvidia-ml' || true)
+    if [ -n "$missing" ]; then
+        echo "$b: missing libraries:"
+        echo "$missing"
+        exit 1
+    fi
+done
+
+cd /opt/strata
+python -m serve.server --help > /dev/null
+echo "serve.server starts"
+EOF
 
 ENV LD_LIBRARY_PATH=/opt/strata/engine
 VOLUME ["/data"]
