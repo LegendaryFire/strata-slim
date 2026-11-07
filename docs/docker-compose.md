@@ -1,6 +1,7 @@
 # Running strata-slim with Docker Compose
 
-You set everything in one file, `.env`, and start it with `docker compose up -d`. On the first start the
+The server's settings live in one file, `.env`; `compose.yaml` holds the build, the port and the folders. Start it
+with `docker compose up -d`. On the first start the
 model is downloaded and prepared; after that, it starts in a few minutes.
 
 ## What you need
@@ -18,14 +19,17 @@ model is downloaded and prepared; after that, it starts in a few minutes.
 cp example.env .env
 ```
 
-Open `.env` and check these lines:
+In `compose.yaml`, check:
+
+- `CUDA_ARCHITECTURES`: your card, `86` RTX 30, `89` RTX 40, `120` RTX 50.
+- On AMD, swap the commented lines: the `-rocm` image, `Dockerfile.rocm`, `HIP_ARCHITECTURES` (your card: `gfx1100`
+  RX 7900, `gfx1101` RX 7800 / 7700, `gfx1201` RX 9070, `gfx1200` RX 9060), and `devices` in place of `deploy`.
+- The model goes in `./models` next to `compose.yaml` (100+ GB); change that volume line to put it on another disk.
+
+Then open `.env` and check these lines:
 
 | Setting | What to put |
 |---|---|
-| `COMPOSE_PROFILES` | `nvidia` or `amd` |
-| `MODELS_PATH` | a folder with room for the model; it is created if missing |
-| `CUDA_ARCHITECTURES` (NVIDIA) | your card: `86` RTX 30, `89` RTX 40, `120` RTX 50 |
-| `HIP_ARCHITECTURES` (AMD) | your card: `gfx1100` RX 7900, `gfx1101` RX 7800 / 7700, `gfx1201` RX 9070, `gfx1200` RX 9060 |
 | `GPUS` | `0` for one card, `0,1` for two |
 | `ENGINE_ARGS` | the example is tuned for two RTX 3060s; delete the line if your setup is different |
 
@@ -68,22 +72,22 @@ The API is OpenAI- and Anthropic-compatible: point a client at `http://localhost
 | `docker compose logs -f` | follow the log (`Ctrl+C` stops following, not the server) |
 | `docker compose ps` | is it running and healthy? |
 
-Editing `.env` takes effect on the next `docker compose up -d`. No rebuild is needed, except for the build settings
-(`CUDA_ARCHITECTURES`, `HIP_ARCHITECTURES`, `BUILD_JOBS`).
+Editing `.env` takes effect on the next `docker compose up -d`. No rebuild is needed, except for the build args in
+`compose.yaml` (`CUDA_ARCHITECTURES`, `HIP_ARCHITECTURES`, `BUILD_JOBS`): `docker compose build` after changing those.
 
-Two useful one-offs (use `strata-amd` instead of `strata-nvidia` on AMD):
+Two useful one-offs:
 
 ```sh
-docker compose run --rm strata-nvidia print-config   # show the config the settings make, without starting
-docker compose run --rm strata-nvidia prepare        # only download and prepare the model, then exit
+docker compose run --rm strata-slim print-config   # show the config the settings make, without starting
+docker compose run --rm strata-slim prepare        # only download and prepare the model, then exit
 ```
 
 ## Opening it to your network
 
-By default only this machine can reach the API (`LISTEN=127.0.0.1`). To let other machines connect:
+By default only this machine can reach the API (`127.0.0.1:8080:8080` in `compose.yaml`). To let other machines
+connect, change that line to `8080:8080` and set a key in `.env`:
 
 ```ini
-LISTEN=0.0.0.0
 API_KEY=some-long-random-string
 ```
 
@@ -99,13 +103,14 @@ STRATA_ALLOWED_HOSTS=llm.example.com
 
 | On the host | What |
 |---|---|
-| `MODELS_PATH/models/` | the downloaded model files |
-| `MODELS_PATH/packs/` | the pack built from them |
-| `MODELS_PATH/mtp/` | the MTP draft layer |
-| `DATA_PATH/run/config.json` | the config generated on each start |
-| `DATA_PATH/logs/engine.log` | the engine's log |
+| `models/models/` | the downloaded model files |
+| `models/packs/` | the pack built from them |
+| `models/mtp/` | the MTP draft layer |
+| `data/run/config.json` | the config generated on each start |
+| `data/logs/engine.log` | the engine's log |
 
-If you already have the model downloaded, point `MODELS_PATH` at the folder that holds `models/`. strata-slim checks those
+Both folders are next to `compose.yaml`. If you already have the model downloaded, point the `/models` volume at the
+folder that holds `models/`. strata-slim checks those
 files and uses them instead of downloading again.
 
 ## Updating
@@ -122,7 +127,7 @@ docker compose up -d
 |---|---|
 | `could not select device driver "nvidia"` | install the NVIDIA Container Toolkit and restart Docker |
 | `/dev/kfd: no such file` (AMD) | the amdgpu driver is not loaded, or this is not an AMD machine |
-| the engine stops saying the card has no code | build again with your card in `CUDA_ARCHITECTURES` / `HIP_ARCHITECTURES` |
+| the engine stops saying the card has no code | put your card in `CUDA_ARCHITECTURES` / `HIP_ARCHITECTURES` in `compose.yaml` and build again |
 | out of memory on the GPU | lower `CONTEXT` (e.g. `64k`), or raise `VRAM_RESERVE_MIB` if other programs use the card |
-| the build is killed | lower `BUILD_JOBS` |
+| the build is killed | lower `BUILD_JOBS` in `compose.yaml` |
 | a setting seems ignored | `print-config` (above) shows what the server gets; the log warns about `CONFIG_*` names it does not know |
