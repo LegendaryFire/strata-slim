@@ -1,30 +1,21 @@
 # patches
 
-Local fixes on top of upstream Strata. They are **optional and off by default**: `vendor/` is always upstream's code
-exactly, and a build applies patches only when you ask for them with the `PATCHES` build arg.
-
-| `PATCHES` | Build |
-|---|---|
-| unset, empty or `none` (default) | upstream's code as released |
-| `all` | every `*.patch` here, in name order |
-| `0001,0002` | just those, by number or file name |
+Small fixes we carry on top of upstream Strata. They're off by default, so a normal build is upstream's code as
+released. Turn them on with the `PATCHES` build arg:
 
 ```sh
-docker build -t strata-slim:0.2.11 .                                         # stock
-docker build -t strata-slim:0.2.11-patched --build-arg PATCHES=all .         # with the fixes
+docker build -t strata-slim:0.2.11-patched --build-arg PATCHES=all .
 ```
 
-`compose.yaml` builds the stock image; build a patched one with `docker build` as above. The engine's `BUILD.json` lists the patches a build has (`"patches": [...]`).
+`PATCHES` takes `all`, or a list of patch numbers like `0001,0002`.
 
-`scripts/apply-patches.sh` applies them in the build stage. `scripts/extract.sh` checks each against a new release:
+To add one, make the change in `vendor/`, commit it, save it with
+`git format-patch -1 <commit> --stdout > patches/NNNN-name.patch`, then revert the commit.
 
-- A patch upstream already has gets a note: delete it.
-- A patch that no longer applies stops the extract: rebase it on the new `vendor/`.
+When upstream updates, `scripts/extract.sh` checks that each patch still applies. If upstream already has the fix,
+delete the patch.
 
-New patch: make the change in `vendor/`, commit it, `git format-patch -1 <commit> --stdout > patches/NNNN-name.patch`,
-then revert the commit so `vendor/` stays upstream's.
-
-| Patch | What |
+| Patch | What it does |
 |---|---|
-| `0001-hc-q8-honor-stage-trim.patch` | `STRATA_HC_Q8` + `STRATA_STAGE_TRIM`: each layer-split card loads only its own layers' Q8_0 hyper-connection copies, not all 48 (~0.3 GiB per card on 2x RTX 3060, +357 resident experts) |
-| `0002-hc-q8-skip-bf16-multi-gpu.patch` | `STRATA_HC_Q8` on a layer split: don't load the BF16 copy of the HC down/up weights, as single GPU already does (~600 MiB per card) |
+| `0001-hc-q8-honor-stage-trim.patch` | When the model is split across GPUs, each GPU only loads the HC Q8 weights for its own layers instead of all of them. |
+| `0002-hc-q8-skip-bf16-multi-gpu.patch` | When the model is split across GPUs, skip loading the BF16 copy of the HC weights, the same as a single GPU already does. |
