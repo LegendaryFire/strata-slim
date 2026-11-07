@@ -3,6 +3,7 @@
 #
 #   docker build -f Dockerfile.rocm -t strata-slim:0.2.11-rocm .                         # RDNA3 + RDNA4, 4 compile jobs
 #   docker build -f Dockerfile.rocm -t strata-slim:0.2.11-rocm --build-arg HIP_ARCHITECTURES=gfx1201 --build-arg BUILD_JOBS=8 .
+#   docker build -f Dockerfile.rocm -t strata-slim:0.2.11-patched-rocm --build-arg PATCHES=all .   # with the local fixes
 #
 # HIP_ARCHITECTURES (upstream's table, cmake/hip_backend.cmake and docs/AMD_HIP.md):
 #   gfx1100 RX 7900 XT/XTX, gfx1201 RX 9070/9070 XT and Radeon AI PRO R9700   (tested by upstream's maintainers)
@@ -28,7 +29,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive PIP_DISABLE_PIP_VERSION_CHECK=1 CCACHE_DIR=/ccache CCACHE_MAXSIZE=10G \
     ROCM_PATH=/opt/rocm HIP_PATH=/opt/rocm HIP_PLATFORM=amd
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential ca-certificates ccache curl unzip python3 python3-venv \
+        build-essential ca-certificates ccache curl unzip patch python3 python3-venv \
     && rm -rf /var/lib/apt/lists/*
 RUN python3 -m venv /tools
 WORKDIR /src
@@ -52,6 +53,11 @@ COPY vendor/tests/       /src/tests/
 COPY vendor/tools/vision/  /src/tools/vision/
 COPY vendor/tools/trellis/ /src/tools/trellis/
 COPY vendor/tools/hip/     /src/tools/hip/
+# local fixes from patches/, only when asked: PATCHES=all, or some by number (0001,0002). Default: none, upstream's code.
+COPY patches/ /patches/
+COPY scripts/apply-patches.sh /usr/local/bin/apply-patches
+ARG PATCHES=""
+RUN apply-patches /patches /src "$PATCHES"
 ARG HIP_ARCHITECTURES="gfx1100;gfx1101;gfx1102;gfx1200;gfx1201"
 ARG BUILD_JOBS=4
 ARG BUILD_VISION=1
@@ -91,13 +97,13 @@ RUN set -e; R=$ROCM_PATH; O=/out/engine; mkdir -p $O; \
     done; \
     . ./UPSTREAM; vision=$([ -f $O/strata-vision-hip ] && echo gpu || echo none); \
     ENGINE_VERSION="$engine_version" TAG="$tag" COMMIT="$commit" ARCHS="$archs" ROCM="$(cat $R/.info/version 2>/dev/null || $R/bin/hipconfig --version 2>/dev/null || echo unknown)" \
-    VISION="$vision" python3 -c '\
+    VISION="$vision" APPLIED="$(cat PATCHES)" python3 -c '\
 import json, os; \
 archs = os.environ["ARCHS"].split(); \
 print(json.dumps({"version": os.environ["ENGINE_VERSION"], "source": "strata-slim " + os.environ["TAG"], \
                   "commit": os.environ["COMMIT"], "backend": "hip", "rocm": os.environ["ROCM"], "portable": True, \
                   "archs": archs, "vision": os.environ["VISION"], "vision_cpu": "strata-vision", "vision_gpu": "strata-vision-hip", \
-                  "vision_archs": archs}))' > $O/BUILD.json; \
+                  "vision_archs": archs, "patches": [p for p in os.environ["APPLIED"].split(",") if p]}))' > $O/BUILD.json; \
     cat $O/BUILD.json; echo "engine folder: $(du -sh $O | cut -f1)"
 
 # ---- 2. runtime --------------------------------------------------------------------------------------------------

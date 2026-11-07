@@ -3,6 +3,7 @@
 #
 #   docker build -t strata-slim:0.2.11 .                                     # RTX 30 (sm_86), 4 compile jobs
 #   docker build -t strata-slim:0.2.11 --build-arg CUDA_ARCHITECTURES="86;89" --build-arg BUILD_JOBS=8 .
+#   docker build -t strata-slim:0.2.11-patched --build-arg PATCHES=all .    # with the local fixes (patches/README.md)
 #
 # CUDA_ARCHITECTURES: 86 = RTX 30, 89 = RTX 40, 120 = RTX 50 (the last one also gets PTX). BUILD_JOBS: each nvcc job
 # can take several GB of RAM; raise it when the machine has the memory free.
@@ -19,7 +20,7 @@ ARG UBUNTU=ubuntu24.04
 FROM nvidia/cuda:${CUDA_VERSION}-devel-${UBUNTU} AS build
 ENV DEBIAN_FRONTEND=noninteractive PIP_DISABLE_PIP_VERSION_CHECK=1 CCACHE_DIR=/ccache CCACHE_MAXSIZE=10G
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential ca-certificates ccache curl unzip python3 python3-venv libgomp1 libatomic1 \
+        build-essential ca-certificates ccache curl unzip patch python3 python3-venv libgomp1 libatomic1 \
     && rm -rf /var/lib/apt/lists/*
 RUN python3 -m venv /tools
 WORKDIR /src
@@ -42,6 +43,11 @@ COPY vendor/bench/       /src/bench/
 COPY vendor/tests/       /src/tests/
 COPY vendor/tools/vision/  /src/tools/vision/
 COPY vendor/tools/trellis/ /src/tools/trellis/
+# local fixes from patches/, only when asked: PATCHES=all, or some by number (0001,0002). Default: none, upstream's code.
+COPY patches/ /patches/
+COPY scripts/apply-patches.sh /usr/local/bin/apply-patches
+ARG PATCHES=""
+RUN apply-patches /patches /src "$PATCHES"
 ARG CUDA_ARCHITECTURES=86
 ARG BUILD_JOBS=4
 ARG BUILD_VISION=1
@@ -66,12 +72,14 @@ RUN set -e; mkdir -p /out/engine; \
     [ -f build/libstrata_kq.so ] && cp build/libstrata_kq.so /out/engine/ || true; \
     [ -f build-vision/bin/strata-vision ] && cp build-vision/bin/strata-vision /out/engine/ || true; \
     . ./UPSTREAM; cuda=$(nvcc --version | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1); \
-    ENGINE_VERSION="$engine_version" TAG="$tag" COMMIT="$commit" CUDA="$cuda" ARCHS="$CUDA_ARCHITECTURES" python3 -c '\
+    ENGINE_VERSION="$engine_version" TAG="$tag" COMMIT="$commit" CUDA="$cuda" ARCHS="$CUDA_ARCHITECTURES" \
+    APPLIED="$(cat PATCHES)" python3 -c '\
 import json, os, re; \
 archs = [a for a in re.split(r"[;,\s]+", os.environ["ARCHS"]) if a]; \
 print(json.dumps({"version": os.environ["ENGINE_VERSION"], "source": "strata-slim " + os.environ["TAG"], \
                   "commit": os.environ["COMMIT"], "cuda": os.environ["CUDA"], "portable": True, \
-                  "archs": archs, "vision_archs": archs, "ptx": True}))' > /out/engine/BUILD.json; \
+                  "archs": archs, "vision_archs": archs, "ptx": True, \
+                  "patches": [p for p in os.environ["APPLIED"].split(",") if p]}))' > /out/engine/BUILD.json; \
     cat /out/engine/BUILD.json
 
 # ---- 2. runtime --------------------------------------------------------------------------------------------------

@@ -1,12 +1,28 @@
 # patches
 
-Local fixes on top of upstream Strata. `scripts/extract.sh` applies every `*.patch` here, in name order, after it
-replaces `vendor/`, and lists them in `vendor/UPSTREAM`. Paths are relative to the project root (`vendor/...`).
+Local fixes on top of upstream Strata. They are **optional and off by default**: `vendor/` is always upstream's code
+exactly, and a build applies patches only when you ask for them with the `PATCHES` build arg.
 
-- A patch upstream already has is skipped with a note: delete it.
+| `PATCHES` | Build |
+|---|---|
+| unset, empty or `none` (default) | upstream's code as released |
+| `all` | every `*.patch` here, in name order |
+| `0001,0002` | just those, by number or file name |
+
+```sh
+docker build -t strata-slim:0.2.11 .                                         # stock
+docker build -t strata-slim:0.2.11-patched --build-arg PATCHES=all .         # with the fixes
+```
+
+`compose.yaml` builds the stock image; build a patched one with `docker build` as above. The engine's `BUILD.json` lists the patches a build has (`"patches": [...]`).
+
+`scripts/apply-patches.sh` applies them in the build stage. `scripts/extract.sh` checks each against a new release:
+
+- A patch upstream already has gets a note: delete it.
 - A patch that no longer applies stops the extract: rebase it on the new `vendor/`.
 
-New patch: commit the change to `vendor/`, then `git format-patch -1 <commit> --stdout > patches/NNNN-name.patch`.
+New patch: make the change in `vendor/`, commit it, `git format-patch -1 <commit> --stdout > patches/NNNN-name.patch`,
+then revert the commit so `vendor/` stays upstream's.
 
 | Patch | What |
 |---|---|
