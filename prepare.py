@@ -45,54 +45,6 @@ DRAFT_VOCAB_FILES = {
 RECORD_FILE = ".source.json"
 
 
-# ---- which files ------------------------------------------------------------------------------------------------
-
-def is_mmproj(f: RemoteFile) -> bool:
-    return f.name.lower().startswith("mmproj") and f.name.endswith(".gguf")
-
-
-def quant_of(f: RemoteFile) -> str:
-    """The quantization a model file belongs to: its folder (UD-Q4_K_XL/...), or its name without the shard suffix."""
-    if "/" in f.path:
-        return f.path.split("/", 1)[0]
-    return re.sub(r"-\d{5}-of-\d{5}$", "", f.name.removesuffix(".gguf"))
-
-
-def files_by_quant(files: list[RemoteFile], repo: str, quant: str | None) -> tuple[str, list[RemoteFile]]:
-    """The files of one quantization: MODEL_QUANT, or the only one the repository has."""
-    groups: dict[str, list[RemoteFile]] = {}
-    for f in files:
-        if f.name.endswith(".gguf") and not is_mmproj(f) and not f.name.lower().startswith("mtp"):
-            groups.setdefault(quant_of(f), []).append(f)
-
-    choices = ""
-    for q, group in sorted(groups.items()):
-        total = 0
-        for f in group:
-            total += f.size
-        choices += f"\n    {q:28} {len(group)} file(s), {size_text(total)}"
-
-    if not quant:
-        if len(groups) == 1:
-            return next(iter(groups.items()))
-        raise SetupError(f"{repo} has {len(groups)} quantizations; set MODEL_QUANT to one of them:{choices}")
-
-    # an exact name, else a suffix: Q4_K_XL finds UD-Q4_K_XL
-    matches = []
-    for q in groups:
-        if q.lower() == quant.lower():
-            matches.append(q)
-    if not matches:
-        for q in groups:
-            if q.lower().endswith("-" + quant.lower()):
-                matches.append(q)
-
-    if len(matches) != 1:
-        found = "matches none" if not matches else f"matches {len(matches)} ({', '.join(matches)})"
-        raise SetupError(f"MODEL_QUANT={quant} {found} of {repo}'s quantizations:{choices}")
-    return matches[0], groups[matches[0]]
-
-
 # ---- the record of a download (.source.json) ----------------------------------------------------------------------
 
 @dataclass
@@ -212,7 +164,45 @@ class Preparer:
         """No record yet: resolve the revision, adopt files already there, download the rest, write the record."""
         repo = self.settings.model_repo
         commit = self.hub.resolve_commit(repo, self.settings.model_revision or "main")
-        quant, files = files_by_quant(self.hub.list_files(repo, commit), repo, self.settings.model_quant)
+
+        # the model's GGUF files by quantization: their folder (UD-Q4_K_XL/...), or the name without the shard suffix
+        groups: dict[str, list[RemoteFile]] = {}
+        for f in self.hub.list_files(repo, commit):
+            if not f.name.endswith(".gguf") or f.name.lower().startswith(("mmproj", "mtp")):
+                continue
+            if "/" in f.path:
+                q = f.path.split("/", 1)[0]
+            else:
+                q = re.sub(r"-\d+-of-\d+$", "", f.name.removesuffix(".gguf"))   # Model-Q8_0-00001-of-00003 -> Model-Q8_0
+            groups.setdefault(q, []).append(f)
+
+        choices = ""
+        for q, group in sorted(groups.items()):
+            total = 0
+            for f in group:
+                total += f.size
+            choices += f"\n    {q:28} {len(group)} file(s), {size_text(total)}"
+
+        # MODEL_QUANT picks one: an exact name, else a suffix (Q4_K_XL finds UD-Q4_K_XL). Unset: the only one there is
+        asked = self.settings.model_quant
+        matches = []
+        if not asked:
+            if len(groups) != 1:
+                raise SetupError(f"{repo} has {len(groups)} quantizations; set MODEL_QUANT to one of them:{choices}")
+            matches = list(groups)
+        else:
+            for q in groups:
+                if q.lower() == asked.lower():
+                    matches.append(q)
+            if not matches:
+                for q in groups:
+                    if q.lower().endswith("-" + asked.lower()):
+                        matches.append(q)
+            if len(matches) != 1:
+                found = "matches none" if not matches else f"matches {len(matches)} ({', '.join(matches)})"
+                raise SetupError(f"MODEL_QUANT={asked} {found} of {repo}'s quantizations:{choices}")
+        quant = matches[0]
+        files = groups[quant]
 
         # finished (.done) GGUF files already in the folder are adopted, but only when they are exactly these:
         # another version's or quant's files stop the start
@@ -254,7 +244,8 @@ class Preparer:
 
         candidates = []
         for f in self.hub.list_files(repo, commit):
-            if is_mmproj(f):
+            is_mmproj = f.name.lower().startswith("mmproj") and f.name.endswith(".gguf")
+            if is_mmproj:
                 candidates.append(f)
         if not candidates:
             raise SetupError(f"{repo} has no mmproj*.gguf file; "
