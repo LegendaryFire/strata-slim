@@ -45,7 +45,7 @@ COPY vendor/tools/vision/  /src/tools/vision/
 COPY vendor/tools/trellis/ /src/tools/trellis/
 # local fixes from patches/, only when asked: PATCHES=all, or some by number (0001,0002). Default: none, upstream's code.
 COPY patches/ /patches/
-COPY scripts/apply_patches.py /usr/local/bin/apply_patches.py
+COPY scripts/apply_patches.py scripts/build_info.py /usr/local/bin/
 ARG PATCHES=""
 RUN python3 /usr/local/bin/apply_patches.py /patches /src "$PATCHES"
 ARG CUDA_ARCHITECTURES=86
@@ -101,27 +101,7 @@ mkdir -p /out/engine
 cp build/strata /out/engine/
 if [ -f build/libstrata_kq.so ]; then cp build/libstrata_kq.so /out/engine/; fi
 if [ -f build-vision/bin/strata-vision ]; then cp build-vision/bin/strata-vision /out/engine/; fi
-
-. ./UPSTREAM
-export ENGINE_VERSION="$engine_version" TAG="$tag" COMMIT="$commit" APPLIED="$(cat PATCHES)"
-export CUDA="$(nvcc --version | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1)"
-python3 - > /out/engine/BUILD.json <<'PY'
-import json, os, re
-env = os.environ
-archs = [a for a in re.split(r"[;,\s]+", env["CUDA_ARCHITECTURES"]) if a]
-print(json.dumps({
-    "version": env["ENGINE_VERSION"],
-    "source": "strata-slim " + env["TAG"],
-    "commit": env["COMMIT"],
-    "cuda": env["CUDA"],
-    "portable": True,
-    "archs": archs,
-    "vision_archs": archs,
-    "ptx": True,
-    "patches": [p for p in env["APPLIED"].split(",") if p],
-}))
-PY
-cat /out/engine/BUILD.json
+python3 /usr/local/bin/build_info.py cuda "$CUDA_ARCHITECTURES" /src /out/engine
 EOF
 
 # ---- 2. runtime --------------------------------------------------------------------------------------------------

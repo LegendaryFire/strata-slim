@@ -55,7 +55,7 @@ COPY vendor/tools/trellis/ /src/tools/trellis/
 COPY vendor/tools/hip/     /src/tools/hip/
 # local fixes from patches/, only when asked: PATCHES=all, or some by number (0001,0002). Default: none, upstream's code.
 COPY patches/ /patches/
-COPY scripts/apply_patches.py /usr/local/bin/apply_patches.py
+COPY scripts/apply_patches.py scripts/build_info.py /usr/local/bin/
 ARG PATCHES=""
 RUN python3 /usr/local/bin/apply_patches.py /patches /src "$PATCHES"
 ARG HIP_ARCHITECTURES="gfx1100;gfx1101;gfx1102;gfx1200;gfx1201"
@@ -95,16 +95,8 @@ RUN set -e; R=$ROCM_PATH; O=/out/engine; mkdir -p $O; \
           --out $O "${data[@]}"; \
       data=(); cp "$b" $O/; \
     done; \
-    . ./UPSTREAM; vision=$([ -f $O/strata-vision-hip ] && echo gpu || echo none); \
-    ENGINE_VERSION="$engine_version" TAG="$tag" COMMIT="$commit" ARCHS="$archs" ROCM="$(cat $R/.info/version 2>/dev/null || $R/bin/hipconfig --version 2>/dev/null || echo unknown)" \
-    VISION="$vision" APPLIED="$(cat PATCHES)" python3 -c '\
-import json, os; \
-archs = os.environ["ARCHS"].split(); \
-print(json.dumps({"version": os.environ["ENGINE_VERSION"], "source": "strata-slim " + os.environ["TAG"], \
-                  "commit": os.environ["COMMIT"], "backend": "hip", "rocm": os.environ["ROCM"], "portable": True, \
-                  "archs": archs, "vision": os.environ["VISION"], "vision_cpu": "strata-vision", "vision_gpu": "strata-vision-hip", \
-                  "vision_archs": archs, "patches": [p for p in os.environ["APPLIED"].split(",") if p]}))' > $O/BUILD.json; \
-    cat $O/BUILD.json; echo "engine folder: $(du -sh $O | cut -f1)"
+    python3 /usr/local/bin/build_info.py hip "$HIP_ARCHITECTURES" /src $O; \
+    echo "engine folder: $(du -sh $O | cut -f1)"
 
 # ---- 2. runtime --------------------------------------------------------------------------------------------------
 FROM ${RUNTIME_IMAGE}
