@@ -3,4 +3,3 @@ commit=c3b3f5035506f3e966f1b4b7b188aeaabae92f1d
 date=2026-11-05T12:54:06+01:00
 engine_version=0.1.57
 llama_cpp_commit=3cf03257f219afbe7334045ff7c6a06ac68c627d
-patches=0001-hc-q8-honor-stage-trim.patch,0002-hc-q8-skip-bf16-multi-gpu.patch
