@@ -153,7 +153,7 @@ class Config:
         """CONFIG_<KEY>=value becomes {"key": value}. The value is parsed as JSON when it is JSON.
 
         These are not in Settings: any key the server reads can be set, and .config-keys (made by
-        scripts/extract.sh from upstream's server) is the list to check a typo against."""
+        scripts/extract.py from upstream's server) is the list to check a typo against."""
         known_keys = (ROOT / ".config-keys").read_text().split()
         # keys built from their own settings, so CONFIG_<KEY> must not set them
         built_keys = ["exe", "args", "tokenizer", "vision", "drafting"]

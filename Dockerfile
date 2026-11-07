@@ -8,7 +8,7 @@
 # CUDA_ARCHITECTURES: 86 = RTX 30, 89 = RTX 40, 120 = RTX 50 (the last one also gets PTX). BUILD_JOBS: each nvcc job
 # can take several GB of RAM; raise it when the machine has the memory free.
 #
-# The compile flags are upstream's (its root Dockerfile, "engine-build" stage). vendor/ comes from scripts/extract.sh.
+# The compile flags are upstream's (its root Dockerfile, "engine-build" stage). vendor/ comes from scripts/extract.py.
 # The engine stage copies only the engine's sources, so a change to the server, the tools or launch.py does not
 # recompile it; and ccache (a BuildKit cache mount) keeps object files between builds, so a new upstream release
 # recompiles only the sources that changed.
@@ -45,9 +45,9 @@ COPY vendor/tools/vision/  /src/tools/vision/
 COPY vendor/tools/trellis/ /src/tools/trellis/
 # local fixes from patches/, only when asked: PATCHES=all, or some by number (0001,0002). Default: none, upstream's code.
 COPY patches/ /patches/
-COPY scripts/apply-patches.sh /usr/local/bin/apply-patches
+COPY scripts/apply_patches.py /usr/local/bin/apply_patches.py
 ARG PATCHES=""
-RUN apply-patches /patches /src "$PATCHES"
+RUN python3 /usr/local/bin/apply_patches.py /patches /src "$PATCHES"
 ARG CUDA_ARCHITECTURES=86
 ARG BUILD_JOBS=4
 ARG BUILD_VISION=1

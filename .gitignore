@@ -1,4 +1,4 @@
-# cached bare clone of upstream (scripts/extract.sh)
+# cached bare clone of upstream (scripts/extract.py)
 .upstream/
 vendor.new/
 __pycache__/

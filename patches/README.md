@@ -12,7 +12,7 @@ docker build -t strata-slim:0.2.11-patched --build-arg PATCHES=all .
 To add one, make the change in `vendor/`, commit it, save it with
 `git format-patch -1 <commit> --stdout > patches/NNNN-name.patch`, then revert the commit.
 
-When upstream updates, `scripts/extract.sh` checks that each patch still applies. If upstream already has the fix,
+When upstream updates, `scripts/extract.py` checks that each patch still applies. If upstream already has the fix,
 delete the patch.
 
 | Patch | What it does |

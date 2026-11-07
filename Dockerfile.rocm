@@ -55,9 +55,9 @@ COPY vendor/tools/trellis/ /src/tools/trellis/
 COPY vendor/tools/hip/     /src/tools/hip/
 # local fixes from patches/, only when asked: PATCHES=all, or some by number (0001,0002). Default: none, upstream's code.
 COPY patches/ /patches/
-COPY scripts/apply-patches.sh /usr/local/bin/apply-patches
+COPY scripts/apply_patches.py /usr/local/bin/apply_patches.py
 ARG PATCHES=""
-RUN apply-patches /patches /src "$PATCHES"
+RUN python3 /usr/local/bin/apply_patches.py /patches /src "$PATCHES"
 ARG HIP_ARCHITECTURES="gfx1100;gfx1101;gfx1102;gfx1200;gfx1201"
 ARG BUILD_JOBS=4
 ARG BUILD_VISION=1
