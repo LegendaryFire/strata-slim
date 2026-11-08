@@ -94,6 +94,7 @@ tool_call_recovery
 trusted_origins
 type
 uma
+undeclared_tool_calls
 url
 user_args
 vae

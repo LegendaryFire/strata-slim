@@ -12,8 +12,8 @@ name: strata-slim
 
 services:
   strata-slim:
-    image: strata-slim:0.2.11
-    # image: strata-slim:0.2.11-rocm
+    image: strata-slim:0.2.12
+    # image: strata-slim:0.2.12-rocm
     build:
       context: .
       dockerfile: Dockerfile

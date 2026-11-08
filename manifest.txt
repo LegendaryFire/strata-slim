@@ -26,6 +26,8 @@ bench/gfx906_qsa_query_swizzle_probe.cpp
 # two test programs CMakeLists adds outside its "tests/ present" check (v0.2.10)
 tests/core/dma_batch_parity.cu
 tests/cuda/hc_q8_stream_test.cu
+# the CUDA and HIP builds both add this one the same way (v0.2.12)
+tests/core/flag_order_test.cu
 # the HIP build (Dockerfile.rocm) adds these tests and tuning tools outside the "tests/ present" check too (v0.2.10);
 # configure needs them to exist, only `strata` and `strata-device` are built
 tests/cuda/pa_bench.cpp
