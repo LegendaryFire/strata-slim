@@ -20,7 +20,7 @@ or AMD, name a model, run `docker compose up -d`, and it downloads, checks, pack
 ## Docker Compose
 
 Images are published for NVIDIA (`cuda`: RTX 30, 40 and 50) and AMD (`rocm`: RX 7000 and 9000). Each release is
-also tagged with its version, such as `0.2.12-1-cuda`, for pinning.
+also tagged with its version, such as `0.2.13-1-cuda`, for pinning.
 
 `docker-compose.yml`:
 

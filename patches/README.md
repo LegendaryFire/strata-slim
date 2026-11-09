@@ -4,7 +4,7 @@ Small fixes we carry on top of upstream Strata. They're off by default, so a nor
 released. Turn them on with the `PATCHES` build arg:
 
 ```sh
-docker build -t strata-slim:0.2.12-patched --build-arg PATCHES=all .
+docker build -t strata-slim:0.2.13-patched --build-arg PATCHES=all .
 ```
 
 `PATCHES` takes `all`, or a list of patch numbers like `0001,0002`.
