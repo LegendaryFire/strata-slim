@@ -114,6 +114,9 @@ GPUS=0
 # Layer split across several GPUs: auto, or the first layer of each additional GPU (for example 24). Default: auto.
 # CONFIG_LAYER_SPLIT=auto
 
+# Each GPU loads only its own layers' dense weights, freeing memory for the expert cache. Recommended for multi-GPU setups.
+# STRATA_STAGE_TRIM=1
+
 # ----------------------------------------------------------------------
 # Vision
 # ----------------------------------------------------------------------
@@ -167,6 +170,7 @@ in [docs/docker-compose.md](docs/docker-compose.md).
 | `VRAM_RESERVE_MIB` | MiB of VRAM kept free, e.g. `550` | the engine's |
 | `GPUS` | card numbers: `0`, `0,1` | the server's choice |
 | `CONFIG_LAYER_SPLIT` | `auto`, or the first layer of each later GPU: `24` (2 GPUs), `24,36,42` (4 GPUs) | `auto` |
+| `STRATA_STAGE_TRIM` | `1` to load each GPU's own layers' dense weights only (recommended for multi-GPU setups) | off |
 | `VISION` | `off`, `cpu`, `gpu` | `off` |
 | `VISION_MAX_TOKENS` | tokens per picture, `0` for no limit | `300` on CPU, `1024` on GPU |
 | `API_KEY` | any string; clients send it as `Authorization: Bearer ...` | none (no key) |
