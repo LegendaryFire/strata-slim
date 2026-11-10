@@ -104,8 +104,8 @@ KV=int8
 # VRAM to keep free on each card, in MiB. Default: set by the engine.
 # VRAM_RESERVE_MIB=550
 
-# Additional engine flags.
-# ENGINE_ARGS=--expert-cache auto --spec 4
+# Engine flags. Required, and must include --prefill and --spec.
+ENGINE_ARGS=--expert-cache auto --prefill auto --spec 4 --spec-min-p 0.5
 
 # ----------------------------------------------------------------------
 # GPUs
@@ -179,7 +179,7 @@ in [docs/docker-compose.md](docs/docker-compose.md).
 | `API_KEY` | any string; clients send it as `Authorization: Bearer ...` | none (no key) |
 | `MODEL_NAME` | the name `/v1/models` lists | from the file name |
 | `PREPARE` | `auto`, `off` | `auto` |
-| `ENGINE_ARGS` | any other engine flags, e.g. `--spec 4 --expert-cache auto` | none |
+| `ENGINE_ARGS` | engine flags, must include `--prefill` and `--spec`, e.g. `--expert-cache auto --prefill auto --spec 4 --spec-min-p 0.5` | required |
 
 ## License
 

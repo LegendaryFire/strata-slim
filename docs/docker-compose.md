@@ -31,7 +31,7 @@ Then open `.env` and check these lines:
 | Setting | What to put |
 |---|---|
 | `GPUS` | `0` for one card, `0,1` for two |
-| `ENGINE_ARGS` | the example is tuned for two RTX 3060s; delete the line if your setup is different |
+| `ENGINE_ARGS` | the example is tuned for two RTX 3060s; if your setup is different, use `--expert-cache auto --prefill auto --spec 4 --spec-min-p 0.5` |
 
 Everything else can stay as it is.
 

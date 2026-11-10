@@ -114,6 +114,9 @@ class Config:
             args += ["--vram-reserve-mib", str(s.vram_reserve_mib)]
 
         extra = shlex.split(s.engine_args)
+        missing_required = "--prefill" not in extra or "--spec" not in extra
+        if missing_required:
+            raise SetupError("Engine arguments is missing required parameters. --prefill and --spec must be set")
         # flags that have their own setting, so ENGINE_ARGS must not set them again
         flags_with_a_setting = ["--pack", "--native", "--expert-profile", "--mtp", "--max-context", "--kv",
                                 "--vram-reserve-mib"]
