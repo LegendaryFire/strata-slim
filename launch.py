@@ -45,8 +45,7 @@ class Config:
     def build(self) -> dict:
         s = self.settings
         if not self.paths.pack.is_dir():
-            raise SetupError(f"no pack at {self.paths.pack}: start with PREPARE=auto to build it, "
-                             "or set PACK to an existing pack folder")
+            raise SetupError(f"no pack at {self.paths.pack}: build it with PREPARE=auto or set PACK to an existing one")
 
         tokenizer = s.tokenizer or Path(self.paths.pack, "tokenizer")
         if not Path(tokenizer, "vocab.json").is_file():

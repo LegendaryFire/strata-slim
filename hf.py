@@ -22,7 +22,6 @@ from common import Progress, SetupError, size_text
 log = logging.getLogger(__name__)
 
 CHUNK = 8 << 20
-DOWNLOAD_TRIES = 5
 
 
 @dataclass
@@ -154,15 +153,16 @@ class HuggingFace:
             raise SetupError(f"{dst.parent}: {size_text(free)} free, {dst.name} needs {size_text(needed)} more")
 
         url = f"{self.endpoint}/{repo}/resolve/{urllib.parse.quote(commit, safe='')}/{urllib.parse.quote(f.path)}"
-        for attempt in range(1, DOWNLOAD_TRIES + 1):
+        max_attempts = 5
+        for attempt in range(1, max_attempts + 1):
             try:
                 self.fetch_rest(url, part, f, dst.name)
                 break
             except OSError as e:          # URLError, TimeoutError and ConnectionError are all OSErrors
-                if attempt == DOWNLOAD_TRIES:
+                if attempt == max_attempts:
                     raise SetupError(f"{dst.name}: the download keeps stopping ({e}). "
                                      "Start again: it continues where it stopped.")
-                log.warning(f"{dst.name}: stopped ({e}); again in 10 s ({attempt + 1} of {DOWNLOAD_TRIES})")
+                log.warning(f"{dst.name}: stopped ({e}); again in 10 s ({attempt + 1} of {max_attempts})")
                 time.sleep(10)
 
         if part.stat().st_size != f.size:
