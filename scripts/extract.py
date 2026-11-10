@@ -100,7 +100,7 @@ def extract(tag: str) -> None:
 
     version = re.search(r"^\s*project\([^)]*VERSION\s*([0-9][0-9.]*)", Path(new, "CMakeLists.txt").read_text(), re.M)
     engine_ver = version.group(1) if version else ""
-    llama = Path(new, "third_party/ggml/VERSION.txt").read_text().split()[0]
+    llama = Path(new, "third_party", "ggml", "VERSION.txt").read_text().split()[0]
     date = git("-C", str(src), "show", "-s", "--format=%cI", commit)
     Path(new, "UPSTREAM").write_text(f"tag={tag}\ncommit={commit}\ndate={date}\nengine_version={engine_ver}\n"
                                   f"llama_cpp_commit={llama}\n")
