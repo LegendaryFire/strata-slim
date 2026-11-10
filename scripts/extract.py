@@ -53,7 +53,7 @@ def manifest_specs() -> list[str]:
     for line in Path(ROOT, "manifest.txt").read_text(encoding="utf-8").splitlines():
         line = line.split("#", 1)[0].strip()
         if line:
-            specs.append(":(exclude)" + line[1:] if line.startswith("!") else line)
+            specs.append(f":(exclude){line[1:]}" if line.startswith("!") else line)
     return specs
 
 

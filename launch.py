@@ -222,7 +222,7 @@ class Launcher:
         shown = dict(cfg)
         if "api_key" in shown:
             shown["api_key"] = "***"
-        log.info(f"config ({path}):\n" + json.dumps(shown, indent=1))
+        log.info(f"config ({path}):\n{json.dumps(shown, indent=1)}")
         return path
 
     def start_server(self, config_path: Path) -> None:

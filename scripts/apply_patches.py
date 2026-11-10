@@ -55,7 +55,7 @@ def apply(folder: Path, root: Path, want: str) -> None:
         log.info(f"patch applied: {patch.name}")
     if not applied:
         log.info("no patches: upstream's code as released")
-    Path(root, "PATCHES").write_text(",".join(applied) + "\n")
+    Path(root, "PATCHES").write_text(f"{','.join(applied)}\n")
 
 
 if __name__ == "__main__":

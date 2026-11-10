@@ -40,7 +40,7 @@ class RemoteFile:
 # A finished, checked file has <file>.done beside it holding "sha256 <hex>" (the mark upstream's setup writes too).
 
 def done_mark(path: Path) -> Path:
-    return path.with_name(path.name + ".done")
+    return path.with_name(f"{path.name}.done")
 
 
 def marked_sha(path: Path) -> str | None:
@@ -147,7 +147,7 @@ class HuggingFace:
             raise SetupError(f"{dst}: there without a .done mark, so it was not checked. Move it away to download it.")
 
         dst.parent.mkdir(parents=True, exist_ok=True)
-        part = dst.with_name(dst.name + ".part")
+        part = dst.with_name(f"{dst.name}.part")
         free = shutil.disk_usage(dst.parent).free
         needed = f.size - (part.stat().st_size if part.exists() else 0)
         if free < needed:

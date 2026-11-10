@@ -78,7 +78,7 @@ def tool(name: str, *args: str, tries: int = 1) -> None:
     """Run one of upstream's tools; a tool that resumes (mtp_fetch) can be given more than one try."""
     cmd = [sys.executable, str(Path(TOOLS, name)), *args]
     for attempt in range(1, tries + 1):
-        log.info("$ " + shlex.join(cmd))
+        log.info(f"$ {shlex.join(cmd)}")
         result = subprocess.run(cmd, cwd=ROOT)
         if result.returncode == 0:
             return
@@ -196,7 +196,7 @@ class Preparer:
                     matches.append(q)
             if not matches:
                 for q in groups:
-                    if q.lower().endswith("-" + asked.lower()):
+                    if q.lower().endswith(f"-{asked.lower()}"):
                         matches.append(q)
             if len(matches) != 1:
                 found = "matches none" if not matches else f"matches {len(matches)} ({', '.join(matches)})"

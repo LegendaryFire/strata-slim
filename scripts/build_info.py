@@ -46,7 +46,7 @@ def build_info(backend: str, archs_arg: str, root: Path, engine: Path) -> dict:
     patches = [p for p in Path(root, "PATCHES").read_text().strip().split(",") if p]
     info = {
         "version": upstream["engine_version"],
-        "source": "strata-slim " + upstream["tag"],
+        "source": f"strata-slim {upstream['tag']}",
         "commit": upstream["commit"],
     }
     if backend == "cuda":
