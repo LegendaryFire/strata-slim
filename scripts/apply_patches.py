@@ -33,7 +33,7 @@ def pick(folder: Path, want: str) -> list[Path]:
     picked = []
     for name in filter(None, want.split(",")):
         stem = name.removesuffix(".patch")
-        matches = [folder / f"{stem}.patch"] if (folder / f"{stem}.patch").is_file() else \
+        matches = [Path(folder, f"{stem}.patch")] if Path(folder, f"{stem}.patch").is_file() else \
             sorted(folder.glob(f"{stem}-*.patch"))                      # a number: 0001 -> 0001-*.patch
         if not matches:
             raise PatchError(f"PATCHES: no patch named {name} in patches/")
@@ -55,7 +55,7 @@ def apply(folder: Path, root: Path, want: str) -> None:
         log.info(f"patch applied: {patch.name}")
     if not applied:
         log.info("no patches: upstream's code as released")
-    (root / "PATCHES").write_text(",".join(applied) + "\n")
+    Path(root, "PATCHES").write_text(f"{','.join(applied)}\n")
 
 
 if __name__ == "__main__":

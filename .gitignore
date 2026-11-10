@@ -7,3 +7,7 @@ __pycache__/
 # what compose.yaml creates by default
 /models/
 /data/
+# scripts/build_windows.ps1
+/build/
+# docker build output
+*.log

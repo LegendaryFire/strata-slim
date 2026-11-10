@@ -7,6 +7,8 @@ env file), so they are the whole truth about how the engine runs. Every variable
     docker run ... strata-slim                 # prepare what is missing, write the config, start the server
     docker run ... strata-slim prepare         # only download / pack / MTP, then exit (no GPU needed)
     docker run ... strata-slim print-config    # write and print the config, do not start (no GPU needed)
+
+On Windows, start.bat runs it the same way: start.bat, start.bat prepare, start.bat print-config.
 """
 from __future__ import annotations
 
@@ -15,14 +17,13 @@ import logging
 import os
 import re
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 
 import prepare
-from common import ROOT, SetupError, first_shard, mmproj_near
+from common import ON_WINDOWS, ROOT, SetupError, engine_program, first_shard, mmproj_near
 from settings import ModelPaths, Prepare, Settings, Vision
-
-ENGINE = ROOT / "engine"
 
 log = logging.getLogger(__name__)
 
@@ -38,18 +39,16 @@ class Config:
 
         # the Dockerfile writes BUILD.json beside the engine; only Dockerfile.rocm sets a backend ("hip")
         self.backend = "cuda"
-        build_record = ENGINE / "BUILD.json"
+        build_record = Path(ROOT, "engine", "BUILD.json")
         if build_record.is_file():
             self.backend = json.loads(build_record.read_text()).get("backend", "cuda")
 
     def build(self) -> dict:
         s = self.settings
         if not self.paths.pack.is_dir():
-            raise SetupError(f"no pack at {self.paths.pack}: start with PREPARE=auto to build it, "
-                             "or set PACK to an existing pack folder")
-
-        tokenizer = s.tokenizer or self.paths.pack / "tokenizer"
-        if not (tokenizer / "vocab.json").is_file():
+            raise SetupError(f"no pack at {self.paths.pack}: build it with PREPARE=auto or set PACK to an existing one")
+        tokenizer = s.tokenizer or Path(self.paths.pack, "tokenizer")
+        if not Path(tokenizer, "vocab.json").is_file():
             raise SetupError(f"TOKENIZER={tokenizer}: no vocab.json in it")
 
         # Model-Q4-00001-of-00002.gguf -> model-q4
@@ -57,7 +56,7 @@ class Config:
         model_name = re.sub(r"[^a-z0-9._-]+", "-", model_name).strip("-")
 
         cfg = {
-            "exe": str(ENGINE / "strata"),
+            "exe": str(engine_program("strata")),
             "args": self.engine_args(),
             "cwd": str(ROOT),
             "tokenizer": str(tokenizer),
@@ -131,7 +130,7 @@ class Config:
 
         gpu = s.vision == Vision.GPU
         section = {
-            "exe": str(ENGINE / "strata-vision"),
+            "exe": str(engine_program("strata-vision")),
             "mmproj": str(self.mmproj),
             "model": str(self.model),
             "gpu": gpu,
@@ -140,8 +139,8 @@ class Config:
         # NVIDIA: strata-vision reads on the GPU too. AMD: the GPU reader is its own program, and the server
         # falls back to the CPU one when it does not start.
         if gpu and self.backend == "hip":
-            section["exe"] = str(ENGINE / "strata-vision-hip")
-            section["cpu_exe"] = str(ENGINE / "strata-vision")
+            section["exe"] = str(engine_program("strata-vision-hip"))
+            section["cpu_exe"] = str(engine_program("strata-vision"))
 
         if s.vision_threads is not None:
             section["threads"] = s.vision_threads
@@ -154,7 +153,7 @@ class Config:
 
         These are not in Settings: any key the server reads can be set, and .config-keys (made by
         scripts/extract.py from upstream's server) is the list to check a typo against."""
-        known_keys = (ROOT / ".config-keys").read_text().split()
+        known_keys = Path(ROOT, ".config-keys").read_text().split()
         # keys built from their own settings, so CONFIG_<KEY> must not set them
         built_keys = ["exe", "args", "tokenizer", "vision", "drafting"]
 
@@ -217,12 +216,13 @@ class Launcher:
         path = self.settings.config_out
         path.parent.mkdir(parents=True, exist_ok=True)
         Path(cfg["log"]).parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(cfg, indent=1) + "\n")
+        with path.open("w") as f:
+            json.dump(cfg, f, indent=1)
 
         shown = dict(cfg)
         if "api_key" in shown:
             shown["api_key"] = "***"
-        log.info(f"config ({path}):\n" + json.dumps(shown, indent=1))
+        log.info(f"config ({path}):\n{json.dumps(shown, indent=1)}")
         return path
 
     def start_server(self, config_path: Path) -> None:
@@ -240,11 +240,25 @@ class Launcher:
         else:
             os.environ.pop("STRATA_API_KEY", None)
 
+        # Restore the defaults in which maintain model quality and integrity,
+        os.environ.setdefault("STRATA_ROUTE_TAIL_SKIP", "0")
+        os.environ.setdefault("STRATA_HC_Q8", "1")
+
         argv = [sys.executable, "-m", "serve.server", "--engine", "strata", "--config", str(config_path),
                 "--host", s.host, "--port", str(s.port)]
         argv += shlex.split(s.server_args)
 
         log.info(shlex.join(argv))
+        if ON_WINDOWS:
+            # execv on Windows starts the server as a new process and ends this one, so the console comes back while
+            # the server runs and Ctrl+C no longer reaches it; wait for it instead
+            server = subprocess.Popen(argv, cwd=ROOT)
+            while True:
+                try:
+                    sys.exit(server.wait())
+                except KeyboardInterrupt:
+                    pass        # the server got the Ctrl+C too, and is stopping
+
         logging.shutdown()   # flush before the server replaces this process
         os.chdir(ROOT)
         os.execv(argv[0], argv)

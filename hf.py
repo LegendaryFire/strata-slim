@@ -14,20 +14,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from http import HTTPStatus
 from pathlib import Path
 
 from common import Progress, SetupError, size_text
 
 log = logging.getLogger(__name__)
-
-CHUNK = 8 << 20
-DOWNLOAD_TRIES = 5
-
-HTTP_HINTS = {
-    401: " (private or gated: set HF_TOKEN)",
-    403: " (gated: accept its terms, set HF_TOKEN)",
-    404: " (no such repository, revision or path)",
-}
 
 
 @dataclass
@@ -45,7 +37,7 @@ class RemoteFile:
 # A finished, checked file has <file>.done beside it holding "sha256 <hex>" (the mark upstream's setup writes too).
 
 def done_mark(path: Path) -> Path:
-    return path.with_name(path.name + ".done")
+    return path.with_name(f"{path.name}.done")
 
 
 def marked_sha(path: Path) -> str | None:
@@ -74,8 +66,9 @@ def sha256_of(path: Path, label: str) -> str:
     digest = hashlib.sha256()
     progress = Progress(f"{label}: checking SHA-256", path.stat().st_size)
     with path.open("rb") as f:
+        chunk_size = 8 << 20
         while True:
-            block = f.read(CHUNK)
+            block = f.read(chunk_size)
             if not block:
                 break
             digest.update(block)
@@ -109,7 +102,13 @@ class HuggingFace:
                     data = json.load(r)
                     link = r.headers.get("Link", "")
             except urllib.error.HTTPError as e:
-                raise SetupError(f"{url}: HTTP {e.code}{HTTP_HINTS.get(e.code, '')}")
+                if e.code == HTTPStatus.FORBIDDEN or e.code == HTTPStatus.UNAUTHORIZED:
+                    hint = "Ensure HF_TOKEN is set, and accept the terms and conditions"
+                elif e.code == HTTPStatus.NOT_FOUND:
+                    hint = "No such repository, revision or path"
+                else:
+                    hint = "An unknown error occurred"
+                raise SetupError(f"{url}: HTTP {e.code} - {hint}")
             except urllib.error.URLError as e:
                 raise SetupError(f"{url}: {e.reason} (no network? A start with every file present does not need it)")
 
@@ -146,22 +145,23 @@ class HuggingFace:
             raise SetupError(f"{dst}: there without a .done mark, so it was not checked. Move it away to download it.")
 
         dst.parent.mkdir(parents=True, exist_ok=True)
-        part = dst.with_name(dst.name + ".part")
+        part = dst.with_name(f"{dst.name}.part")
         free = shutil.disk_usage(dst.parent).free
         needed = f.size - (part.stat().st_size if part.exists() else 0)
         if free < needed:
             raise SetupError(f"{dst.parent}: {size_text(free)} free, {dst.name} needs {size_text(needed)} more")
 
         url = f"{self.endpoint}/{repo}/resolve/{urllib.parse.quote(commit, safe='')}/{urllib.parse.quote(f.path)}"
-        for attempt in range(1, DOWNLOAD_TRIES + 1):
+        max_attempts = 5
+        for attempt in range(1, max_attempts + 1):
             try:
                 self.fetch_rest(url, part, f, dst.name)
                 break
             except OSError as e:          # URLError, TimeoutError and ConnectionError are all OSErrors
-                if attempt == DOWNLOAD_TRIES:
+                if attempt == max_attempts:
                     raise SetupError(f"{dst.name}: the download keeps stopping ({e}). "
                                      "Start again: it continues where it stopped.")
-                log.warning(f"{dst.name}: stopped ({e}); again in 10 s ({attempt + 1} of {DOWNLOAD_TRIES})")
+                log.warning(f"{dst.name}: stopped ({e}); again in 10 s ({attempt + 1} of {max_attempts})")
                 time.sleep(10)
 
         if part.stat().st_size != f.size:
@@ -183,7 +183,7 @@ class HuggingFace:
 
         headers = {"Range": f"bytes={have}-"} if have else None
         with urllib.request.urlopen(self.request(url, headers), timeout=120) as r:
-            if have and r.status != 206:           # the server ignored the range: start over rather than corrupt it
+            if have and r.status != HTTPStatus.PARTIAL_CONTENT:  # the server ignored the range: start over rather than corrupt it
                 part.unlink()
                 have = 0
             if have:
@@ -192,8 +192,9 @@ class HuggingFace:
             progress = Progress(label, f.size, done=have)
             written = have
             with part.open("ab") as out:
+                chunk_size = 8 << 20
                 while True:
-                    block = r.read(CHUNK)
+                    block = r.read(chunk_size)
                     if not block:
                         break
                     out.write(block)

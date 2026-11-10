@@ -1,0 +1,3 @@
+# Check every file out exactly as committed. Git for Windows otherwise turns LF into CRLF, and patches/ then no longer
+# applies to vendor/ in scripts/build_windows.ps1. start.bat is committed with CRLF, as cmd needs.
+* -text

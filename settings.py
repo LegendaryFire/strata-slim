@@ -12,7 +12,18 @@ from typing import get_args, get_type_hints
 
 from dotenv import load_dotenv
 
-from common import ROOT, SetupError
+from common import ON_WINDOWS, ROOT, SetupError
+
+# Docker keeps the models and the run files in the folders compose.yaml mounts, and maps the port to localhost itself.
+# Windows keeps them in the install folder, and listens on localhost only unless HOST says otherwise.
+if ON_WINDOWS:
+    DEFAULT_MODELS_DIR = Path(ROOT, "models")
+    DEFAULT_STATE_DIR = ROOT
+    DEFAULT_HOST = "127.0.0.1"
+else:
+    DEFAULT_MODELS_DIR = Path("/models")
+    DEFAULT_STATE_DIR = Path("/data")
+    DEFAULT_HOST = "0.0.0.0"
 
 
 # Settings that take one of a few values. The variable is matched in any case: VISION=GPU is Vision.GPU.
@@ -89,25 +100,26 @@ class Settings:
     api_key: str | None = None
     api_key_file: Path | None = None
     server_args: str = ""
-    host: str = "0.0.0.0"
+    host: str = DEFAULT_HOST
     port: int = 8080
 
-    # where things are (the defaults match the folders compose.yaml mounts)
+    # where things are (in Docker, the defaults match the folders compose.yaml mounts)
     prepare: Prepare = Prepare.AUTO
-    models_dir: Path = Path("/models")
+    models_dir: Path = DEFAULT_MODELS_DIR
     model_gguf: Path | None = None          # None: derived from model_repo and model_quant
     pack: Path | None = None                # None: derived from the model folder
     tokenizer: Path | None = None           # None: <pack>/tokenizer
-    expert_profile: str = str(ROOT / "data" / "expert-profile.bin")    # or "none"
-    config_out: Path = Path("/data/run/config.json")
-    log_file: Path = Path("/data/logs/engine.log")
+    expert_profile: str = str(Path(ROOT, "data", "expert-profile.bin"))    # or "none"
+    config_out: Path = Path(DEFAULT_STATE_DIR, "run", "config.json")
+    log_file: Path = Path(DEFAULT_STATE_DIR, "logs", "engine.log")
     log_level: LogLevel = LogLevel.INFO
 
     @classmethod
     def load(cls) -> Settings:
-        """The settings from the environment, after loading the env file ENV_FILE (default /data/.env) when it
-        is there. A variable already set (compose's env_file, docker run -e) wins over the file."""
-        load_dotenv(os.environ.get("ENV_FILE") or "/data/.env")
+        """The settings from the environment, after loading the env file ENV_FILE (default /data/.env, on Windows
+        .env in the install folder) when it is there. A variable already set (compose's env_file, docker run -e) wins
+        over the file."""
+        load_dotenv(os.environ.get("ENV_FILE") or Path(DEFAULT_STATE_DIR, ".env"))
 
         types = get_type_hints(cls)
         values = {}
@@ -172,15 +184,15 @@ class ModelPaths:
             model = settings.model_gguf
         elif settings.model_repo:
             owner, _, name = settings.model_repo.partition("/")
-            model = root / "models" / f"{owner}-{settings.model_quant or name}"
+            model = Path(root, "models", f"{owner}-{settings.model_quant or name}")
         else:
             raise SetupError("set MODEL_REPO (and MODEL_QUANT) to download a model, "
                              "or MODEL_GGUF to a model already there")
 
         folder = model if model.suffix != ".gguf" else model.parent
-        pack = settings.pack or root / "packs" / folder.name.lower()
+        pack = settings.pack or Path(root, "packs", folder.name.lower())
 
         mtp = None
         if settings.drafter in (Drafter.MTP, Drafter.AUTO):
-            mtp = root / "mtp" / "rt"
+            mtp = Path(root, "mtp", "rt")
         return cls(model, pack, mtp)

@@ -158,6 +158,23 @@ The first start downloads and prepares the model (well over 100 GB), then the AP
 Every setting is in [`example.env`](example.env); network access, troubleshooting and building the images yourself are
 in [docs/docker-compose.md](docs/docker-compose.md).
 
+## Windows
+
+A native Windows build without Docker, NVIDIA only. It is new and has not been tested on Windows yet.
+
+To build it, install Visual Studio 2022 Build Tools (with "Desktop development with C++"), the CUDA 13.0 toolkit, Git
+for Windows and Python 3. Clone this repository to a short path such as `C:\src\strata-slim`, then run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1 -CudaArchitectures 86 -Patches all
+```
+
+Use the same `-CudaArchitectures` values as the Docker build. The result is `build\windows\strata-slim\`, plus a zip of it.
+
+To run it, copy `example.env` to `.env` in that folder, edit it, and run `start.bat`. The models, logs and config go
+into that folder, and the server only listens on this PC (`127.0.0.1`). Set `MODELS_DIR` to keep the models somewhere
+else, and `HOST=0.0.0.0` with an `API_KEY` to open it to your network.
+
 ## Common settings
 
 | Variable | Valid values | Default |

@@ -37,7 +37,7 @@ def upstream_repo() -> Path:
     """The repo to read from: UPSTREAM_GIT as it is, or .upstream/ (a bare clone, made once, fetched every time)."""
     if os.environ.get("UPSTREAM_GIT"):
         return Path(os.environ["UPSTREAM_GIT"])
-    src = ROOT / ".upstream"
+    src = Path(ROOT, ".upstream")
     if not src.is_dir():
         log.info(f"cloning {UPSTREAM_URL} into .upstream/ (once)")
         subprocess.run(["git", "clone", "--quiet", "--bare", UPSTREAM_URL, str(src)], check=True)
@@ -50,10 +50,10 @@ def upstream_repo() -> Path:
 def manifest_specs() -> list[str]:
     """manifest.txt as git pathspecs: comments and blank lines dropped, "!x" becomes ":(exclude)x"."""
     specs = []
-    for line in (ROOT / "manifest.txt").read_text(encoding="utf-8").splitlines():
+    for line in Path(ROOT, "manifest.txt").read_text(encoding="utf-8").splitlines():
         line = line.split("#", 1)[0].strip()
         if line:
-            specs.append(":(exclude)" + line[1:] if line.startswith("!") else line)
+            specs.append(f":(exclude){line[1:]}" if line.startswith("!") else line)
     return specs
 
 
@@ -81,7 +81,7 @@ def extract(tag: str) -> None:
         raise ExtractError(f"manifest entries not in {tag}: {', '.join(missing)} (upstream moved or removed these: "
                            "fix manifest.txt)")
 
-    new = ROOT / "vendor.new"
+    new = Path(ROOT, "vendor.new")
     shutil.rmtree(new, ignore_errors=True)
     new.mkdir()
     archive = subprocess.Popen(["git", "-C", str(src), "archive", "--format=tar", commit, "--", *specs],
@@ -94,23 +94,23 @@ def extract(tag: str) -> None:
     # the config keys the server reads (cfg.get("key") / cfg["key"] in serve/): launch.py warns about a CONFIG_<KEY>
     # not among them
     keys = set()
-    for py in (new / "serve").glob("*.py"):
+    for py in Path(new, "serve").glob("*.py"):
         keys.update(re.findall(r'cfg(?:\.get\(|\[)"([a-z_][a-z0-9_]*)"', py.read_text(encoding="utf-8")))
-    (new / ".config-keys").write_text("".join(f"{k}\n" for k in sorted(keys)))
+    Path(new, ".config-keys").write_text("".join(f"{k}\n" for k in sorted(keys)))
 
-    version = re.search(r"^\s*project\([^)]*VERSION\s*([0-9][0-9.]*)", (new / "CMakeLists.txt").read_text(), re.M)
+    version = re.search(r"^\s*project\([^)]*VERSION\s*([0-9][0-9.]*)", Path(new, "CMakeLists.txt").read_text(), re.M)
     engine_ver = version.group(1) if version else ""
-    llama = (new / "third_party/ggml/VERSION.txt").read_text().split()[0]
+    llama = Path(new, "third_party/ggml/VERSION.txt").read_text().split()[0]
     date = git("-C", str(src), "show", "-s", "--format=%cI", commit)
-    (new / "UPSTREAM").write_text(f"tag={tag}\ncommit={commit}\ndate={date}\nengine_version={engine_ver}\n"
+    Path(new, "UPSTREAM").write_text(f"tag={tag}\ncommit={commit}\ndate={date}\nengine_version={engine_ver}\n"
                                   f"llama_cpp_commit={llama}\n")
 
-    shutil.rmtree(ROOT / "vendor", ignore_errors=True)
-    new.rename(ROOT / "vendor")
+    shutil.rmtree(Path(ROOT, "vendor"), ignore_errors=True)
+    new.rename(Path(ROOT, "vendor"))
 
     # local fixes (patches/*.patch) stay out of vendor/: the build applies them only when asked (the PATCHES build
     # arg). Checked here so a release that breaks one shows now, not in docker build.
-    for patch in sorted((ROOT / "patches").glob("*.patch")):
+    for patch in sorted(Path(ROOT, "patches").glob("*.patch")):
         name = patch.relative_to(ROOT)
         if subprocess.run(["git", "apply", "--check", str(patch)], capture_output=True).returncode == 0:
             log.info(f"patch applies: {name}")
@@ -119,7 +119,7 @@ def extract(tag: str) -> None:
         else:
             raise ExtractError(f"patch does not apply to {tag}: {name} (rebase it on the new vendor/)")
 
-    files = [p for p in (ROOT / "vendor").rglob("*") if p.is_file()]
+    files = [p for p in Path(ROOT, "vendor").rglob("*") if p.is_file()]
     log.info(f"vendor/ = {tag} ({commit}), engine {engine_ver}, {len(files)} files, "
         f"{size_text(sum(p.stat().st_size for p in files))}")
     log.info("next: git diff --stat vendor/, then docker build")
