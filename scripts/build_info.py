@@ -22,7 +22,7 @@ log = logging.getLogger(__name__)
 
 def read_upstream(root: Path) -> dict[str, str]:
     """vendor/UPSTREAM: key=value lines."""
-    pairs = (line.split("=", 1) for line in (root / "UPSTREAM").read_text().splitlines() if "=" in line)
+    pairs = (line.split("=", 1) for line in Path(root, "UPSTREAM").read_text().splitlines() if "=" in line)
     return {k.strip(): v.strip() for k, v in pairs}
 
 
@@ -34,16 +34,16 @@ def cuda_version() -> str:
 def rocm_version() -> str:
     rocm = Path(os.environ.get("ROCM_PATH", "/opt/rocm"))
     try:
-        return (rocm / ".info" / "version").read_text().strip()
+        return Path(rocm, ".info", "version").read_text().strip()
     except OSError:
-        done = subprocess.run([str(rocm / "bin" / "hipconfig"), "--version"], capture_output=True, text=True)
+        done = subprocess.run([str(Path(rocm, "bin", "hipconfig")), "--version"], capture_output=True, text=True)
         return done.stdout.strip() or "unknown"
 
 
 def build_info(backend: str, archs_arg: str, root: Path, engine: Path) -> dict:
     upstream = read_upstream(root)
     archs = [a for a in re.split(r"[;,\s]+", archs_arg) if a]
-    patches = [p for p in (root / "PATCHES").read_text().strip().split(",") if p]
+    patches = [p for p in Path(root, "PATCHES").read_text().strip().split(",") if p]
     info = {
         "version": upstream["engine_version"],
         "source": "strata-slim " + upstream["tag"],
@@ -53,7 +53,7 @@ def build_info(backend: str, archs_arg: str, root: Path, engine: Path) -> dict:
         info |= {"cuda": cuda_version(), "portable": True, "archs": archs, "vision_archs": archs, "ptx": True}
     else:
         info |= {"backend": "hip", "rocm": rocm_version(), "portable": True, "archs": archs,
-                 "vision": "gpu" if (engine / "strata-vision-hip").is_file() else "none",
+                 "vision": "gpu" if Path(engine, "strata-vision-hip").is_file() else "none",
                  "vision_cpu": "strata-vision", "vision_gpu": "strata-vision-hip", "vision_archs": archs}
     info["patches"] = patches
     return info
@@ -65,5 +65,5 @@ if __name__ == "__main__":
         sys.exit("usage: build_info.py cuda|hip <architectures> <source root> <engine folder>")
     engine = Path(sys.argv[4])
     info = build_info(sys.argv[1], sys.argv[2], Path(sys.argv[3]), engine)
-    (engine / "BUILD.json").write_text(json.dumps(info) + "\n")
+    Path(engine, "BUILD.json").write_text(json.dumps(info) + "\n")
     log.info(json.dumps(info))

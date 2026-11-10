@@ -35,7 +35,7 @@ from strata_control import acquisition, drafting, drafting_fetch
 
 log = logging.getLogger(__name__)
 
-TOOLS = ROOT / "tools"
+TOOLS = Path(ROOT, "tools")
 DRAFT_VOCAB_FILES = {
     DraftVocab.CJK: "draft_vocab.bin",
     DraftVocab.EN: "draft_vocab_en.bin",
@@ -56,7 +56,7 @@ class Record:
 
     @staticmethod
     def read(folder: Path) -> Record | None:
-        path = folder / RECORD_FILE
+        path = Path(folder, RECORD_FILE)
         if not path.is_file():
             return None
         data = json.loads(path.read_text())
@@ -71,12 +71,12 @@ class Record:
             files.append({"path": f.path, "size": f.size, "sha256": f.sha256})
         data = {"repo": self.repo, "commit": self.commit, "quant": self.quant, "recorded": time.strftime("%F %T"),
                 "files": files}
-        (folder / RECORD_FILE).write_text(json.dumps(data, indent=1) + "\n")
+        Path(folder, RECORD_FILE).write_text(json.dumps(data, indent=1) + "\n")
 
 
 def tool(name: str, *args: str, tries: int = 1) -> None:
     """Run one of upstream's tools; a tool that resumes (mtp_fetch) can be given more than one try."""
-    cmd = [sys.executable, str(TOOLS / name), *args]
+    cmd = [sys.executable, str(Path(TOOLS, name)), *args]
     for attempt in range(1, tries + 1):
         log.info("$ " + shlex.join(cmd))
         result = subprocess.run(cmd, cwd=ROOT)
@@ -149,7 +149,7 @@ class Preparer:
 
         missing = []
         for f in record.files:
-            if not hf.is_done(folder / f.name, f):
+            if not hf.is_done(Path(folder, f.name), f):
                 missing.append(f)
         if not missing:
             log.info(f"{folder.name}: {len(record.files)} file(s) of {repo}@{record.commit[:12]} present")
@@ -158,7 +158,7 @@ class Preparer:
         log.info(f"{folder.name}: {len(missing)} of {len(record.files)} file(s) missing, "
                  "fetching them at the recorded commit")
         for f in missing:
-            self.hub.download(repo, record.commit, f, folder / f.name)
+            self.hub.download(repo, record.commit, f, Path(folder, f.name))
 
     def first_download(self, folder: Path) -> None:
         """No record yet: resolve the revision, adopt files already there, download the rest, write the record."""
@@ -211,7 +211,7 @@ class Preparer:
             wanted[f.name] = f.sha256
         for mark in folder.glob("*.gguf.done"):
             name = mark.name.removesuffix(".done")
-            sha = hf.marked_sha(folder / name)
+            sha = hf.marked_sha(Path(folder, name))
             if name not in wanted or (sha and wanted[name] and sha != wanted[name]):
                 raise SetupError(f"{folder}: the files there are not {repo}@{commit[:12]}'s {quant}. Use an empty "
                                  "folder, or set MODEL_REVISION to the commit they came from.")
@@ -223,7 +223,7 @@ class Preparer:
 
         folder.mkdir(parents=True, exist_ok=True)
         for f in files:
-            self.hub.download(repo, commit, f, folder / f.name)
+            self.hub.download(repo, commit, f, Path(folder, f.name))
         Record(repo, commit, quant, files).write(folder)
 
     def get_mmproj(self, model_folder: Path) -> Path:
@@ -256,7 +256,7 @@ class Preparer:
                              "download the one you want beside the model folder, or set MMPROJ to it")
         f = candidates[0]
 
-        path = given or model_folder.parent / f.name     # beside the model folders, as upstream keeps it
+        path = given or Path(model_folder.parent, f.name)     # beside the model folders, as upstream keeps it
         log.info(f"picture reader: {repo}@{commit[:12]} {f.path} -> {path}")
         self.hub.download(repo, commit, f, path)
         return path
@@ -265,7 +265,7 @@ class Preparer:
 
     def build_pack(self, model: Path) -> None:
         pack = self.paths.pack
-        if (pack / "native_experts.txt").is_file() and (pack / "tokenizer" / "vocab.json").is_file():
+        if Path(pack, "native_experts.txt").is_file() and Path(pack, "tokenizer", "vocab.json").is_file():
             return
         log.info(f"building the pack {pack} from {model.name}")
         pack.parent.mkdir(parents=True, exist_ok=True)
@@ -273,7 +273,7 @@ class Preparer:
 
     def build_mtp(self) -> None:
         rt = self.paths.mtp
-        if not (rt / "experts.bin").is_file():
+        if not Path(rt, "experts.bin").is_file():
             root = rt.parent
             experts = self.settings.mtp_experts
             log.info(f"building the MTP draft layer in {root} "
@@ -281,17 +281,17 @@ class Preparer:
             root.mkdir(parents=True, exist_ok=True)
             tool("mtp_fetch.py", "fetch", "--out", str(root), tries=3)
             tool("mtp_fetch.py", "verify", "--out", str(root))
-            packed = root / f"mtp-{experts}.gguf"
+            packed = Path(root, f"mtp-{experts}.gguf")
             tool("mtp_pack.py", "--src", str(root), "--experts", experts, "--out", str(packed))
             tool("mtp_rt.py", "--gguf", str(packed), "--out", str(rt))
 
         # the draft token subset: cjk when there is none yet, or the one DRAFT_VOCAB names
-        target = rt / "draft_vocab.bin"
+        target = Path(rt, "draft_vocab.bin")
         choice = self.settings.draft_vocab
         if target.exists() and not choice:
             return
         choice = choice or DraftVocab.CJK
-        shutil.copyfile(ROOT / "data" / DRAFT_VOCAB_FILES[choice], target)
+        shutil.copyfile(Path(ROOT, "data", DRAFT_VOCAB_FILES[choice]), target)
         log.info(f"draft layer token subset: {choice}")
 
     def build_dflash2(self) -> None:
@@ -319,7 +319,7 @@ class Preparer:
 
         try:
             drafting_fetch.ensure(data_dir, progress=progress)
-            if drafting.engine_reads_selector_q4(ROOT / "engine" / "strata"):
+            if drafting.engine_reads_selector_q4(Path(ROOT, "engine", "strata")):
                 drafting_fetch.convert_selector(data_dir, progress=progress)    # 174 MiB less VRAM, same output
         except (drafting_fetch.DraftingError, acquisition.AcquisitionRefused) as e:
             raise SetupError(f"DFlash2: {e}")

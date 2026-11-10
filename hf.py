@@ -14,6 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from http import HTTPStatus
 from pathlib import Path
 
 from common import Progress, SetupError, size_text
@@ -22,12 +23,6 @@ log = logging.getLogger(__name__)
 
 CHUNK = 8 << 20
 DOWNLOAD_TRIES = 5
-
-HTTP_HINTS = {
-    401: " (private or gated: set HF_TOKEN)",
-    403: " (gated: accept its terms, set HF_TOKEN)",
-    404: " (no such repository, revision or path)",
-}
 
 
 @dataclass
@@ -109,7 +104,13 @@ class HuggingFace:
                     data = json.load(r)
                     link = r.headers.get("Link", "")
             except urllib.error.HTTPError as e:
-                raise SetupError(f"{url}: HTTP {e.code}{HTTP_HINTS.get(e.code, '')}")
+                if e.code == HTTPStatus.FORBIDDEN or e.code == HTTPStatus.UNAUTHORIZED:
+                    hint = "Ensure HF_TOKEN is set, and accept the terms and conditions"
+                elif e.code == HTTPStatus.NOT_FOUND:
+                    hint = "No such repository, revision or path"
+                else:
+                    hint = "An unknown error occurred"
+                raise SetupError(f"{url}: HTTP {e.code} - {hint}")
             except urllib.error.URLError as e:
                 raise SetupError(f"{url}: {e.reason} (no network? A start with every file present does not need it)")
 
@@ -183,7 +184,7 @@ class HuggingFace:
 
         headers = {"Range": f"bytes={have}-"} if have else None
         with urllib.request.urlopen(self.request(url, headers), timeout=120) as r:
-            if have and r.status != 206:           # the server ignored the range: start over rather than corrupt it
+            if have and r.status != HTTPStatus.PARTIAL_CONTENT:  # the server ignored the range: start over rather than corrupt it
                 part.unlink()
                 have = 0
             if have:

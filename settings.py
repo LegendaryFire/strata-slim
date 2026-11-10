@@ -98,7 +98,7 @@ class Settings:
     model_gguf: Path | None = None          # None: derived from model_repo and model_quant
     pack: Path | None = None                # None: derived from the model folder
     tokenizer: Path | None = None           # None: <pack>/tokenizer
-    expert_profile: str = str(ROOT / "data" / "expert-profile.bin")    # or "none"
+    expert_profile: str = str(Path(ROOT, "data", "expert-profile.bin"))    # or "none"
     config_out: Path = Path("/data/run/config.json")
     log_file: Path = Path("/data/logs/engine.log")
     log_level: LogLevel = LogLevel.INFO
@@ -172,15 +172,15 @@ class ModelPaths:
             model = settings.model_gguf
         elif settings.model_repo:
             owner, _, name = settings.model_repo.partition("/")
-            model = root / "models" / f"{owner}-{settings.model_quant or name}"
+            model = Path(root, "models", f"{owner}-{settings.model_quant or name}")
         else:
             raise SetupError("set MODEL_REPO (and MODEL_QUANT) to download a model, "
                              "or MODEL_GGUF to a model already there")
 
         folder = model if model.suffix != ".gguf" else model.parent
-        pack = settings.pack or root / "packs" / folder.name.lower()
+        pack = settings.pack or Path(root, "packs", folder.name.lower())
 
         mtp = None
         if settings.drafter in (Drafter.MTP, Drafter.AUTO):
-            mtp = root / "mtp" / "rt"
+            mtp = Path(root, "mtp", "rt")
         return cls(model, pack, mtp)
