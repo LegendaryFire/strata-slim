@@ -1,0 +1,127 @@
+From: LegendaryFire <tristan.balon@outlook.com>
+Subject: [PATCH] Keep no verify PCIe staging slots with --pcie-frac 0
+
+Every verifier carved 16 expert blobs (16 x 3.99 MB, ~61 MiB on UD-Q4_K_XL)
+of VRAM for the PCIe share of the missed experts. With --pcie-frac 0 that
+share is always empty: the probe, PcieAuto and STRATA_PCIE_BALANCE all
+apply only when --pcie-frac is not given, so the slots were never written.
+The VRAM goes to the expert cache instead (one verifier per card on a split).
+
+The planner already only routes an expert over PCIe while fetches <
+staging_cap, so with no slots a request that asks for a share anyway
+(strata_tune's pcie_frac) computes those experts on the CPU. The copy and
+rebase kernels of --pcie-mode copy are skipped with no slots.
+STRATA_PCIE_STAGING_KEEP=1 keeps the slots.
+---
+diff --git a/vendor/include/strata/core/verify.hpp b/vendor/include/strata/core/verify.hpp
+index a0dbeda..3b6af04 100644
+--- a/vendor/include/strata/core/verify.hpp
++++ b/vendor/include/strata/core/verify.hpp
+@@ -317,6 +317,8 @@ public:
+     /// the session from another stream or the host afterwards (a new request, a checkpoint, a snapshot, the prompt
+     /// path, the end of a run) calls wait_commit() first.  STRATA_COMMIT_SYNC=1 keeps the wait.
+     static void set_commit_async(bool on);
++    /// The PCIe staging slots were allocated even with --pcie-frac 0, so now they're not (STRATA_PCIE_STAGING_KEEP=1: kept).
++    static void set_pcie_share_off(bool off);
+     /// Waits for the last commit graph when commit() did not (an event recorded after it, not the whole device);
+     /// false with `err` when it failed.  Free when nothing is pending.
+     bool wait_commit(std::string& err);
+@@ -755,6 +757,7 @@ private:
+     int32_t* plan_ = nullptr;                                     // device copy of the plan block
+     uint8_t* staging_ = nullptr;                                  // VRAM slots for the PCIe share of the misses
+     static constexpr int64_t kStagingBlobs = 16;
++    int64_t staging_blobs_ = kStagingBlobs;
+     static constexpr int64_t kPcieGroupRows = 4;                  // the PCIe call's groups side by side (of <= 16)
+     uint8_t* hit_xq_ = nullptr;
+     uint8_t* nat_xq_ = nullptr;   // plan v0.3 P6: q8_1 activations for a native pack's grouped experts
+diff --git a/vendor/src/core/verify.cpp b/vendor/src/core/verify.cpp
+index 61b32de..9413226 100644
+--- a/vendor/src/core/verify.cpp
++++ b/vendor/src/core/verify.cpp
+@@ -876,6 +876,12 @@ bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err)
+     return true;
+ }
+ 
++static bool g_pcie_share_off = false;
++void Verifier::set_pcie_share_off(bool off) {
++    const char* keep = std::getenv("STRATA_PCIE_STAGING_KEEP");
++    g_pcie_share_off = off && !(keep != nullptr && keep[0] == '1');
++}
++
+ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
+                     const NativeHead* head, int max_t, std::string& err) {
+     g_diag_verifier.store(this);
+@@ -1092,7 +1098,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
+         shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); hit_out_ = b.take<float>(T * K * N);
+         hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
+         plan_ = b.take<int32_t>(2 * ((uint64_t) plan_i32_ + 16));
+-        staging_ = b.take<uint8_t>((uint64_t) kStagingBlobs * strata::kernels::cpu::expert_layout().max_blob);
++        staging_ = staging_blobs_ > 0 ? b.take<uint8_t>((uint64_t) staging_blobs_ * strata::kernels::cpu::expert_layout().max_blob)
++                                      : nullptr;
+         hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
+         nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
+         nat_xr_ = had_gu_any ? b.take<float>(T * N) : nullptr;
+@@ -1108,6 +1115,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
+         hist_snap_ = b.take<float>(T * HS);
+         ple_key_ = b.take<float>(T * (uint64_t) strata::kernels::NG_HC_DIM); ple_val_ = b.take<float>(T * N);
+     };
++    staging_blobs_ = g_pcie_share_off ? 0 : kStagingBlobs;
+     Bump count;
+     carve(count);
+     if (cudaMalloc(&arena_, count.used) != cudaSuccess) {
+@@ -1170,7 +1178,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
+         had_sh_ = strata::kernels::hadamard_device_signs(strata::kernels::cpu::hadamard_signs((int) g.n_ff), (int) g.n_ff);
+     }
+     sink_.staging = (unsigned long long) staging_;
+-    sink_.staging_cap = kStagingBlobs;
++    sink_.staging_cap = staging_blobs_;
+     (void) TS;
+     // STRATA_GRAPH_PRIO=1 (opt-in): the window's streams carry priorities that their captured kernel
+     // nodes keep (the window graph is instantiated with cudaGraphInstantiateFlagUseNodePriority): the GDN gates / QSA
+@@ -1318,9 +1326,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
+         }
+         if (!ok2) { cudaGetLastError(); all_resident_ = false; device_plan_ = false; }
+     }
+-    std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers%s\n", max_t,
++    std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers%s%s\n", max_t,
+                  (double) count.used / 1048576.0,
+-                 all_resident_ ? " (100% VRAM resident: zero-doorbell graph)" : "");
++                 all_resident_ ? " (100% VRAM resident: zero-doorbell graph)" : "",
++                 staging_blobs_ == 0 ? " (no PCIe staging: --pcie-frac 0)" : "");
+     return true;
+ }
+ 
+@@ -2408,8 +2417,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+             else if (m_bal_ != nullptr)   // set_pcie_balance: the PCIe part starts
+                 wait_flag_ge_stamped(m_flagB_, ring, m_bal_ + ((l - lb_) * 2 + grp) * 4 + 1, nullptr, cs);
+             else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
+-            if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
+-                const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
++            if (sink_.pcie_mode == 2 && staging_blobs_ > 0) {      // stage it with a copy kernel, then point at staging
++                const int64_t per = G == 2 ? staging_blobs_ / 2 : staging_blobs_;
+                 uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
+                 const unsigned long long* p_dst2 = (const unsigned long long*) (pl + dst2_off_);   // STRATA_ADAPT_FETCH
+                 fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs, p_dst2);
+@@ -3729,8 +3738,8 @@ void Verifier::set_plan_slot(int grp) {
+     sink_.start2 = base + ptr_off + 4 * cap;
+     sink_.dst2 = (unsigned long long*) (base + dst2_off_);
+     const int G = last_batch_ ? 1 : (groups_[last_t_] > 0 ? groups_[last_t_] : 1);
+-    const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+-    sink_.staging = (unsigned long long) (staging_ + (size_t) (grp * per) * strata::kernels::cpu::expert_layout().max_blob);
++    const int64_t per = G == 2 ? staging_blobs_ / 2 : staging_blobs_;
++    sink_.staging = staging_ != nullptr ? (unsigned long long) (staging_ + (size_t) (grp * per) * strata::kernels::cpu::expert_layout().max_blob) : 0;
+     sink_.staging_cap = per;
+ }
+ 
+diff --git a/vendor/src/program/generate.cpp b/vendor/src/program/generate.cpp
+index 7416f4e..444d7c2 100644
+--- a/vendor/src/program/generate.cpp
++++ b/vendor/src/program/generate.cpp
+@@ -5680,6 +5680,7 @@ int main(int argc, char** argv) {
+         }
+     }
+     strata::core::Verifier::set_commit_async(!multi_gpu);   // see Verifier::set_commit_async
++    strata::core::Verifier::set_pcie_share_off(pcie_given && o.pcie_frac == 0.0);
+     // --draft-fallback none: the MTP layer is not loaded and every "is there an MTP" test below sees --mtp as absent; DFlash2 drafts alone.  The draft
+     // vocabulary file is taken from the --mtp directory first.  Anything DFlash2 cannot do here is an error at start (below), never a silent MTP.
+     bool df2_solo = false;

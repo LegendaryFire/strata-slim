@@ -22,6 +22,9 @@ or AMD, name a model, run `docker compose up -d`, and it downloads, checks, pack
 Images are published for NVIDIA (`cuda`: RTX 30, 40 and 50) and AMD (`rocm`: RX 7000 and 9000). Each release is
 also tagged with its version, such as `0.2.13-1-cuda`, for pinning.
 
+These are upstream's code as released. Images with our [patches](patches/README.md) applied are published beside
+them as `cuda-patched` and `rocm-patched` (pinned: `0.2.13-1-cuda-patched`). Use whichever you prefer.
+
 `docker-compose.yml`:
 
 ```yaml

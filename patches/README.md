@@ -17,4 +17,6 @@ delete the patch.
 
 | Patch | What it does |
 |---|---|
-| `0002-hc-q8-skip-bf16-multi-gpu.patch` | When the model is split across GPUs, skip loading the BF16 copy of the HC weights, the same as a single GPU already does. |
+| `0001-hc-q8-skip-bf16-multi-gpu.patch` | When the model is split across GPUs, skip loading the BF16 copy of the HC weights, the same as a single GPU already does. |
+| `0002-dense-arena.patch` | Pack the dense projection matrices into one VMM range per GPU instead of one `cudaMalloc` each, so they stop losing VRAM to 2 MiB rounding; the expert cache gets it. Same output. CUDA only; `STRATA_DENSE_ARENA=0` turns it off. |
+| `0003-verify-no-pcie-staging.patch` | With `--pcie-frac 0`, the verify window keeps no PCIe staging slots (about 61 MiB per GPU on UD-Q4_K_XL), which were never used; the expert cache gets it. `STRATA_PCIE_STAGING_KEEP=1` keeps them. |
