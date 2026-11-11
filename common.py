@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from pathlib import Path
 
 ROOT = Path("/opt/strata")          # where the image keeps the engine, the server and the tools
+ON_WINDOWS = os.name == "nt"
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +52,14 @@ class Progress:
         moved = self.done - self.first
         rate = f", {moved / elapsed / 1e6:.0f} MB/s" if elapsed > 1 and moved > 0 else ""
         log.info(f"{self.label}  {what}: {size_text(self.done)} in {duration_text(elapsed)}{rate}")
+
+
+def engine_program(name: str) -> Path:
+    """A program in engine/: strata.exe on Windows, strata in the image."""
+    if ON_WINDOWS:
+        return Path(ROOT, "engine", f"{name}.exe")
+    else:
+        return Path(ROOT, "engine", f"{name}")
 
 
 # ---- model files ------------------------------------------------------------------------------------------------

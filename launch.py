@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 
 import prepare
-from common import ROOT, SetupError, first_shard, mmproj_near
+from common import ROOT, SetupError, engine_program, first_shard, mmproj_near
 from settings import ModelPaths, Prepare, Settings, Vision
 
 ENGINE = Path(ROOT, "engine")
@@ -56,7 +56,7 @@ class Config:
         model_name = re.sub(r"[^a-z0-9._-]+", "-", model_name).strip("-")
 
         cfg = {
-            "exe": str(Path(ENGINE, "strata")),
+            "exe": str(engine_program("strata")),
             "args": self.engine_args(),
             "cwd": str(ROOT),
             "tokenizer": str(tokenizer),
@@ -133,7 +133,7 @@ class Config:
 
         gpu = s.vision == Vision.GPU
         section = {
-            "exe": str(Path(ENGINE, "strata-vision")),
+            "exe": str(engine_program("strata-vision")),
             "mmproj": str(self.mmproj),
             "model": str(self.model),
             "gpu": gpu,
@@ -142,8 +142,8 @@ class Config:
         # NVIDIA: strata-vision reads on the GPU too. AMD: the GPU reader is its own program, and the server
         # falls back to the CPU one when it does not start.
         if gpu and self.backend == "hip":
-            section["exe"] = str(Path(ENGINE, "strata-vision-hip"))
-            section["cpu_exe"] = str(Path(ENGINE, "strata-vision"))
+            section["exe"] = str(engine_program("strata-vision-hip"))
+            section["cpu_exe"] = str(engine_program("strata-vision"))
 
         if s.vision_threads is not None:
             section["threads"] = s.vision_threads

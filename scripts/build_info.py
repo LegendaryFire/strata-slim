@@ -65,5 +65,7 @@ if __name__ == "__main__":
         sys.exit("usage: build_info.py cuda|hip <architectures> <source root> <engine folder>")
     engine = Path(sys.argv[4])
     info = build_info(sys.argv[1], sys.argv[2], Path(sys.argv[3]), engine)
-    Path(engine, "BUILD.json").write_text(json.dumps(info) + "\n")
+    build_json = Path(engine, "BUILD.json")
+    with build_json.open("w") as f:
+        json.dump(info, f)
     log.info(json.dumps(info))

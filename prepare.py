@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import hf
-from common import ROOT, Progress, SetupError, first_shard, mmproj_near, size_text
+from common import ROOT, Progress, SetupError, engine_program, first_shard, mmproj_near, size_text
 from hf import HuggingFace, RemoteFile
 from settings import DraftVocab, Drafter, ModelPaths, Settings
 from strata_control import acquisition, drafting, drafting_fetch
@@ -319,7 +319,7 @@ class Preparer:
 
         try:
             drafting_fetch.ensure(data_dir, progress=progress)
-            if drafting.engine_reads_selector_q4(Path(ROOT, "engine", "strata")):
+            if drafting.engine_reads_selector_q4(engine_program("strata")):
                 drafting_fetch.convert_selector(data_dir, progress=progress)    # 174 MiB less VRAM, same output
         except (drafting_fetch.DraftingError, acquisition.AcquisitionRefused) as e:
             raise SetupError(f"DFlash2: {e}")
