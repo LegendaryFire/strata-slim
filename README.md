@@ -22,8 +22,9 @@ or AMD, name a model, run `docker compose up -d`, and it downloads, checks, pack
 Images are published for NVIDIA (`cuda`: RTX 30, 40 and 50) and AMD (`rocm`: RX 7000 and 9000). Each release is
 also tagged with its version, such as `0.2.13-1-cuda`, for pinning.
 
-These are upstream's code as released. Images with our [patches](patches/README.md) applied are published beside
-them as `cuda-patched` and `rocm-patched` (pinned: `0.2.13-1-cuda-patched`). Use whichever you prefer.
+The [patches](patches/README.md) are optional performance fixes, which the aim is to get into upstream Strata. The
+default images don't include them; only the `-patched` images do: `cuda-patched` and `rocm-patched` (pinned:
+`0.2.13-1-cuda-patched`).
 
 `docker-compose.yml`:
 
@@ -104,8 +105,8 @@ KV=int8
 # VRAM to keep free on each card, in MiB. Default: set by the engine.
 # VRAM_RESERVE_MIB=550
 
-# Additional engine flags.
-# ENGINE_ARGS=--expert-cache auto --spec 4
+# Engine flags. Required, and must include --prefill and --spec.
+ENGINE_ARGS=--expert-cache auto --prefill auto --spec 4 --spec-min-p 0.5
 
 # ----------------------------------------------------------------------
 # GPUs
@@ -196,7 +197,7 @@ else, and `HOST=0.0.0.0` with an `API_KEY` to open it to your network.
 | `API_KEY` | any string; clients send it as `Authorization: Bearer ...` | none (no key) |
 | `MODEL_NAME` | the name `/v1/models` lists | from the file name |
 | `PREPARE` | `auto`, `off` | `auto` |
-| `ENGINE_ARGS` | any other engine flags, e.g. `--spec 4 --expert-cache auto` | none |
+| `ENGINE_ARGS` | engine flags, must include `--prefill` and `--spec`, e.g. `--expert-cache auto --prefill auto --spec 4 --spec-min-p 0.5` | required |
 
 ## License
 
