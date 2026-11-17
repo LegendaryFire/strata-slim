@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1
 # strata-slim: the Strata engine, its API server and model prep (download, pack, MTP), nothing else.
 #
-#   docker build -t strata-slim:0.2.13 .                                     # RTX 30 (sm_86), 4 compile jobs
-#   docker build -t strata-slim:0.2.13 --build-arg CUDA_ARCHITECTURES="86;89" --build-arg BUILD_JOBS=8 .
-#   docker build -t strata-slim:0.2.13-patched --build-arg PATCHES=all .    # with the local fixes (patches/README.md)
+#   docker build -t strata-slim:0.2.15 .                                     # RTX 30 (sm_86), 4 compile jobs
+#   docker build -t strata-slim:0.2.15 --build-arg CUDA_ARCHITECTURES="86;89" --build-arg BUILD_JOBS=8 .
+#   docker build -t strata-slim:0.2.15-patched --build-arg PATCHES=all .    # with the local fixes (patches/README.md)
 #
 # CUDA_ARCHITECTURES: 86 = RTX 30, 89 = RTX 40, 120 = RTX 50 (the last one also gets PTX). BUILD_JOBS: each nvcc job
 # can take several GB of RAM; raise it when the machine has the memory free.
@@ -78,7 +78,10 @@ cmake -G Ninja -S . -B build $ccache \
     -DSTRATA_Q6K_EXPERTS=ON \
     -DSTRATA_MMQ_KQUANTS=ON \
     -DSTRATA_GGML_DIR=/opt/llama.cpp
-cmake --build build --target strata strata_kq -j "$BUILD_JOBS"
+# strata_kq was always built, but it only exists with -DSTRATA_MMQ=ON since v0.2.15, so now only when it's there
+targets=strata
+if cmake --build build --target strata_kq -- -n >/dev/null 2>&1; then targets="strata strata_kq"; fi
+cmake --build build --target $targets -j "$BUILD_JOBS"
 
 if [ "$BUILD_VISION" = "1" ]; then
     cmake -G Ninja -S tools/vision -B build-vision $ccache \

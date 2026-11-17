@@ -28,6 +28,8 @@ tests/core/dma_batch_parity.cu
 tests/cuda/hc_q8_stream_test.cu
 # the CUDA and HIP builds both add this one the same way (v0.2.12)
 tests/core/flag_order_test.cu
+# the quant layer adds its benchmark outside the tests check (v0.2.15)
+tests/quant/quant_bench.cpp
 # the HIP build (Dockerfile.rocm) adds these tests and tuning tools outside the "tests/ present" check too (v0.2.10);
 # configure needs them to exist, only `strata` and `strata-device` are built
 tests/cuda/pa_bench.cpp
@@ -47,6 +49,10 @@ tests/hip/prefill_rocblas_gemm.cpp
 tests/hip/prefill_wmma_gemm_parity.cpp
 tests/hip/q2_zero.cpp
 tests/hip/router_fast.cpp
+# three more the HIP build adds the same way (v0.2.15)
+tests/cuda/prefill_decode_golden.cu
+tests/cuda/prefill_expert_paths_bench.cpp
+tests/cuda/prefill_fused_q36_test.cpp
 tools/hip/tune_hipblaslt.cpp
 tools/hip/tune_rocblas.cpp
 # the AMD image (Dockerfile.rocm): upstream's own collector of the ROCm libraries and kernel data the engine loads
