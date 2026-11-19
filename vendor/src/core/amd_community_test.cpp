@@ -63,7 +63,7 @@ int main() {
     for (const auto& t : ac::kRocblasTables) {
         std::string tag(t.version);
         while (!tag.empty() && tag.back() == '.') tag.pop_back();
-        const std::string path = std::string("tools/hip/") + t.arch + "-rocblas-" + tag + ".txt";
+        const std::string path = std::string("../terminal/tools/hip/") + t.arch + "-rocblas-" + tag + ".txt";
         std::string err;
         strata::prefill::rocblas_tuning::Table ok;
         CHECK(ok.load(path, t.arch, t.version, err));

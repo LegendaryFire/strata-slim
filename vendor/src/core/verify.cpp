@@ -24,6 +24,9 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #include <intrin.h>
 #endif
@@ -98,6 +101,7 @@ bool window_run(void* w, int T, const int32_t* tokens, int64_t pos0, bool head, 
 bool window_commit(void* w, int n_keep, std::string& err);
 bool window_copy_logits(void* w, int t, float* host);
 void window_set_sampling(void* w, const strata::kernels::SamplerParams* sp, const int32_t* hist, int hist_len);
+const float* window_logits(void* w, int t);   // row t of the last window's head logits, null past its rows (#879)
 bool window_sample_slot_row(void* w, int row, const strata::kernels::SamplerParams& sp, const int32_t* hist, int hist_len, int32_t* tok, std::string& err);
 bool window_init_slots(void* w, const std::vector<strata::core::SessionState*>& slots, std::string& err);
 bool window_run_slots(void* w, const int* rows, int S, const int32_t* tokens, const int64_t* pos, int32_t* out, std::string& err);
@@ -911,6 +915,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     sampling_.temperature = 0.0f;
 #if defined(STRATA_GPU_METAL)
     if (metal_ == nullptr) metal_ = strata::metal_engine::window_create();
+    // #879: last_stage() reads le_, and its default is set below only where the CUDA prepare runs; this branch
+    // returns before that line, so without it the #879 gates (note_nonfinite's, and the host row scan's
+    // nan_guard_on() && last_stage()) never open on the Mac and the guard silently stays off (#3287).
+    if (le_ < 0) le_ = g.n_layers;
     if (!strata::metal_engine::window_init(metal_, g, ss, max_t, ss.qsa_states[ss.qsa_primary()].max_cells, &n_vocab_, err)) return false;
     if (!tap_req_.empty()) {   // DFlash2: the Metal window writes the taps itself (metal/src/engine/dflash2.inc); tap_dev() is its unified-memory buffer
         const float* tp = nullptr;
@@ -1370,6 +1378,19 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     // Pipelined windows must wait for the host verdict/snapshot fence before mutating state.
     const bool self_commit = T == 1 && !always_publish_ && !batch_rec_ && !g_qfuse() && one_token_self_commit();   // see Verifier::commit
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
+    // A batch window's rows that belong to one slot (its token, then its proposals: --batch-mtp, the pipelined groups'
+    // drafts) take the solo window's launches over that run: the K/V and indexer appends, the block scores, the top-k,
+    // a streamed K/V's resolve and the attention once per run instead of once per row.  They are the same kernels with
+    // n rows instead of 1, as the solo window runs them over its rows.  Opt-in (#5864, off until the two-card
+    // measurement): STRATA_BATCH_SLOT_RUNS=1; unset, row by row, as before.
+    static const bool slot_runs_env = [] { const char* v = std::getenv("STRATA_BATCH_SLOT_RUNS"); return v != nullptr && std::atoi(v) != 0; }();
+    const bool slot_runs = batch_rec_ && dec_batch && slot_runs_env;
+    // the end of the run of rows of row `first`'s slot in [first, end) (one row when the runs are off)
+    auto run_end = [&](int first, int end, bool on) {
+        int t = first + 1;
+        while (on && t < end && brow_[t] == brow_[first]) ++t;
+        return t;
+    };
     // fork 34a35db: the GDN gates and the QSA indexer beside the projections (STRATA_SIDE_MIXER=1; 0 / unset = in line)
     const int side_mixer_mode = g_side_mixer();
     const bool side_mixer = side_mixer_mode >= 1;
@@ -1899,12 +1920,19 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                                         n, 0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
                                                         rope_scaling(), ns);
                     } else {
-                        for (int t = tb; t < te; ++t) {
-                            const QsaState& sx = slot_ss(t).qsa_states[qi];
+                        for (int t = tb; t < te;) {
+                            const int first = t;
+                            t = run_end(first, te, slot_runs && !g_no_batch_kv);
+                            const QsaState& sx = slot_ss(first).qsa_states[qi];
                             const QsaIndexerBuffers ib{sx.idx_tail, sx.idx_dead, sx.idx_pooled, sx.idx_block_pos};
-                            native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos, 0,
-                                                      (const float*) wikn->data, EPS, ib, s, sx.max_cells,
-                                                      rope_scaling(), ns);
+                            if (t - first > 1)   // a slot's rows: one launch (slot_runs)
+                                native_qsa_indexer_append_steps(idx_raw + first * ID, step_ + first * kStepCount + kStepPos,
+                                                                kStepCount, t - first, 0, (const float*) wikn->data, EPS,
+                                                                ib, s, sx.max_cells, rope_scaling(), ns);
+                            else
+                                native_qsa_indexer_append(idx_raw + first * ID, step_ + first * kStepCount + kStepPos, 0,
+                                                          (const float*) wikn->data, EPS, ib, s, sx.max_cells,
+                                                          rope_scaling(), ns);
                         }
                     }
                 };
@@ -2032,25 +2060,39 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                             kv_append_step(st.k_pool, st.v_pool, st.page_table, step_ + t * kStepCount,
                                            kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st.host);
                 } else
-                for (int t = tb; t < te; ++t) {
-                    const QsaState& st = slot_ss(t).qsa_states[qi];   // the row's own K/V (ss's outside a batch)
-                    const int32_t* step_t = step_ + t * kStepCount;
+                for (int t = tb; t < te;) {
+                    const int first = t;
+                    const QsaState& st = slot_ss(first).qsa_states[qi];   // the row's own K/V (ss's outside a batch)
+                    // a slot's rows in one launch per pool (slot_runs), where the pool's kind has the launch
+                    t = run_end(first, te, slot_runs && !g_no_batch_kv && (st.kv_hybrid || st.kv_q4 || st.kv_int8));
+                    const int m = t - first;
+                    const int32_t* step_t = step_ + first * kStepCount;
+                    const float* kc = kcur_ + first * NKV * HD;
+                    const float* vc = vcur_ + first * NKV * HD;
                     if (st.kv_hybrid) {   // K8V4: the unused half's lanes folded onto the used pool (layer.cpp)
                         const KvHostPools hk = kv_hybrid_k_half(st.host), hv = kv_hybrid_v_half(st.host);
                         const bool mirror = st.host.present();   // streamed: the host copy too
-                        kv_append_q8_step(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, step_t,
-                                          kcur_ + t * NKV * HD, kcur_ + t * NKV * HD, s, cs, mirror ? &hk : nullptr);
-                        kv_append_q4_step(st.v_q4, st.v_q4, st.page_table, step_t, vcur_ + t * NKV * HD,
-                                          vcur_ + t * NKV * HD, s, cs, mirror ? &hv : nullptr);
-                    } else if (st.kv_q4)
-                        kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, step_t, kcur_ + t * NKV * HD,
-                                          vcur_ + t * NKV * HD, s, cs, &st.host);
-                    else if (st.kv_int8)
-                        kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_t,
-                                          kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st.host);
-                    else
-                        kv_append_step(st.k_pool, st.v_pool, st.page_table, step_t, kcur_ + t * NKV * HD,
-                                       vcur_ + t * NKV * HD, s, cs, &st.host);
+                        if (m > 1) {
+                            kv_append_q8_steps(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, step_t, kStepCount,
+                                               kc, kc, (int) (NKV * HD), m, s, cs, mirror ? &hk : nullptr);
+                            kv_append_q4_steps(st.v_q4, st.v_q4, st.page_table, step_t, kStepCount, m, vc, vc, s, cs,
+                                               mirror ? &hv : nullptr);
+                        } else {
+                            kv_append_q8_step(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, step_t, kc, kc, s, cs,
+                                              mirror ? &hk : nullptr);
+                            kv_append_q4_step(st.v_q4, st.v_q4, st.page_table, step_t, vc, vc, s, cs,
+                                              mirror ? &hv : nullptr);
+                        }
+                    } else if (st.kv_q4) {
+                        if (m > 1) kv_append_q4_steps(st.k_q4, st.v_q4, st.page_table, step_t, kStepCount, m, kc, vc, s, cs, &st.host);
+                        else kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, step_t, kc, vc, s, cs, &st.host);
+                    } else if (st.kv_int8) {
+                        if (m > 1)
+                            kv_append_q8_steps(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_t, kStepCount, kc,
+                                               vc, (int) (NKV * HD), m, s, cs, &st.host);
+                        else kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_t, kc, vc, s, cs, &st.host);
+                    } else
+                        kv_append_step(st.k_pool, st.v_pool, st.page_table, step_t, kc, vc, s, cs, &st.host);
                 }
                 if (!sidem) idx_append(cs);
                 stamp(l, 9, grp);
@@ -2126,18 +2168,22 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                                       attn_scratch_ + (size_t) t * attn_scratch_floats_,
                                                       attn_ + t * NH * HD, 1, cs);
                     }
-                } else if (batch_rec_) {   // each row selects and attends over its own slot's K/V
-                    for (int t = tb; t < te; ++t) {
-                        const QsaState& sx = slot_ss(t).qsa_states[qi];
-                        qsa_block_scores(sx.idx_pooled, sx.idx_dead, qidx_ + t * IQ * ID, step_ + t * kStepCount, 1,
-                                         max_blocks_, s, scores_ + (size_t) t * max_blocks_, cs);
-                        qsa_block_topk(scores_ + (size_t) t * max_blocks_, step_ + t * kStepCount, 1, max_blocks_, cap_, s,
-                                       sel_ + (size_t) t * cap_, cs);
-                        qsa_kv_resolve(sx, *g_, sel_ + (size_t) t * cap_, step_ + t * kStepCount, 1, cap_, cs);
+                } else if (batch_rec_) {   // each slot's rows select and attend over its own K/V (slot_runs: a launch per run)
+                    for (int t = tb; t < te;) {
+                        const int first = t;
+                        t = run_end(first, te, slot_runs);
+                        const int m = t - first;
+                        const QsaState& sx = slot_ss(first).qsa_states[qi];
+                        qsa_block_scores(sx.idx_pooled, sx.idx_dead, qidx_ + first * IQ * ID, step_ + first * kStepCount, m,
+                                         max_blocks_, s, scores_ + (size_t) first * max_blocks_, cs);
+                        qsa_block_topk(scores_ + (size_t) first * max_blocks_, step_ + first * kStepCount, m, max_blocks_,
+                                       cap_, s, sel_ + (size_t) first * cap_, cs);
+                        qsa_kv_resolve(sx, *g_, sel_ + (size_t) first * cap_, step_ + first * kStepCount, m, cap_, cs);
                         const QsaAttnPools px = qsa_attn_pools(sx);
-                        qsa_decode_attn_batch(qcur_ + t * NH * HD, px, sel_ + (size_t) t * cap_, step_ + t * kStepCount,
-                                              cap_, s, attn_scratch_ + (size_t) t * attn_scratch_floats_,
-                                              attn_ + t * NH * HD, 1, cs);
+                        qsa_decode_attn_batch(qcur_ + first * NH * HD, px, sel_ + (size_t) first * cap_,
+                                              step_ + first * kStepCount, cap_, s,
+                                              attn_scratch_ + (size_t) first * attn_scratch_floats_,
+                                              attn_ + first * NH * HD, m, cs);
                     }
                 } else {
                 if (!sidem) idx_select(cs);
@@ -3238,6 +3284,44 @@ bool Verifier::prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string
     return true;
 }
 
+#if defined(STRATA_GPU_METAL)
+// #879's device row check on the Metal port: CUDA scans every head window's logits rows in the graph
+// (logits_nonfinite_rows); the port has no such kernel, and its samplers answer the CUDA final reduction's own
+// rule for a row with no finite candidate (token 0, sampler.cu's "the serial version answered 0"), so the pick
+// cannot carry the fact.  The rows stand in unified memory after the window (window_logits): read the same fact
+// from the host before the serve loop emits anything.  The test is the CUDA kernel's, bit for bit: a value whose
+// exponent is all ones (NaN, +inf, -inf) marks the row.
+static uint32_t metal_scan_rows(void* metal, int T, int64_t n_vocab) {
+    uint32_t mask = 0;
+    const int lim = T < (int) strata::kernels::kVerifyMaxT ? T : (int) strata::kernels::kVerifyMaxT;
+    for (int t = 0; t < lim; ++t) {
+        const float* row = strata::metal_engine::window_logits(metal, t);
+        if (row == nullptr) continue;   // (a window without a head for that row checks nothing)
+        // the same bit test, as a branch-free reduction over blocks of 4096 values (the compiler turns it into NEON;
+        // the per-value early exit kept it scalar): one decode window's rows cost about 1.5% of the M5 Max's decode otherwise
+        typedef uint32_t __attribute__((may_alias)) u32_alias;
+        const u32_alias* u = reinterpret_cast<const u32_alias*>(row);
+        for (int64_t i0 = 0; i0 < n_vocab; i0 += 4096) {
+            const int64_t i1 = i0 + 4096 < n_vocab ? i0 + 4096 : n_vocab;
+            uint32_t hit = 0;
+            for (int64_t i = i0; i < i1; ++i) hit |= (uint32_t) ((u[i] & 0x7f800000u) == 0x7f800000u);
+            if (hit) { mask |= 1u << t; break; }
+        }
+    }
+    return mask;
+}
+// fold a scan's rows into the note_nonfinite fact (the first flagged row wins, as the CUDA mask reads it)
+static inline void metal_fold_nf(uint32_t nf_mask, uint32_t scan, int T, const int64_t* pos_b, int64_t pos0,
+                                 uint32_t& mask_out, int& row_out, int64_t& pos_out) {
+    if (scan == 0) return;
+    mask_out |= scan;
+    row_out = -1;
+    for (int t = 0; t < T && row_out < 0; ++t)
+        if ((mask_out >> t) & 1u) row_out = t;
+    if (row_out >= 0) pos_out = pos_b != nullptr ? pos_b[row_out] : pos0 + row_out;
+}
+#endif
+
 bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
                    std::string& err) {
     const bool measure = spec_measure_;
@@ -3268,7 +3352,19 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             strata::metal_engine::window_set_sampling(metal_, nullptr, nullptr, 0);
         }
     }
-    return strata::metal_engine::window_run(metal_, T, tokens, pos0, head_sampling_, out, err);
+    if (!strata::metal_engine::window_run(metal_, T, tokens, pos0, head_sampling_, out, err)) return false;
+    // #879 on Metal: the CUDA path records the fact with its device row check inside run(); this branch returned
+    // before note_nonfinite, so a window whose logits had gone non-finite streamed the sampler's token-0 "no
+    // candidate" answer forever.  The port has no device kernel; the head rows stand in unified memory after the
+    // window and carry the same fact (metal_scan_rows, the CUDA kernel's bit test).  note_nonfinite resets and
+    // honours the guard switch; the fold adds the scan's rows after it.
+    last_pos0_ = pos0;   // (before note_nonfinite: its position of a flagged row is last_pos0_ + row, as on CUDA)
+    note_nonfinite(T, nullptr);
+    const uint32_t nf_scan = nan_guard_on() && last_stage() ? metal_scan_rows(metal_, T, n_vocab_) : 0u;
+    metal_fold_nf(nf_mask_, nf_scan, T, nullptr, pos0, nf_mask_, nf_row_, nf_pos_);
+    progress_at("decode");   // (as the CUDA / HIP path's end of run(): a finished window is progress for the serve watchdog)
+    progress_beat();
+    return true;
 #endif
     using namespace strata::kernels;
     const OnDevice on_device(device_);
@@ -4428,6 +4524,29 @@ bool Verifier::evict_batch_graph(const std::vector<int>& keep, bool& evicted, st
     return true;
 }
 
+bool Verifier::drop_window_graphs(int& dropped, std::string& err) {
+    dropped = 0;
+    if (prelaunched_ != 0) {
+        err = "verify: a prelaunched window is pending; its graph cannot be dropped";
+        return false;
+    }
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = "verify: synchronizing before dropping the window graphs failed";
+        return false;
+    }
+    for (int s = 0; s < 2; ++s)
+        for (int t = 0; t <= strata::kernels::kVerifyLongT; ++t) {
+            for (cudaGraphExec_t* e : {&exec_[s][t], &exec_nr_[s][t]})
+                if (*e != nullptr) {
+                    (void) cudaGraphExecDestroy(*e);
+                    *e = nullptr;
+                    ++dropped;
+                }
+            launched_[s][t] = launched_nr_[s][t] = false;   // the next graph of that size is a cold first launch again
+        }
+    return true;
+}
+
 bool Verifier::evict_window_graph(int keep_t, bool& evicted, std::string& err) {
     evicted = false;
     if (no_window_eviction_ || keep_t < 1) return true;
@@ -4552,6 +4671,7 @@ bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, cons
     // (into a local: what a failed instantiate leaves in the output is not specified, and `ex` is a member that
     // capture() reads as "captured" when it is not null)
     capture_oom_ = false;
+    graphs_made_counter().fetch_add(1, std::memory_order_relaxed);
     cudaGraphExec_t got = nullptr;
     cudaError_t ie = cudaGraphInstantiate(&got, graph, flags);
     int freed = 0;
@@ -4721,6 +4841,15 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
             if (!strata::metal_engine::window_sample_slot_row(metal_, t, sp, hist, hlen, &out[t], err)) return false;
         }
     }
+    // #879 on batch slots (Metal): the CUDA path records the row check after the run; the scan here is the same
+    // fact, and nonfinite_in(t) is what the batch serve loop already consults per row.
+    note_nonfinite(S, last_pos_b_);
+    const uint32_t nf_scan = nan_guard_on() && last_stage() ? metal_scan_rows(metal_, S, n_vocab_) : 0u;
+    metal_fold_nf(nf_mask_, nf_scan, S, last_pos_b_, 0, nf_mask_, nf_row_, nf_pos_);
+    // the serve watchdog (issue #29): a finished batch window is progress, as in the CUDA / HIP path below.  Without it a Metal --batch
+    // decode with no admission for 60 s was ended as "no progress" (both slots mid-decode at 53 tok/s)
+    progress_at("decode");
+    progress_beat();
     return true;
 #endif
     using namespace strata::kernels;
@@ -5135,11 +5264,19 @@ void Verifier::note_nonfinite(int T, const int64_t* pos_b) {
     nf_row_ = -1;
     nf_pos_ = -1;
     nf_mask_ = 0;
+#if defined(STRATA_GPU_METAL)
+    // the Metal port has no device flags (h_nf_ stays null: its rows are scanned on the host after this, metal_scan_rows);
+    // STRATA_NAN_INJECT below still applies, so the #879 path can be tested on a Mac (#3287)
+    if (!nan_guard_on() || !last_stage()) return;
+#else
     if (!nan_guard_on() || h_nf_ == nullptr || !last_stage()) return;   // (a stage without the head checks nothing)
-    const volatile uint32_t* f = h_nf_;
-    for (int t = 0; t < T && t < strata::kernels::kVerifyMaxT; ++t)
-        for (int b = 0; b < strata::kernels::kNonfiniteBlocks; ++b)
-            if (f[t * strata::kernels::kNonfiniteBlocks + b] != 0) { nf_mask_ |= 1u << t; break; }
+#endif
+    if (h_nf_ != nullptr) {
+        const volatile uint32_t* f = h_nf_;
+        for (int t = 0; t < T && t < strata::kernels::kVerifyMaxT; ++t)
+            for (int b = 0; b < strata::kernels::kNonfiniteBlocks; ++b)
+                if (f[t * strata::kernels::kNonfiniteBlocks + b] != 0) { nf_mask_ |= 1u << t; break; }
+    }
     const std::vector<long long>& inject = nan_inject_list();
     if (!inject.empty()) {
         const long long k = g_nf_windows.fetch_add(1) + 1;

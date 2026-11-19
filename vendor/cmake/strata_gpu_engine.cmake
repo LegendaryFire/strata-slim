@@ -229,7 +229,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(pa_bench PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(pa_bench PRIVATE strata_kernels CUDA::cudart)
   endif()
-  # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/ggml)
+  # plan v0.3 P6: the GGUF block layouts and codebook grids for the i-quant formats (third_party/ggml/ggml-common.h forwards to include/strata/quant/strata-quant-common.h)
   target_include_directories(strata_kernels PRIVATE third_party/ggml)
   # Match the pinned llama.cpp CUDA arithmetic contract for this adapter only.
   if(STRATA_ENABLE_CUDA)
@@ -420,6 +420,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME conversation_snapshot_test_ckpt_vram_slots COMMAND conversation_snapshot_test)
     set_tests_properties(conversation_snapshot_test_ckpt_vram_slots PROPERTIES
       ENVIRONMENT "STRATA_TEST_BIG_GDN=1;STRATA_CKPT_ASYNC=1;STRATA_CKPT_VRAM_SLOTS=3" SKIP_RETURN_CODE 77 TIMEOUT 300)
+    # #6075: two threads saving checkpoints through the one background-copy buffer, forced to overlap; alone and with
+    # recent states kept in VRAM
+    add_executable(conversation_ckpt_race_test src/core/conversation_ckpt_race_test.cpp)
+    target_link_libraries(conversation_ckpt_race_test PRIVATE strata_engine)
+    add_test(NAME conversation_ckpt_race_test COMMAND conversation_ckpt_race_test)
+    set_tests_properties(conversation_ckpt_race_test PROPERTIES
+      ENVIRONMENT "STRATA_CKPT_ASYNC=1" SKIP_RETURN_CODE 77 TIMEOUT 120)
+    add_test(NAME conversation_ckpt_race_test_vram_slots COMMAND conversation_ckpt_race_test)
+    set_tests_properties(conversation_ckpt_race_test_vram_slots PROPERTIES
+      ENVIRONMENT "STRATA_CKPT_ASYNC=1;STRATA_CKPT_VRAM_SLOTS=2" SKIP_RETURN_CODE 77 TIMEOUT 120)
     add_executable(conversation_validation_test src/core/conversation_validation_test.cpp)
     target_link_libraries(conversation_validation_test PRIVATE strata_engine)
     add_test(NAME conversation_validation_test COMMAND conversation_validation_test)
@@ -457,7 +467,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_compile_definitions(strata_prefill PRIVATE STRATA_HIPBLASLT_AVAILABLE=1)
     target_link_libraries(strata_prefill PRIVATE roc::hipblaslt)
 
-    add_executable(tune_hipblaslt tools/hip/tune_hipblaslt.cpp)
+    add_executable(tune_hipblaslt ../terminal/tools/hip/tune_hipblaslt.cpp)
     target_link_libraries(tune_hipblaslt PRIVATE hip::host roc::hipblas roc::hipblaslt)
   endif()
   if(STRATA_ENABLE_HIP AND STRATA_ROCBLAS_AVAILABLE)
@@ -465,7 +475,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_compile_definitions(strata_prefill PRIVATE STRATA_ROCBLAS_AVAILABLE=1)
     target_link_libraries(strata_prefill PRIVATE roc::rocblas)
 
-    add_executable(tune_rocblas tools/hip/tune_rocblas.cpp)
+    add_executable(tune_rocblas ../terminal/tools/hip/tune_rocblas.cpp)
     target_link_libraries(tune_rocblas PRIVATE hip::host roc::rocblas)
   endif()
 
@@ -743,7 +753,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   endforeach()
   if(NOT _iq_python STREQUAL "")
     add_test(NAME iq_parity_fixtures
-             COMMAND ${_iq_python} ${CMAKE_CURRENT_SOURCE_DIR}/tools/iq_fixture.py
+             COMMAND ${_iq_python} ${CMAKE_CURRENT_SOURCE_DIR}/../terminal/tools/iq_fixture.py
                      --out ${CMAKE_CURRENT_BINARY_DIR}/iq_fixture)
     # exit 3: numpy or the vendored gguf-py is missing (a trimmed third_party) - a skip, not a failure
     set_tests_properties(iq_parity_fixtures PROPERTIES FIXTURES_SETUP iq_fixture_data SKIP_RETURN_CODE 3)
@@ -1053,6 +1063,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(route_resident_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME route_resident_parity COMMAND route_resident_parity)
   set_tests_properties(route_resident_parity PROPERTIES TIMEOUT 120)
+  # STRATA_ROUTE_PRIOR (#5655): degenerate router rows keep the router's top-10 whole, rankable rows match a serial
+  # reference (GPU, synthetic, no model)
+  add_executable(route_prior_parity src/kernels/route_prior_parity.cu)
+  target_include_directories(route_prior_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(route_prior_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME route_prior_parity COMMAND route_prior_parity)
+  set_tests_properties(route_prior_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 
   add_executable(router_top10_parity src/kernels/router_top10_parity.cpp)
   target_include_directories(router_top10_parity PRIVATE ${_strata_gpu_include_directories})

@@ -2584,6 +2584,34 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_BATCH_SLOT_RUNS",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/core/verify.cpp",
+     "line": 1383,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #5864, opt-in (off by default): =1 runs a batch slot's rows of one window (its token and its proposals) as one launch per layer (K/V append, indexer step, block scores, top-k, resolve, attention); unset, a launch per row. Measured on 2x RTX A6000, UD-Q4_K_XL, conversations of about 2K tokens, 3 turns per client, STRATA_PIPED_MTP=2 with and without it, 4 repeats: 1 / 2 / 4 / 8 clients 56.6 / 67.1 / 78.4 / 75.6 committed tok/s against 56.6 / 67.1 / 78.1 / 75.4 without; whether its run path was taken is not verified.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_BATCH_TELEMETRY",
    "backends": [
     "cuda-hip"
@@ -6447,6 +6475,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_DUMP_TOKENS_DIR",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 19548,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #5860, measurement only, off by default: writes each request's generated tokens to <dir> for a later STRATA_FOLLOW_DIR run.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_DUMP_WINDOW_TOP2",
    "backends": [
     "sycl"
@@ -7911,6 +7972,39 @@
    "status": "research",
    "owner": "program",
    "note": "[reviewed] Described as a \"STRATA_FOLLOW test path\"; test-only switch. [notes-148-intel.md:83]",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_FOLLOW_DIR",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 19547,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #5860, measurement only, off by default: a forced continuation from <dir> stands in for the head's picks, so two arms decode the same tokens.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -11931,6 +12025,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_HEAD_ALIAS_TEST_MOVE",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 17353,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": "off",
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "d4c732f6a0",
+   "first_date": "2026-11-16",
+   "since": null,
+   "last_commit": "d4c732f6a0",
+   "last_date": "2026-11-16",
+   "status": "research",
+   "owner": "program",
+   "note": "tests only (#5188): =1 holds a head-sized spacer while --prefill-head-alias reloads the output head, so the head comes back at another address on a large card; users never set it",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_HEAD_HOST",
    "backends": [
     "cuda-hip"
@@ -12357,7 +12484,7 @@
    "last_date": "2026-11-12",
    "status": "default",
    "owner": "prefill",
-   "note": "[auto] on by default for a Radeon 780M (gfx1103, integrated, Linux) only (include/strata/core/arch_defaults.hpp:82 prompt_f16_resolve, used by prompt_f16() in src/prefill/gemm.cu); opt-in elsewhere (=1); =0 turns it off. [docs/AMD_HIP.md:512]",
+   "note": "on by default for a Radeon 780M (gfx1103, integrated, Linux) and for the discrete RX 6000 cards (gfx1030 / gfx1031 / gfx1032, #5151) (include/strata/core/arch_defaults.hpp prompt_f16_resolve, used by prompt_f16() in src/prefill/gemm.cu); opt-in elsewhere (=1); =0 turns it off (the way back). [docs/AMD_HIP.md:512]",
    "retire_after": "",
    "retired_in": ""
   },
@@ -13037,6 +13164,39 @@
    "status": "research",
    "owner": "kernels",
    "note": "The 8-entry slices of the tile-2..4 int8 expert kernel (STRATA_EXPERT_I8's prompt path; two weight rows and one entry of each 8-entry slice per thread; output bit-identical). Not set: on for tile 2 (up to about 1,950 tokens at Flash-Next's shape), off for tiles 3 and above. 1: tiles 2 to 4. 0: off.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_I8_SM70",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/kernels/cuda/iq_kernels.cu",
+     "line": 6277,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "string",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "f41d35929e",
+   "first_date": "2026-11-16",
+   "since": null,
+   "last_commit": "f41d35929e",
+   "last_date": "2026-11-16",
+   "status": "rollback",
+   "owner": "kernels",
+   "note": "The Volta (sm_70) rule of STRATA_EXPERT_I8's prompt kernels: the tile that keeps two blocks per multiprocessor and the big grids read from global memory (#6053). Not set: on on a Volta card, off elsewhere and on HIP. 0: off (the tile rule of the other cards).",
    "retire_after": "",
    "retired_in": ""
   },
@@ -14211,11 +14371,11 @@
    "since": "v0.2.12",
    "last_commit": "7bf5ec4ebf",
    "last_date": "2026-11-06",
-   "status": "opt-in",
+   "status": "retired",
    "owner": "prefill",
-   "note": "[reviewed] Documented =1/2 int8 kernel for IQ4 experts, \"each is off unless you set it\". [docs/DETAILS.md:1082]",
+   "note": "Retired in 0.2.16 (own-stack step 10): read only in llama.cpp's MMQ build path, which left the tree; the setting is no longer read. [reviewed] Documented =1/2 int8 kernel for IQ4 experts, \"each is off unless you set it\". [docs/DETAILS.md:1082]",
    "retire_after": "",
-   "retired_in": ""
+   "retired_in": "0.2.16"
   },
   {
    "name": "STRATA_IQ512_FUSED_MAX",
@@ -15494,6 +15654,34 @@
    "status": "opt-in",
    "owner": "prefill",
    "note": "[auto] documented for users (docs/KVA.md:14), 2 more",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_KV_COPY_RESIDENT",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/core/conversation_snapshot.cpp",
+     "line": 440,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #5864, opt-in (off by default): =1 lets a direct K/V copy between a batch slot and the main sessions carry the streamed K/V's VRAM pages and map along; unset, the target's residency is reset. Not measured here.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -17708,6 +17896,72 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_METAL_KEEPALIVE_MS",
+   "backends": [
+    "metal"
+   ],
+   "reads": [
+    {
+     "file": "metal/src/mtl_rt.mm",
+     "line": 77,
+     "backend": "metal",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "float",
+   "default_state": null,
+   "code_default": "250.0",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "f12b65334f",
+   "first_date": "2026-11-16",
+   "since": null,
+   "last_commit": "f12b65334f",
+   "last_date": "2026-11-16",
+   "status": "default",
+   "owner": "metal/engine",
+   "note": "The GPU keep-alive's interval in milliseconds (default 250; 0 turns the keep-alive off). While idle, a tiny GPU job every interval keeps the engine's GPU memory in place, so the first request after a pause does not wait (#6078). Read by metal/src/mtl_rt.mm.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_METAL_KEEPALIVE_WINDOW_S",
+   "backends": [
+    "metal"
+   ],
+   "reads": [
+    {
+     "file": "metal/src/mtl_rt.mm",
+     "line": 80,
+     "backend": "metal",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "float",
+   "default_state": null,
+   "code_default": "120.0",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "f12b65334f",
+   "first_date": "2026-11-16",
+   "since": null,
+   "last_commit": "f12b65334f",
+   "last_date": "2026-11-16",
+   "status": "default",
+   "owner": "metal/engine",
+   "note": "How long the GPU keep-alive runs after the last request, in seconds (default 120). After that the GPU memory is given back; it also pauses while macOS reports memory pressure (#6078). Read by metal/src/mtl_rt.mm.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_METAL_KEEP_FREE_GB",
    "backends": [
     "metal"
@@ -19319,6 +19573,45 @@
    "retired_in": "0.2.13"
   },
   {
+   "name": "STRATA_METAL_WRAP_PLE",
+   "backends": [
+    "metal"
+   ],
+   "reads": [
+    {
+     "file": "metal/src/engine/window.cpp",
+     "line": 753,
+     "backend": "metal",
+     "fn": "getenv"
+    },
+    {
+     "file": "metal/src/engine/window.cpp",
+     "line": 753,
+     "backend": "metal",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "8baf901707",
+   "first_date": "2026-11-16",
+   "since": null,
+   "last_commit": "8baf901707",
+   "last_date": "2026-11-16",
+   "status": "rollback",
+   "owner": "metal/engine",
+   "note": "1 = wrap the whole Gyro file including the PLE table, the behaviour before #6024 (8baf90170). Read by metal/src/engine/window.cpp.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_METAL_WRAP_SPLIT",
    "backends": [
     "metal"
@@ -19427,11 +19720,11 @@
    "since": "v0.1.45",
    "last_commit": "9d53a1a8db",
    "last_date": "2026-11-13",
-   "status": "opt-in",
+   "status": "retired",
    "owner": "prefill",
-   "note": "[reviewed] Documented opt-in needing STRATA_MMQ_TAB build; E23 rejected it as default but it is a user feature. [docs/DETAILS.md:1081]",
+   "note": "Retired in 0.2.16 (own-stack step 10): read only in llama.cpp's MMQ build path, which left the tree; the setting is no longer read. [reviewed] Documented opt-in needing STRATA_MMQ_TAB build; E23 rejected it as default but it is a user feature. [docs/DETAILS.md:1081]",
    "retire_after": "",
-   "retired_in": ""
+   "retired_in": "0.2.16"
   },
   {
    "name": "STRATA_MMQ_DIRECT_LOG",
@@ -19534,18 +19827,6 @@
     {
      "file": "src/core/gfx12_extra_test.cpp",
      "line": 96,
-     "backend": "cuda-hip",
-     "fn": "getenv"
-    },
-    {
-     "file": "src/prefill/mmq_kq_loader.cpp",
-     "line": 110,
-     "backend": "cuda-hip",
-     "fn": "getenv"
-    },
-    {
-     "file": "src/prefill/moe_mmq.cu",
-     "line": 51,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -19676,11 +19957,11 @@
    "since": "v0.2.7",
    "last_commit": "62b6a47ea4",
    "last_date": "2026-11-12",
-   "status": "opt-in",
+   "status": "retired",
    "owner": "prefill",
-   "note": "[auto] documented for users (docs/OLDER_GPUS.md:191), 1 more",
+   "note": "Retired in 0.2.16 (own-stack step 10): read only in llama.cpp's MMQ build path, which left the tree; the setting is no longer read. [auto] documented for users (docs/OLDER_GPUS.md:191), 1 more",
    "retire_after": "",
-   "retired_in": ""
+   "retired_in": "0.2.16"
   },
   {
    "name": "STRATA_MMVF_CHECK",
@@ -24638,8 +24919,7 @@
    "backends": [
     "cuda",
     "cuda-hip",
-    "hip",
-    "sycl"
+    "hip"
    ],
    "reads": [
     {
@@ -24772,18 +25052,6 @@
      "file": "src/qwen35/q36_engine.cu",
      "line": 3965,
      "backend": "cuda-hip",
-     "fn": "getenv"
-    },
-    {
-     "file": "sycl/src/prefill/moe_fused.dp.cpp",
-     "line": 950,
-     "backend": "sycl",
-     "fn": "getenv"
-    },
-    {
-     "file": "sycl/src/prefill/moe_fused.dp.cpp",
-     "line": 961,
-     "backend": "sycl",
      "fn": "getenv"
     }
    ],
@@ -24963,8 +25231,7 @@
    "name": "STRATA_PF_FUSED_KQ",
    "backends": [
     "cuda",
-    "cuda-hip",
-    "sycl"
+    "cuda-hip"
    ],
    "reads": [
     {
@@ -24983,12 +25250,6 @@
      "file": "src/prefill/moe_fused_iq.cu",
      "line": 2536,
      "backend": "cuda-hip",
-     "fn": "getenv"
-    },
-    {
-     "file": "sycl/src/prefill/moe_fused_iq.dp.cpp",
-     "line": 1220,
-     "backend": "sycl",
      "fn": "getenv"
     }
    ],
@@ -25026,20 +25287,13 @@
   {
    "name": "STRATA_PF_FUSED_NATIVE",
    "backends": [
-    "cuda-hip",
-    "sycl"
+    "cuda-hip"
    ],
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
      "line": 2893,
      "backend": "cuda-hip",
-     "fn": "getenv"
-    },
-    {
-     "file": "sycl/src/prefill/moe_fused_iq.dp.cpp",
-     "line": 1365,
-     "backend": "sycl",
      "fn": "getenv"
     }
    ],
@@ -25427,6 +25681,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_PF_FUSED_SM75_KQ",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/prefill/moe_fused_iq.cu",
+     "line": 2447,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "042f91a3ff",
+   "first_date": "2026-11-16",
+   "since": null,
+   "last_commit": "042f91a3ff",
+   "last_date": "2026-11-16",
+   "status": "rollback",
+   "owner": "prefill",
+   "note": "On a Turing card (sm_75) the K-quant and Q8_0 prompt-expert pairs (Q4_K / Q5_K gate/up with a Q5_1 or Q8_0 down, Q6_K or Q8_0 gate/up with a Q8_0 down: the UD-Q4_K_XL / UD-Q6_K_XL sets and Qwen3.6's UD sets) run on the fused kernels by default (#6066). Not set: on. 0: off, those layers go back to the int8 dp4a kernels (a rollback for bug reports; users never set it).",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_PF_FUSED_SM86",
    "backends": [
     "cuda-hip"
@@ -25462,20 +25749,13 @@
   {
    "name": "STRATA_PF_FUSED_TILE",
    "backends": [
-    "cuda-hip",
-    "sycl"
+    "cuda-hip"
    ],
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
      "line": 2806,
      "backend": "cuda-hip",
-     "fn": "getenv"
-    },
-    {
-     "file": "sycl/src/prefill/moe_fused_iq.dp.cpp",
-     "line": 1352,
-     "backend": "sycl",
      "fn": "getenv"
     }
    ],
@@ -25907,8 +26187,7 @@
   {
    "name": "STRATA_PF_OCC",
    "backends": [
-    "hip",
-    "sycl"
+    "hip"
    ],
    "reads": [
     {
@@ -25921,18 +26200,6 @@
      "file": "src/prefill/moe_fused_iq.cu",
      "line": 2353,
      "backend": "hip",
-     "fn": "getenv"
-    },
-    {
-     "file": "sycl/src/prefill/moe_fused.dp.cpp",
-     "line": 845,
-     "backend": "sycl",
-     "fn": "getenv"
-    },
-    {
-     "file": "sycl/src/prefill/moe_fused_iq.dp.cpp",
-     "line": 1163,
-     "backend": "sycl",
      "fn": "getenv"
     }
    ],
@@ -26913,6 +27180,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_PF_TQ_G11",
+   "backends": [
+    "hip"
+   ],
+   "reads": [
+    {
+     "file": "src/prefill/moe_fused_iq.cu",
+     "line": 2672,
+     "backend": "hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "string",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "default",
+   "owner": "prefill",
+   "note": "on by default on the RX 7000 cards (gfx1100 / gfx1101 / gfx1102) in a build without llama.cpp's MMQ: the fused prompt kernels take Gyro-S's and Gyro-M's trellis experts instead of the dequantize + FP16 path (#6067; include/strata/prefill/fused_tq_hip.hpp kG11DefaultOn); =0 turns it off; =1 also takes the Radeon 780M (gfx1103: opt-in only, never by default); nothing on other devices; for A/B runs only, not for users",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_PF_TQ_G1151",
    "backends": [
     "hip"
@@ -27579,6 +27879,34 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_PIPED_LOOKUP",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 7508,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #5864, opt-in (off by default): =1, with STRATA_PIPED_MTP and the prompt lookup (--suffix-draft): a slot's window in the pipelined groups may carry the lookup's drafts instead of the draft layer's; unset, the draft layer's only. Measured on 2x RTX A6000, UD-Q4_K_XL, conversations of about 2K tokens, 3 turns per client, STRATA_PIPED_MTP=2 with and without it, 4 repeats: 1 / 2 / 4 / 8 clients 55.5 / 66.7 / 77.9 / 75.3 committed tok/s against 56.6 / 67.1 / 78.1 / 75.4 without.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_PIPED_MTP",
    "backends": [
     "cuda-hip"
@@ -27975,6 +28303,72 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_PIPELINE_HIT_MIN",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 18099,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "float",
+   "default_state": null,
+   "code_default": "-1.0",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #5860, opt-in (off by default): the pipelined decode launches a speculative window when the share of such windows on the path, counted in this process, is at least this (0.35 measured best on 2x RTX 3090); unset, the theta gate at 0.2. Measured on 2x RTX A6000, UD-Q4_K_XL, one client, --pipeline-windows 2, 3 starts of 4 requests of about 1.9K tokens: 58.3 committed tok/s with it against 58.1 with none set.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_PIPELINE_LAZY_CHAIN",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 18109,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #5860, opt-in (off by default): =1 runs the MTP chain's steps only as the outputs before them call for them (chain_extend); unset, the whole chain at once. Measured on 2x RTX A6000, UD-Q4_K_XL, one client, --pipeline-windows 2, 3 starts of 4 requests of about 1.9K tokens: 58.6 committed tok/s with it against 58.1 with none set.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_PIPELINE_LOG",
    "backends": [
     "cuda-hip",
@@ -28051,6 +28445,39 @@
    "status": "research",
    "owner": "program",
    "note": "[auto] diagnostic / trace / measurement switch by name or by code, not documented for users",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_PIPELINE_LOOKUP_RUN",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 18116,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #5860, opt-in (off by default): =1 makes the window behind a lookup continuation that was on the path the same lookup's; unset, the chain's. Measured on 2x RTX A6000, UD-Q4_K_XL, one client, --pipeline-windows 2, 3 starts of 4 requests of about 1.9K tokens: 58.3 committed tok/s with it against 58.1 with none set.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -30190,31 +30617,12 @@
   {
    "name": "STRATA_PREFILL_NVFP4",
    "backends": [
-    "cuda",
     "cuda-hip"
    ],
    "reads": [
     {
-     "file": "src/prefill/mmq_expert_bench.cpp",
-     "line": 114,
-     "backend": "cuda-hip",
-     "fn": "getenv"
-    },
-    {
-     "file": "src/prefill/mmq_nvfp4_parity.cpp",
-     "line": 340,
-     "backend": "cuda",
-     "fn": "getenv"
-    },
-    {
      "file": "src/prefill/moe_fused_iq.cu",
      "line": 2946,
-     "backend": "cuda-hip",
-     "fn": "getenv"
-    },
-    {
-     "file": "src/prefill/moe_mmq.cu",
-     "line": 201,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -34031,11 +34439,11 @@
    "since": "v0.1.45",
    "last_commit": "c675f5b787",
    "last_date": "2026-10-14",
-   "status": "research",
+   "status": "retired",
    "owner": "prefill",
-   "note": "[reviewed] \"No gain measured; keep the defaults\"; documented tuning pair. [docs/DETAILS.md:1119]",
+   "note": "Retired in 0.2.16 (own-stack step 10): read only in llama.cpp's MMQ build path, which left the tree; the setting is no longer read. [reviewed] \"No gain measured; keep the defaults\"; documented tuning pair. [docs/DETAILS.md:1119]",
    "retire_after": "",
-   "retired_in": ""
+   "retired_in": "0.2.16"
   },
   {
    "name": "STRATA_RAM_ADAPT",
@@ -36739,6 +37147,34 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_SLOT_CKPT_KV_DIRECT",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 16007,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #5864, opt-in (off by default): =1, with STRATA_SLOT_COPY_DIRECT=1: the hand-back of a turn checkpoint copies the K/V straight from the slot's pools; unset, through a host image. Not measured here.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_SLOT_CKPT_MOVE",
    "backends": [
     "cuda-hip"
@@ -36892,6 +37328,97 @@
    "status": "default",
    "owner": "program",
    "note": "the engine's own default (the parallel-request stack, bit-exact, QUAL-PAR): on with 2 or more batch slots on Linux CUDA (arch_defaults.cpp parallel_default_env_cuda, applied in generate.cpp) and on Windows gfx1151; NAME=0 turns it off; a value you set is kept",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_SLOT_RAM_RESERVE_GIB",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 7612,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "float",
+   "default_state": null,
+   "code_default": "8.0",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #5864: =<GiB> carves only the batch slots that leave that much RAM free beside their pinned K/V, the experts' arena and an explicit --conversation-cache-mib; 0: no check; unset, the slots are carved as asked and a warning names the shortfall (8 GiB).",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_SLOT_READ",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 15302,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [
+    "serve/server.py"
+   ],
+   "launch_sets": [],
+   "launch_reads": [
+    {
+     "file": "serve/server.py",
+     "line": 2286
+    }
+   ],
+   "doc_mentions": [],
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #5864, opt-in (off by default): =1, with STRATA_PIPED_MTP: the next turn of a conversation is read in the batch slot that holds it, in the slot's own windows; unset, through the main sessions. Measured on 2x RTX A6000, UD-Q4_K_XL, conversations of about 2K tokens, 3 turns per client, STRATA_PIPED_MTP=2 with and without it, 4 repeats each: 4 clients 57.4 committed tok/s with it against 78.1 without, 8 clients 53.2 against 75.4, 2 clients 66.8 against 67.1, 1 client 56.4 against 56.6; time to first token of the later turns, p95: 5.72 s against 0.77 s at 4 clients and 11.79 s against 1.14 s at 8 clients. The pull request reports 115.5 against 102.9 committed tok/s over a round of two turns on 178K-token conversations on 2x RTX 3090 (not measured here).",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_SLOT_READ_MAX",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 16513,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #5864: with STRATA_SLOT_READ, the most new tokens of a turn read in its slot (default 1024); a longer turn takes the usual path.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -39519,6 +40046,72 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_STOP_LAYERS",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/prefill/prefill.cpp",
+     "line": 4733,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "dd1ddc6eab",
+   "first_date": "2026-11-16",
+   "since": null,
+   "last_commit": "dd1ddc6eab",
+   "last_date": "2026-11-16",
+   "status": "research",
+   "owner": "prefill",
+   "note": "[reviewed] #6011: a batched prompt read stops between two layers of a chunk when STOP comes; on by default, 0 turns it back to stopping only between chunks. Internal: users never set it.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_STOP_STAGES",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 15091,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "dd1ddc6eab",
+   "first_date": "2026-11-16",
+   "since": null,
+   "last_commit": "dd1ddc6eab",
+   "last_date": "2026-11-16",
+   "status": "research",
+   "owner": "program",
+   "note": "[reviewed] #6011: every stage of a layer split sees STOP (the later stages get the first stage's should_stop); on by default, 0 turns it back to the first stage only. Internal: users never set it.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_SWITCH_POINT",
    "backends": [
     "cuda-hip"
@@ -41135,6 +41728,39 @@
    "status": "research",
    "owner": "core",
    "note": "[auto] not documented for users; code default not readable from the call",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_TEST_POOL_DELAY",
+   "backends": [
+    "sycl"
+   ],
+   "reads": [
+    {
+     "file": "sycl/src/core/verify.cpp",
+     "line": 410,
+     "backend": "sycl",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "bba1a0e92a",
+   "first_date": "2026-11-16",
+   "since": null,
+   "last_commit": "bba1a0e92a",
+   "last_date": "2026-11-16",
+   "status": "research",
+   "owner": "core",
+   "note": "[reviewed] Test hook, compiled only into a -DSTRATA_SYCL_TEST_HOOKS=ON build (released engines have no such switch): W:K:MS delays the CPU step K of verify window W by MS ms, for the #5160 fault-injection check.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -43602,11 +44228,11 @@
    "since": "v0.2.12",
    "last_commit": "7bf5ec4ebf",
    "last_date": "2026-11-06",
-   "status": "research",
+   "status": "retired",
    "owner": "prefill",
-   "note": "[auto] not documented for users; code default not readable from the call",
+   "note": "Retired in 0.2.16 (own-stack step 10): read only in llama.cpp's MMQ build path, which left the tree; the setting is no longer read. [auto] not documented for users; code default not readable from the call",
    "retire_after": "",
-   "retired_in": ""
+   "retired_in": "0.2.16"
   },
   {
    "name": "STRATA_WARM_GRAPHS",
@@ -43945,11 +44571,11 @@
    "since": "v0.2.7",
    "last_commit": "5dbd8774d8",
    "last_date": "2026-10-26",
-   "status": "opt-in",
+   "status": "retired",
    "owner": "prefill",
-   "note": "[auto] documented for users (docs/OLDER_GPUS.md:197)",
+   "note": "Retired in 0.2.16 (own-stack step 10): read only in llama.cpp's MMQ build path, which left the tree; the setting is no longer read. [auto] documented for users (docs/OLDER_GPUS.md:197)",
    "retire_after": "",
-   "retired_in": ""
+   "retired_in": "0.2.16"
   },
   {
    "name": "STRATA_XN_F16",

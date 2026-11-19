@@ -143,6 +143,20 @@ function startChat() {
   toast("info", tr("chat.newToast", "New chat"), tr("chat.newToastText", "The one you were in is in the list on the left."), 6000,
         {label: tr("undo", "Undo"), run: () => openChat(prev)});
 }
+// bring a saved chat back: a file the composer's save wrote (or any .md in that shape) becomes a chat in the list
+function importChats(files) {
+  for (const file of files || []) {
+    if (busy) { stillWriting(); return; }
+    file.text().then((text) => {
+      const c = H.parseChatMarkdown(text);
+      if (!c) { toast("warn", tr("sidebar.importFailed", "Nothing to bring back"), tr("sidebar.importFailedText", "This file has no chat turns in it. Choose a file saved with “Save this chat as Markdown”."), 6000); return; }
+      c.title = file.name.replace(/\.(md|markdown|txt)$/i, "");
+      chats.push(c);
+      showChat(c);
+      toast("info", tr("sidebar.imported", "Chat brought back"), file.name, 6000);
+    }, () => toast("warn", tr("sidebar.importFailed", "Nothing to bring back"), file.name, 6000));
+  }
+}
 function deleteChat(c) {
   if (busy && c.id === chatId) { stillWriting(); return; }
   const i = chats.indexOf(c), wasOpen = c.id === chatId;
@@ -177,7 +191,9 @@ function renameChat(row, c) {
     if (keep) { c.title = input.value.trim(); chatStore.put(H.cleanChat(c)); }
     renderSidebar();
   };
+  const imeKey = StrataIme.watch(input);              // Enter and Escape inside an IME conversion are the IME's (#5071)
   input.addEventListener("keydown", (e) => {
+    if (imeKey(e)) return;
     if (e.key === "Enter") { e.preventDefault(); finish(true); }
     else if (e.key === "Escape") { e.preventDefault(); finish(false); }
   });
@@ -332,9 +348,11 @@ function editAnswerAt(i) {
   box.querySelector("[data-edit-cancel]").textContent = tr("cancel", "Cancel");
   save.onclick = () => saveAnswerEdit(i, input.value);
   box.querySelector("[data-edit-cancel]").onclick = closePanel;
+  const imeKey = StrataIme.watch(input);              // an Escape that cancels an IME conversion does not close the editor (#5071)
   input.onkeydown = (e) => {
+    if (imeKey(e)) return;
     if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closePanel(); }
-    if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !e.isComposing) { e.preventDefault(); save.click(); }
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); save.click(); }
   };
   el.dataset.editing = "true";
   el.appendChild(box);
@@ -432,6 +450,8 @@ function branchHere(i) {
 function initChats() {
   $("sidebar-toggle").onclick = () => setSidebar(!sidebarOpen, true);
   $("sidebar-new").onclick = startChat;
+  $("sidebar-import").onclick = () => $("sidebar-import-file").click();
+  $("sidebar-import-file").addEventListener("change", (e) => { importChats(e.target.files); e.target.value = ""; });
   $("sidebar-search").addEventListener("input", () => { sidebarQuery = $("sidebar-search").value; renderSidebar(); });
   $("sidebar-list").addEventListener("click", (e) => {
     // a click inside the rename field is caret placement, not a click on the row: the row's handler would open the chat,

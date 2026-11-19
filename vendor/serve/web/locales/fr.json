@@ -24,7 +24,7 @@
   "chat.projectionOn": "projection activée",
   "chat.stopped": "Arrêtée",
   "chat.stoppedLower": "arrêtée",
-  "chat.tokens": "{n} tokens",
+  "chat.tokens": {"one": "{n} token", "other": "{n} tokens"},
   "chat.toolCalls": {
     "one": "{n} appel d’outil",
     "other": "{n} appels d’outils"
@@ -35,7 +35,7 @@
   "close": "Fermer",
   "code.copy": "Copier le code",
   "code.label": "code",
-  "composer.attach": "Joindre un fichier texte (ou le déposer ici)",
+  "composer.attach": "Joindre un fichier texte (ou le déposer ici). Les images ne sont pas disponibles avec ce modèle.",
   "composer.attachLabel": "Joindre un fichier",
   "composer.attachPictures": "Joindre un fichier texte ou une image (ou la déposer ici)",
   "composer.finishOpen": "Enregistrez ou annulez ce qui est ouvert au-dessus pour continuer",
@@ -105,13 +105,14 @@
   "file.pictureBig": "Image trop volumineuse",
   "file.pictureBigText": "{name} dépasse 20 Mo.",
   "file.picturesOff": "Les images sont désactivées",
-  "file.picturesOffText": "Ce modèle a été configuré pour le texte seul.",
+  "file.picturesOffText": "Ce modèle ne peut pas lire les images. Vous pouvez toujours joindre des fichiers texte.",
   "file.remove": "Retirer",
   "group.month": "30 derniers jours",
   "group.older": "Plus anciennes",
   "group.today": "Aujourd’hui",
   "group.week": "7 derniers jours",
   "group.yesterday": "Hier",
+  "header.github": "Strata sur GitHub",
   "hist.editAnswer": "Modifier la réponse",
   "hist.editAnswerTitle": "Corrigez le texte de la réponse. Aucune requête n’est envoyée.",
   "hist.editLabel": "Modifier la réponse",
@@ -260,5 +261,12 @@
   "tool.running": "En cours",
   "tool.skipped": "Non exécuté",
   "tool.writing": "Écriture",
-  "undo": "Annuler"
+  "undo": "Annuler",
+  "sidebar.import": "Récupérer une conversation enregistrée",
+  "sidebar.imported": "Conversation récupérée",
+  "sidebar.importFailed": "Rien à récupérer",
+  "sidebar.importFailedText": "Ce fichier ne contient aucun échange de conversation. Choisissez un fichier enregistré avec « Enregistrer cette conversation en Markdown ».",
+  "chat.finishFromThinking": "Répondre à partir de cette réflexion",
+  "chat.finishFromThinkingTitle": "Rédige une réponse à partir de ce que le modèle avait trouvé avant que vous ne l’arrêtiez. Il ne réfléchit pas davantage.",
+  "chat.fromStoppedThinking": "réponse tirée de la réflexion arrêtée"
 }

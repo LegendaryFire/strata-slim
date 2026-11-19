@@ -27,6 +27,9 @@ if(STRATA_BUILD_TESTS)
   add_executable(pcie_share_rule_test src/core/pcie_share_rule_test.cpp)
   target_include_directories(pcie_share_rule_test PRIVATE include)
   add_test(NAME pcie_share_rule_test COMMAND pcie_share_rule_test)
+  add_executable(kpack_path_test src/core/kpack_path_test.cpp)   # #5060: the package's kpack archives for ROCM_KPACK_PATH
+  target_include_directories(kpack_path_test PRIVATE include)
+  add_test(NAME kpack_path_test COMMAND kpack_path_test)
   # STRATA_AMD_COMMUNITY_TUNING: the switch turns each community-made AMD change off (header only; run from the source tree)
   add_executable(amd_community_test src/core/amd_community_test.cpp)
   target_include_directories(amd_community_test PRIVATE include)
@@ -282,9 +285,12 @@ macro(strata_cpu_native_experts)
   elseif(STRATA_ISA_FLOOR STREQUAL "none")
     target_compile_definitions(strata_kernels_cpu PRIVATE STRATA_ISA_FLOOR_NONE=1)
   endif()
-  # ggml stays linked (its headers and, for the tests that compare against it, ggml-cpu as the oracle).  With STRATA_OWN_CPU_QUANT the pool itself calls no
-  # ggml-cpu function, so a static link of an engine pulls no ggml-cpu object into the binary (checked with nm in the gates).
-  target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
+  # ggml is linked only where the build has it (CMakeLists.txt: the tests, which compare against ggml-cpu as the oracle, the ggml-cpu pool and an MMQ
+  # build).  With STRATA_OWN_CPU_QUANT the pool itself calls no ggml-cpu function, so even there a static link of an engine pulls no ggml-cpu object
+  # into the binary (checked with nm in the gates); a release build has no ggml at all.
+  if(TARGET ggml-base)
+    target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
+  endif()
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
   if(STRATA_OWN_CPU_QUANT)
     target_link_libraries(strata_kernels_cpu PUBLIC strata_quant)
@@ -336,6 +342,7 @@ macro(strata_cpu_native_experts)
     add_test(NAME router_dot_parity COMMAND router_dot_parity)
     add_test(NAME router_dot_parity_avx COMMAND ${CMAKE_COMMAND} -E env STRATA_FORCE_ISA=avx $<TARGET_FILE:router_dot_parity>)
   endif()
+  if(TARGET ggml-cpu)   # (the programs below compare against ggml-cpu or read its headers: only in a build that has ggml, CMakeLists.txt)
   # the AVX-2 expert kernels' variants (iq_avx2.cpp, q2_avx2.cpp) bit for bit against each other at 1..8 tokens and
   # against ggml-cpu's dot, on random blocks; --bench: ms per expert on one thread, the weights streamed from DRAM
   add_executable(iq_avx2_parity src/kernels/cpu/iq_avx2_parity.cpp)
@@ -381,6 +388,7 @@ macro(strata_cpu_native_experts)
     add_test(NAME q8k_quant_parity COMMAND q8k_quant_parity)
     add_test(NAME q8k_quant_parity_avx COMMAND ${CMAKE_COMMAND} -E env STRATA_FORCE_ISA=avx $<TARGET_FILE:q8k_quant_parity>)
   endif()
+  endif()   # TARGET ggml-cpu
   endif()   # STRATA_CPU_X86
 endmacro()
 
@@ -503,11 +511,11 @@ if(STRATA_BUILD_TESTS)
     if(Python3_Interpreter_FOUND)
       if(MSVC)
         target_link_options(iq_avx2_parity PRIVATE /MAP)
-        add_test(NAME isa_guard_check COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_isa_guard.py
+        add_test(NAME isa_guard_check COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../tools/check_isa_guard.py
                  $<TARGET_FILE:iq_avx2_parity> --map $<TARGET_FILE_DIR:iq_avx2_parity>/iq_avx2_parity.map)
       else()
         # the library, not the binary: a Linux source build compiles ggml-cpu for the build machine on purpose
-        add_test(NAME isa_guard_check COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_isa_guard.py
+        add_test(NAME isa_guard_check COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../tools/check_isa_guard.py
                  $<TARGET_FILE:strata_kernels_cpu>)
       endif()
       set_tests_properties(isa_guard_check PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)

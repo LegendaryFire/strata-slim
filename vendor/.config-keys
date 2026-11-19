@@ -26,12 +26,10 @@ elastic
 elastic_idle_s
 elastic_mib
 engine_ready_s
-engine_silence_s
 env
 env_to_user
 exe
 expert_profile_save
-expert_profile_save_every
 fit_max_tokens
 gpu
 gpu_order
@@ -42,7 +40,6 @@ host
 idle_unload_s
 images
 keep_files
-layer_split
 lazy_load
 lib_dirs
 llm
@@ -64,7 +61,6 @@ noise
 open_browser
 out_dir
 parallel
-pool_cores
 pre
 prevent_sleep
 quant
@@ -83,7 +79,6 @@ sampling
 sigmas
 slot_save_path
 special_ids
-split_engine_note
 split_fallback
 split_serve
 split_skip_if_fits
@@ -92,11 +87,10 @@ telemetry_read_key
 threads
 timeout_s
 tokenizer
-tool_call_recovery
+tool_markup_retry
 trusted_origins
 type
 uma
-undeclared_tool_calls
 url
 user_args
 vae

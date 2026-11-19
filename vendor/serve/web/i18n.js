@@ -5,6 +5,7 @@
 // data-i18n="key" (also data-i18n-title, data-i18n-label, data-i18n-placeholder) and holds its English text in the HTML.
 // So the page reads fine with no catalog at all.  Every other language is a catalog, serve/web/locales/<lang>.json
 // (a flat {"key": "text"} object; a plural is {"one": "...", "other": "..."}, the CLDR names of the language).
+// The form is chosen by vars.n, or by vars.count when {n} is shown formatted ({n: "1,234", count: 1234}).
 // serve/test_web_i18n.py keeps the catalogs complete: same keys as the English text in the code, same {placeholders}.
 //
 // The language is the user's choice (About > Settings), kept in this browser.  Nothing is chosen for them from the
@@ -13,13 +14,14 @@
 (function (root) {
   // [code, the language's own name].  A new language is a locales/<code>.json file plus one line here.
   const LANGUAGES = [["en", "English"], ["de", "Deutsch"], ["fr", "Français"], ["es", "Español"], ["ja", "日本語"], ["ko", "한국어"],
-                     ["pt", "Português"], ["ru", "Русский"], ["zh", "中文"]];
+                     ["pt", "Português"], ["ru", "Русский"], ["zh", "中文"], ["he", "עברית"]];
+  const RTL = ["he"];                                   // the languages written right to left
   let lang = "en", catalog = null, rules = null;
 
   const fill = (s, vars) => String(s).replace(/\{(\w+)\}/g, (m, k) => (vars && k in vars ? String(vars[k]) : m));
   function pick(entry, vars) {
     if (entry && typeof entry === "object") {
-      const n = vars && vars.n != null ? Number(vars.n) : 1;
+      const n = vars && vars.count != null ? Number(vars.count) : vars && vars.n != null ? Number(vars.n) : 1;
       let cat = "other";
       try { cat = (rules || new Intl.PluralRules(lang === "en" ? "en" : lang)).select(n); } catch (e) { /* other */ }
       return entry[cat] != null ? entry[cat] : entry.other != null ? entry.other : entry.one;
@@ -48,7 +50,10 @@
         if (attr) el.setAttribute(attr, text); else el.textContent = text;
       }
     }
-    if (root.document && root.document.documentElement) root.document.documentElement.lang = lang;
+    if (root.document && root.document.documentElement) {
+      root.document.documentElement.lang = lang;
+      root.document.documentElement.dir = RTL.includes(lang) ? "rtl" : "ltr";      // #6060: Hebrew reads right to left
+    }
   }
 
   const known = (code) => LANGUAGES.some((l) => l[0] === code);

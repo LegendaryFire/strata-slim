@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <istream>
 #include <optional>
@@ -55,7 +56,16 @@ struct MemoryProbePaths {
     std::string self_cgroup = "/proc/self/cgroup";
     std::string cgroup_root = "/sys/fs/cgroup";
     std::string self_status = "/proc/self/status";
+    std::string zfs_arcstats = "/proc/spl/kstat/zfs/arcstats";   ///< #5519 (absent without ZFS)
 };
+
+/// #5519: the ZFS ARC is kernel memory outside the page cache, so MemAvailable does not count it, yet it shrinks when programs
+/// need the RAM (a TrueNAS host: ~60 GB of ARC, MemAvailable 52 GB of 128, the engine sized itself to the 52 and read its experts
+/// from the SSD).  The share the ARC gives back is its size above its floor: `size - c_min` from an arcstats text (the kstat
+/// "name type data" table); 0 when either line is missing or malformed, or size is at or below c_min.
+uint64_t zfs_arc_reclaimable_from_text(const std::string& arcstats);
+/// The same from the file (`path`; absent = no ZFS = 0).  Linux only; elsewhere 0.
+uint64_t zfs_arc_reclaimable_bytes(const std::string& path = "/proc/spl/kstat/zfs/arcstats");
 
 /// One group's reclaimable file cache from its memory.stat text (v2 names, or v1's total_* names), each less the dirty
 /// and writeback pages and never more than `current`:
@@ -124,6 +134,55 @@ std::optional<uint64_t> conversation_mem_available(std::istream& meminfo);
 inline bool conversation_memory_admit(std::optional<uint64_t> available,
                                       uint64_t allocation, uint64_t floor) {
     return available && *available >= floor && allocation <= *available - floor;
+}
+
+/// #5697: the physical-RAM gate's eviction loop (generate.cpp, park_source).  `admit()` samples the memory reading and
+/// says whether the park fits; `available()` is the reading admit() took last (nullopt: unknown); `evict()` drops the
+/// oldest parked conversation that may go and returns its bytes (0: none could go).  Evicts until the park fits, at most
+/// `max_evictions` entries, and stops at the first eviction whose memory did not show up in the reading: a gain under
+/// half of the entry's bytes AND under 64 MiB (the C library kept it, or another process took it).  The field log of
+/// #5697: the loop used to go on through every parked conversation, read no change, and refuse anyway with an empty
+/// cache.  Now one entry is the most such a gate costs, and the conversations after it stay parked.
+/// #2253 (PR by alanthinker, rebasing Arthur031221's #1394): `required` is what admit() wants the reading to show (the park's
+/// bytes plus the floor) and `evictable` what every parked conversation that may go holds in all.  When the reading is known
+/// and short by more than `evictable`, nothing is evicted: even an empty cache would refuse the park, and the loop above
+/// used to empty it first (each eviction showed progress, so the no-progress stop never came).  required 0: no such check.
+struct EvictForRam {
+    bool fits = false;
+    size_t evicted = 0;
+    bool no_progress = false;   // stopped because an eviction gave nothing back to the reading
+    bool cannot_help = false;   // #2253: short by more than all that may leave; nothing evicted
+    uint64_t short_by = 0;      // (with cannot_help) the bytes the reading was short by
+};
+template <class Admit, class Available, class Evict>
+EvictForRam evict_for_ram(Admit admit, Available available, Evict evict, size_t max_evictions, uint64_t required = 0,
+                          uint64_t evictable = UINT64_MAX) {
+    EvictForRam r;
+    r.fits = admit();
+    if (!r.fits && required > 0) {
+        const std::optional<uint64_t> have = available();
+        if (have && *have < required && required - *have > evictable) {
+            r.cannot_help = true;
+            r.short_by = required - *have;
+            return r;
+        }
+    }
+    while (!r.fits && r.evicted < max_evictions) {
+        const std::optional<uint64_t> before = available();
+        const size_t freed = evict();
+        if (freed == 0) break;
+        ++r.evicted;
+        r.fits = admit();
+        const std::optional<uint64_t> after = available();
+        if (!r.fits && before && after) {
+            const uint64_t gain = *after > *before ? *after - *before : 0;
+            if (gain < freed / 2 && gain < (uint64_t(64) << 20)) {
+                r.no_progress = true;
+                break;
+            }
+        }
+    }
+    return r;
 }
 
 } // namespace strata::core

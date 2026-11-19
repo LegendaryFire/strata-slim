@@ -4726,7 +4726,29 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 std::fprintf(stderr, "strata pf-step: chunk from token %lld, layer %lld: %s took %.0f ms (%s / %s)\n",
                              (long long) p0, (long long) layer, what, ms, cudaGetErrorString(a), cudaGetErrorString(b));
         };
+        // STOP between two layers (STRATA_STOP_LAYERS=0: only between chunks, as before).  A cancelled batched read keeps none
+        // of its session, only the checkpoints saved before it (generate.cpp: pp_exact), so the chunk is given up where it is:
+        // the expert copies end, then this card finishes what was queued, so the next request starts on a quiet card.
+        static const bool stop_in_chunk = [] {
+            const char* v = std::getenv("STRATA_STOP_LAYERS");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
         for (int64_t l = LB; l < LE; ++l) {
+            if (l > LB && stop_in_chunk && should_stop && should_stop()) {
+                a_stop.store(true, std::memory_order_release);
+                if (issuer.joinable()) issuer.join();
+                if (stream_all) m.stager->finish();
+                if (m.pp != nullptr && m.pp->s != nullptr) {
+                    const core::OnDevice od(m.pp->dev);
+                    (void) cudaStreamSynchronize(m.pp->s);
+                    if (m.pp->s_out != nullptr) (void) cudaStreamSynchronize(m.pp->s_out);
+                }
+                (void) cudaDeviceSynchronize();
+                std::fprintf(stderr, "strata prefill: stopped in the chunk from token %lld before layer %lld (STOP)\n",
+                             (long long) p0, (long long) l);
+                err = "cancelled";
+                return false;
+            }
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
             if (l > LB) pf_step("reading the prompt (batched, step sync): the experts and the rest of layer", l - 1);
             core::progress_at("reading the prompt (batched): layer", l, p0);   // #251: a stall names layer and chunk
@@ -6633,7 +6655,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 int i8_ne = 0;
                                 pt.mark(kPfGemmGU, cs);
                                 if (!strata::prefill::i8grp::run(i8_L, g8, order.data(), m.off.data(), m.cnt.data(),
-                                                                 [&](const void* h, size_t bytes) { return m.up_ring.h2d(m.i8_rec, h, bytes, m.cs) == cudaSuccess; },
+                                                                 // TUNE-0216: the record is written by a one-block kernel that takes it as its argument (native_expert_i8_put_record),
+                                                                 // not copied up: a host-to-device copy on the compute stream queued behind the streamed experts' copies in the
+                                                                 // copy engine, so every group's launch waited for the experts in flight and copies and products ran one after the
+                                                                 // other (Tesla V100, experts streamed: 2,048 / 8,192-token prompts 1.6 / 1.4 times 0.1.58's time, STRATA_PREFILL_TIMING
+                                                                 // "gemm gate/up" 2,753 ms at 2,047 tokens against MMQ's 1,201 ms; MMQ uploads nothing per group).  Same bytes.
+                                                                 [&](const void* h, size_t bytes) { return strata::kernels::native_expert_i8_put_record(m.i8_rec, h, bytes, m.cs); },
                                                                  m.i8_rec, m.ids_identity, m.src_dev, m.fr_xq, m.GU, kFF2, m.Dm, N, m.cs, &i8_nr, &i8_ne,
                                                                  i8_few, (size_t) rows_local * (size_t) kFF2 * sizeof(float))) {
                                     std::fprintf(stderr, "prefill: int8 experts: the group's record could not be made (%lld rows, %d experts)\n", (long long) i8_nr, i8_ne);

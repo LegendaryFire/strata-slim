@@ -49,6 +49,7 @@ main { flex: 1; min-height: 0; display: flex; }
 .st-msg { min-width: 0; }
 .st-msg__meta .st-btn--icon { width: 28px; height: 28px; }
 .st-msg__meta .st-btn--icon .st-icon { width: 16px; height: 16px; }
+.st-msg__meta .msg-finish { min-height: 28px; padding: 2px 10px; font-size: var(--st-fs-xs); }   /* #5508: "Answer from this thinking" under a reply Stop left empty */
 .cursor::after { content: ""; display: inline-block; width: 8px; height: 1.1em; margin-left: 2px; vertical-align: -3px;
                  border-radius: 2px; background: var(--st-accent); animation: blink 1s steps(2) infinite; }
 @keyframes blink { 50% { opacity: 0; } }
@@ -72,6 +73,7 @@ main { flex: 1; min-height: 0; display: flex; }
 .st-composer { max-width: min(100%, 1100px); margin: 0 auto; }
 .st-composer textarea { max-height: 40vh; }
 .st-btn--send { width: 42px; padding: 0; }
+[dir="rtl"] .st-btn--send .st-icon { transform: scaleX(-1); }   /* #6060: the send arrow points the way the text runs */
 .composer-hint { font-size: var(--st-fs-xs); color: var(--st-ink-muted); margin-right: var(--st-s-2); font-variant-numeric: tabular-nums; }
 .attachments { display: flex; flex-wrap: wrap; gap: var(--st-s-2); padding: 2px 4px 0; }
 .st-composer.dragging { outline: 2px dashed var(--st-accent); outline-offset: 3px; }
@@ -81,7 +83,13 @@ main { flex: 1; min-height: 0; display: flex; }
 .chip .st-btn--icon .st-icon { width: 14px; height: 14px; }
 
 /* ---------------------------------------------------------------- monitor */
-.view--monitor, .view--about { overflow-y: auto; }
+.view--monitor, .view--about, .view--experts { overflow-y: auto; }
+/* #5723: the Experts view, a grid of the learned expert ranks (experts.js) */
+.experts { width: 100%; max-width: 1200px; margin: 0 auto; padding: 16px; box-sizing: border-box; }
+.experts-card { display: flex; flex-direction: column; gap: 8px; }
+.experts-grid-wrap { width: 100%; overflow: hidden; }
+#experts-grid { display: block; border-radius: 4px; background: var(--st-surface-2, transparent); }
+.experts-tip { min-height: 1.4em; font-variant-numeric: tabular-nums; }
 .monitor, .about { max-width: min(100%, 1920px); width: 100%; margin: 0 auto; padding: var(--st-s-6); display: flex; flex-direction: column;
                    gap: var(--st-s-5); }
 .state-card { display: flex; flex-direction: column; gap: var(--st-s-3); }
@@ -94,6 +102,13 @@ main { flex: 1; min-height: 0; display: flex; }
                    font-weight: var(--st-fw-medium); font-variant-numeric: tabular-nums; }
 .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: var(--st-s-4); }
 .metric-card { padding: var(--st-s-4) var(--st-s-5); }
+.model-card__name { font-size: var(--st-fs-md); font-weight: var(--st-fw-bold); line-height: 1.3; overflow-wrap: anywhere; }
+.model-card__facts { display: grid; grid-template-columns: auto 1fr; gap: 3px var(--st-s-3); font-size: var(--st-fs-xs);
+                     align-items: baseline; margin-top: auto; }
+.model-card__facts .mf-k { color: var(--st-ink-muted); }
+.model-card__facts .mf-v { text-align: right; font-variant-numeric: tabular-nums; }
+.model-card__facts .mf-k--wide { grid-column: 1 / -1; }
+
 .st-metric__value small { font-size: var(--st-fs-md); font-weight: var(--st-fw-medium); color: var(--st-ink-muted); margin-left: 4px; }
 .st-metric__sub { font-size: var(--st-fs-xs); color: var(--st-ink-muted); font-variant-numeric: tabular-nums; min-height: 1em; }
 .st-metric__spark { display: block; overflow: visible; }
@@ -101,6 +116,7 @@ main { flex: 1; min-height: 0; display: flex; }
 .speed-values > div { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
 .speed-values > div:last-child { text-align: right; }
 .speed-values .st-metric__value { font-size: clamp(20px, 2.2vw, var(--st-fs-stat)); }
+.speed-range { margin-top: -6px; }                      /* the min and max belong under their number, not in a third row of their own */
 .st-metric__spark .speed-prefill { color: color-mix(in srgb, var(--st-accent) 65%, black); }
 .st-metric__spark[data-tone="warn"] { color: var(--st-warn); }
 .st-metric__spark[data-tone="info"] { color: var(--st-info); }
@@ -108,7 +124,19 @@ main { flex: 1; min-height: 0; display: flex; }
 .ctx-card { display: flex; flex-direction: column; gap: var(--st-s-2); }
 .ctx-gauge { position: relative; width: 150px; max-width: 100%; aspect-ratio: 1; height: auto; margin: var(--st-s-2) auto var(--st-s-3); }
 .ctx-gauge .st-gauge { width: 100%; height: 100%; }
-.ctx-gauge .st-gauge__fill { transition: stroke-dasharray 400ms var(--st-ease); }
+.ctx-gauge .st-gauge__fill { transition: stroke-dasharray 400ms var(--st-ease), stroke-dashoffset 400ms var(--st-ease); }
+/* #4636: the fill in three parts, in the page's own colours (the prefill tone is the Speed card's) */
+.ctx-seg--read, .ctx-key--read { stroke: color-mix(in srgb, var(--st-accent) 65%, black); background: color-mix(in srgb, var(--st-accent) 65%, black); }
+.ctx-seg--answer, .ctx-key--answer { stroke: var(--st-info); background: var(--st-info); }
+.ctx-key--cached { background: var(--st-accent); }
+.ctx-key--free { background: var(--st-surface-2); box-shadow: inset 0 0 0 1px var(--st-line); }
+.ctx-legend { list-style: none; margin: 0 0 var(--st-s-2); padding: 0; display: grid; gap: 2px; font-size: var(--st-fs-sm); }
+.ctx-legend li { display: grid; grid-template-columns: 10px 1fr auto; align-items: center; gap: var(--st-s-2); font-variant-numeric: tabular-nums; }
+.ctx-legend li.is-now { font-weight: var(--st-fw-bold); }
+.ctx-key { width: 10px; height: 10px; border-radius: 2px; }
+.ctx-gauge__pct[data-tone="warn"] { color: var(--st-warn-text); }
+.ctx-gauge__pct[data-tone="danger"] { color: var(--st-danger-text); }
+.ctx-note { margin: 0; text-align: center; }
 .ctx-gauge__label { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
                     font-size: var(--st-fs-xs); }
 .ctx-gauge__pct { font-weight: var(--st-fw-black); font-size: var(--st-fs-xl); line-height: 1.1; font-variant-numeric: tabular-nums; }
@@ -132,8 +160,11 @@ main { flex: 1; min-height: 0; display: flex; }
 .cc-note { margin: 0; }
 .cc-note:empty { display: none; }
 .mcp-card { display: flex; flex-direction: column; gap: var(--st-s-3); }
-.cfg-form { display: grid; grid-template-columns: minmax(min(180px, 100%), max-content) minmax(0, 1fr); gap: var(--st-s-3) var(--st-s-4);
-            align-items: center; }
+/* A row is a help line that wraps and a field that keeps its width.  The help is the server's own words and may be
+   long, so the label column is the one that gives way: sizing it to max-content once let one long help line squeeze
+   every field of the card down to the width of its own spinner arrows. */
+.cfg-form { display: grid; grid-template-columns: minmax(min(180px, 100%), 1fr) minmax(11rem, 360px);
+            gap: var(--st-s-3) var(--st-s-4); align-items: center; }
 .cfg-form label { overflow-wrap: anywhere; font-size: var(--st-fs-sm); font-weight: var(--st-fw-medium); }
 .cfg-form label code { font: 400 12px var(--st-font-mono); color: var(--st-ink-muted); display: block; }
 .cfg-form .st-input { height: 38px; width: 100%; max-width: 360px; min-width: 0; }
@@ -183,6 +214,9 @@ main { flex: 1; min-height: 0; display: flex; }
 @media (max-width: 900px) {
   .monitor-row { grid-template-columns: minmax(0, 1fr); }
 }
+/* The name in the header is a link to the project (#5510); it keeps the look of the name. Focus uses the global ring. */
+a.st-header__brand { color: inherit; text-decoration: none; }
+a.st-header__brand:hover { color: var(--st-accent-text); text-decoration: none; }
 /* The tab strip keeps a width it can scroll. The pill's text hides only when the header row overflows (fitHeader in app.js).
    Load / Unload (PR #3550) sits in the row: 9rem of tabs plus its 7.75rem fit from 458px; below that the tighter floors keep
    it and the theme button in the viewport. */

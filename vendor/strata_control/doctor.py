@@ -43,11 +43,29 @@ def _location(raw: str, cfg: dict, config_path: Path) -> Path:
     return (Path(cwd) if isinstance(cwd, str) and cwd else config_path.parent) / value
 
 
+def _engine_integrity_failure(raw: str, cfg: dict) -> tuple[Path | None, str | None]:
+    """(the installed engine's folder, the sentence `strata components engine` says) when the run config names the engine by reference and an installed package
+    failed its integrity check (a changed file, a signature by a key this PC does not trust); (None, None) otherwise. Never raises."""
+    try:
+        from strata_control import engine_component
+        if not engine_component.is_reference(raw):
+            return None, None
+        try:
+            engine_component.expand(raw, cfg, full=False)
+        except engine_component.EngineIntegrityError as exc:
+            found, _ = engine_component.scan(exc.root)
+            folder = max(found, key=lambda item: engine_component._version_key(item.version)).root if found else None
+            return folder, str(exc)
+    except Exception:                                    # noqa: BLE001 - the plain "missing" row stays
+        pass
+    return None, None
+
+
 def _drafter_is_dflash2(cfg: dict) -> bool:
     """Does this run config's drafting choice mean DFlash2 on this computer (Auto included)? Never raises."""
     try:
         from strata_control import drafting
-        backend, archs = drafting.detect_hardware()
+        backend, archs = drafting.hardware_for(cfg.get("backend"))   # #5109: the config's card family on a mixed NVIDIA + AMD computer
         return cfg.get("mtp") is not False and drafting.choice_of(cfg.get("drafting"), model_name=cfg.get("model_name"), backend=backend, archs=archs) == "dflash2"
     except Exception:                                    # noqa: BLE001 - unknown means the MTP, which stays required
         return False
@@ -191,9 +209,24 @@ def inspect(config_path: Path | None, *, profile_id: str | None = None, live: bo
     report["devices_selected"] = cfg.get("gpu")
     exe = _location(cfg["exe"], cfg, config_path)
     components.append(_item("engine", exe, "file"))
+    if components[-1]["status"] != "ok":                 # an installed engine that failed its integrity check is not "no engine for this PC": the same sentence and reason as `strata components engine`
+        folder, why = _engine_integrity_failure(cfg["exe"], cfg)
+        if why:
+            components[-1]["reason"] = why
+            if folder is not None:
+                components[-1]["path"] = str(folder)
     if components[-1]["status"] == "ok" and os.name != "nt" and not os.access(exe, os.X_OK):
         components[-1]["status"] = "invalid"
         components[-1]["reason"] = "engine file is not executable"
+    try:                                                 # (#5114) a local build added with `strata components add-build`: said, never hidden
+        from strata_control import engine_component as _ec
+        if _ec.read_manifest(exe.parent).local:
+            components[-1]["local_build"] = True
+            report["issues"].append({"code": "LOCAL_ENGINE_BUILD", "severity": "info",
+                                     "message": "the engine is a local build from this computer, not signed by Strata "
+                                                "(`strata components use newest` goes back to the released engines)"})
+    except (_ec.ComponentProblem, OSError):
+        pass
     build = exe.parent / "BUILD.json"
     if build.is_file():
         try:

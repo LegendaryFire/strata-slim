@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <utility>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <tuple>
@@ -1884,12 +1885,14 @@ struct IqGridWords {
 // mmvq_kernel with the columns taken NC at a time.  After warp_sum every lane holds the same sum, so lane c stores
 // column c.
 // #778: `__shared__ alignas(16)` does not compile for gfx1030 (HIP); the attribute after the declarator does, but nvcc
-// with MSVC as host does not take it.  Same layout either way.
+// with MSVC as host does not take it.  Same layout either way.  #5795 / #5518: the int4 staging arrays of the expdec kernels
+// take the same form (ROCm 6.4 and Fedora's ROCm stopped there).
 #if defined(__HIPCC__)
-#define STRATA_SHARED_ALIGN16_U32(name, ...) __shared__ uint32_t name[__VA_ARGS__] __attribute__((aligned(16)))
+#define STRATA_SHARED_ALIGN16(T, name, ...) __shared__ T name[__VA_ARGS__] __attribute__((aligned(16)))
 #else
-#define STRATA_SHARED_ALIGN16_U32(name, ...) __shared__ alignas(16) uint32_t name[__VA_ARGS__]
+#define STRATA_SHARED_ALIGN16(T, name, ...) __shared__ alignas(16) T name[__VA_ARGS__]
 #endif
+#define STRATA_SHARED_ALIGN16_U32(name, ...) STRATA_SHARED_ALIGN16(uint32_t, name, __VA_ARGS__)
 template<int TY, int NC, bool STAGE_GRID = kStageIqGrid<TY>, bool EXACT_N = false>
 __global__ void __launch_bounds__(128) mmvq_multi_kernel(const uint8_t* __restrict__ w, size_t row_bytes,
                                                          const block_q8_1* __restrict__ x, float* __restrict__ y,
@@ -2590,7 +2593,7 @@ __global__ void __launch_bounds__(256, MINB) expdec_gu_kernel(
                                                                             float* __restrict__ gate, float* __restrict__ up, int rb) {
     const int ng = *n_groups;
     if (blockIdx.y >= ng) return;
-    __shared__ alignas(16) int4 s_u[ED_NC * 2 * ED_XB];
+    STRATA_SHARED_ALIGN16(int4, s_u, ED_NC * 2 * ED_XB);
     __shared__ float s_ds[ED_NC * ED_XB];
     STRATA_SHARED_ALIGN16_U32(s_grid_buf, EdGrid<TG>::words);
     const int tid = threadIdx.x;
@@ -2777,7 +2780,7 @@ __global__ void __launch_bounds__(256, STRATA_EXPDEC_MINB) expdec_down_kernel(co
     if (blockIdx.y >= ng) return;
     constexpr int LANES = TD == 20 ? 8 : 16;
     constexpr int RPP = (256 / LANES) * R;   // rows per pass
-    __shared__ alignas(16) int4 s_u[ED_NC * 2 * ED_HB];
+    STRATA_SHARED_ALIGN16(int4, s_u, ED_NC * 2 * ED_HB);
     __shared__ float s_ds[ED_NC * ED_HB];
     const int tid = threadIdx.x;
     const int sw = tid / LANES, t = tid % LANES;
@@ -6263,6 +6266,35 @@ const char* i8_device_gcn() {
     return "";
 #endif
 }
+// TUNE-0216: the Volta rule of the int8 kernels (i8_expert_rule.hpp, i8_tile_two_blocks; the global grid of I8Smem GG) - on for a compute capability 7.0 card unless
+// STRATA_I8_SM70=0; the multiprocessor's shared memory and the per-block reservation read once per device.  A HIP card: off.
+struct I8Volta {
+    bool on = false;
+    size_t smem_sm = 0, reserved = 0;
+};
+I8Volta i8_volta() {
+#if defined(__HIPCC__)
+    return {};
+#else
+    static const int sw = strata::kernels::i8_switch_parse(std::getenv("STRATA_I8_SM70"));
+    static std::mutex mu;
+    static I8Volta per[64];
+    static bool done[64] = {};
+    int dev = 0;
+    if (!strata::kernels::i8_volta_rule_on(sw) || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return {};
+    std::lock_guard<std::mutex> lk(mu);
+    if (!done[dev]) {
+        done[dev] = true;
+        int major = 0, minor = 0, sm = 0, res = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+        cudaDeviceGetAttribute(&sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev);
+        if (cudaDeviceGetAttribute(&res, cudaDevAttrReservedSharedMemoryPerBlock, dev) != cudaSuccess) { cudaGetLastError(); res = 0; }
+        per[dev] = {strata::cc_major_of(major) == 7 && strata::cc_minor_of(minor) == 0 && sm > 0, (size_t) sm, (size_t) res};
+    }
+    return per[dev];
+#endif
+}
 }  // namespace
 
 void native_grouped_set_v1(bool v1) { g_grouped_v1 = v1; }
@@ -6341,6 +6373,24 @@ void native_expert_i8_quantize(const float* x, int64_t n_rows, int64_t n_cols, v
     check("native_expert_i8_quantize");
 }
 
+namespace {
+struct I8RecArg {
+    uint32_t w[kI8PutRecordMax / 4];
+};
+__global__ void i8_put_record_kernel(const I8RecArg a, uint32_t* __restrict__ dst, int nw) {
+    for (int i = threadIdx.x; i < nw; i += blockDim.x) dst[i] = a.w[i];
+}
+}  // namespace
+
+bool native_expert_i8_put_record(void* dst, const void* src, size_t bytes, void* stream) {
+    if (bytes == 0) return true;
+    if (bytes > kI8PutRecordMax || bytes % 4 != 0 || dst == nullptr) return false;
+    I8RecArg a{};
+    std::memcpy(a.w, src, bytes);
+    i8_put_record_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(a, (uint32_t*) dst, (int) (bytes / 4));
+    return cudaGetLastError() == cudaSuccess;
+}
+
 void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
                       const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries, const void* x_q8_1,
                       void* scratch, float* out, void* stream) {
@@ -6363,14 +6413,29 @@ void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp
     int tm = i8_env_int("STRATA_I8_TM", 0);   // research: the tile code (2, 3 or 4 rows of 16 entries per thread -> 32, 48 or 64 entries; 8 = variant B, 128 entries)
     const int64_t avg = cap_entries / cap_groups;
     const bool b_ok = L.n_embd % 128 == 0 && L.n_ff % 64 == 0;
+    const bool tm_set = tm > 0;
     if (tm <= 0) tm = (avg >= 96 && b_ok) ? 8 : (int) std::max<int64_t>(2, std::min<int64_t>(4, (avg + 8) / 16));
-    tm = tm <= 2 ? 2 : tm == 3 ? 3 : tm >= 8 && b_ok && i8_tile8_type(L.gu_type) && i8_tile8_type(L.d_type) ? 8 : 4;   // (the K-quants and Q5_1 have no tile 8)
+    const I8Volta vo = i8_volta();
+    // tile 5: the Volta tensor-core form (i8h_volta.cuh; bit-identical output), on a compute capability 7.0 card for the formats it covers
+#if defined(__HIPCC__)
+    const bool h_ok = false;   // (i8h_volta.cuh is CUDA only: i8_volta() is off on HIP)
+#else
+    const bool h_ok = vo.on && i8h_type(L.gu_type) && i8h_type(L.d_type) && L.n_ff % 32 == 0 && L.n_embd % 64 == 0;
+#endif
+    if (tm == 5 && !h_ok) tm = 4;
+    if (tm != 5) tm = tm <= 2 ? 2 : tm == 3 ? 3 : tm >= 8 && b_ok && i8_tile8_type(L.gu_type) && i8_tile8_type(L.d_type) ? 8 : 4;   // (the K-quants and Q5_1 have no tile 8)
+    // Volta (i8_expert_rule.hpp, i8_tile_two_blocks): the big-grid formats read their grid from global memory, and the pick is lowered to the largest tile that keeps two blocks
+    // per multiprocessor (a tile set by STRATA_I8_TM is kept; STRATA_I8_SM70=0 turns both off)
+    const bool gg = vo.on && i8_gg_type(L.gu_type);
+    if (vo.on && !tm_set) tm = strata::kernels::i8_tile_two_blocks(tm, i8_smem_bytes(L.gu_type, L.d_type, 2, gg), i8_smem_bytes(L.gu_type, L.d_type, 3, gg),
+                                                                  i8_smem_bytes(L.gu_type, L.d_type, 4, gg), vo.smem_sm, vo.reserved);
+    if (vo.on && !tm_set) tm = strata::kernels::i8_tile_volta(tm, avg, h_ok);   // the tensor-core form from kI8hMinAvg entries an expert (i8_expert_rule.hpp)
     const size_t smem_limit = i8_smem_limit();   // a tile that does not fit the device's shared memory per block falls to the next smaller one
-    while (tm > 2 && i8_smem_bytes(L.gu_type, L.d_type, tm) > smem_limit) tm = tm == 8 ? 4 : tm - 1;
-    const int bm = tm == 8 ? 128 : 16 * tm;
+    while (tm > 2 && i8_smem_bytes(L.gu_type, L.d_type, tm, gg) > smem_limit) tm = tm == 8 || tm == 5 ? 4 : tm - 1;
+    const int bm = tm == 8 ? 128 : tm == 5 ? 64 : 16 * tm;
     i8_tiles_kernel<<<1, 256, 0, s>>>(grp_start, n_groups, bm, tile_off);
     I8Args a{grp_ptr, grp_start, n_groups, tile_off, ent_tok, ent_dst, (const block_q8_1*) x_q8_1, hq, out, L,
-             cap_entries / bm + cap_groups, i8_env_int("STRATA_I8_BISECT", 0), i8_n8_takes(i8_switch_parse(std::getenv("STRATA_I8_N8")), tm)};   // 8-entry slices: tile 2 by default, 2-4 with STRATA_I8_N8=1, none with 0
+             cap_entries / bm + cap_groups, i8_env_int("STRATA_I8_BISECT", 0), i8_n8_takes(i8_switch_parse(std::getenv("STRATA_I8_N8")), tm), gg};   // 8-entry slices: tile 2 by default, 2-4 with STRATA_I8_N8=1, none with 0
     switch (L.gu_type) {
         case 16: i8_launch<16, true>(tm, a, s); break;
         case 17: i8_launch<17, true>(tm, a, s); break;

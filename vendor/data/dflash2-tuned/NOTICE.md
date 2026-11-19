@@ -22,4 +22,4 @@ training on its outputs.
 The idea of the Q4_0 selector tables is nazeshinjite's (Apache-2.0): see `docs/DETAILS.md`, "Credits and licenses".
 
 This file and `LICENSE` are copied next to the drafter file (`<data folder>/dflash2/`) when Strata fetches it, and are part of Strata's own
-tree. Strata's code stays MIT ([`LICENSE`](../../LICENSE)); this drafter's weights are Apache-2.0.
+tree. Strata's code stays MIT ([`LICENSE`](../../../LICENSE)); this drafter's weights are Apache-2.0.
