@@ -1,0 +1,426 @@
+From 0d4d758b122ba260f341bbff38473c3cdc4519d9 Mon Sep 17 00:00:00 2001
+From: LegendaryFire <tristan.balon@outlook.com>
+Date: Fri, 20 Nov 2026 21:35:19 -0700
+Subject: [PATCH] Select the RAM-part pages an Inkling 2 decode reads (opt-in)
+
+A tiered decode read the whole RAM part of every full-attention cache,
+so now --kv-select N reads only N tokens of it (Quest page selection):
+each page of --kv-page P tokens (default 64) keeps per-channel key
+bounds in VRAM, a decode ranks the RAM-part pages by their bound on
+q.k (the best of a KV head's query heads, the first page always kept)
+and the CPU threads read the best N tokens' worth. The VRAM window and
+prompt reading stay exact. Off unless set; needs --kv-resident.
+
+Not exact. 24K text, last 3.8K tokens scored (15-19K RAM-part tokens a
+head): nll +0.0015 at P 16 / N 4096 (run-to-run noise), +0.035 at P 64,
++0.10 at P 16 / N 1024. A 58K needle test (three tags at 15/45/75%)
+finds all three down to N 1024. Decode at 58K, window 8K: 15.5 -> 31
+tok/s. P 16 bounds cost about 1 GiB of VRAM per 512K session.
+---
+ vendor/src/inkling2/cpu_attn.cpp  |  19 ++++
+ vendor/src/inkling2/cpu_attn.hpp  |   4 +
+ vendor/src/inkling2/ink_engine.cu | 179 +++++++++++++++++++++++++++---
+ 3 files changed, 188 insertions(+), 14 deletions(-)
+
+diff --git a/vendor/src/inkling2/cpu_attn.cpp b/vendor/src/inkling2/cpu_attn.cpp
+index d44d2eb..c60decb 100644
+--- a/vendor/src/inkling2/cpu_attn.cpp
++++ b/vendor/src/inkling2/cpu_attn.cpp
+@@ -207,6 +207,25 @@ void range(const CpuAttnJob& j, std::vector<Row>& rows, int kvh, int a, int b) {
+ void cpu_attn(const CpuAttnJob& j) {
+     const int keys = j.kmax - j.kmin + 1;
+     if (keys <= 0) return;
++    if (j.pages) {   // a task a (row, KV head, segment of its page list)
++        CpuPool::get().run(j.nq * j.HKV * j.nseg, [&](int task) {
++            const int seg = task % j.nseg, kvh = (task / j.nseg) % j.HKV, t = task / (j.nseg * j.HKV);
++            thread_local std::vector<float> accs;
++            accs.assign((size_t) j.G * kHD, 0.f);
++            std::vector<Row> rows((size_t) j.G);
++            for (int g = 0; g < j.G; ++g) {
++                const int h = kvh * j.G + g;
++                rows[(size_t) g] = Row{j.q + ((size_t) t * j.H + h) * kHD, -INFINITY, 0.f, accs.data() + (size_t) g * kHD, t, h};
++            }
++            const int32_t* list = j.pages + ((size_t) t * j.HKV + kvh) * j.n_pages;
++            for (int i = j.n_pages * seg / j.nseg; i < j.n_pages * (seg + 1) / j.nseg; ++i) {
++                const int a = std::max(j.kmin, list[i] * j.page), b = std::min(j.kmax, list[i] * j.page + j.page - 1);
++                range(j, rows, kvh, a, b);
++            }
++            finish(j, rows, seg);
++        });
++        return;
++    }
+     const int R = j.nq * j.G;
+     CpuPool::get().run(j.HKV * j.nseg, [&](int task) {
+         const int kvh = task % j.HKV, seg = task / j.HKV;
+diff --git a/vendor/src/inkling2/cpu_attn.hpp b/vendor/src/inkling2/cpu_attn.hpp
+index 50bf71c..ba38407 100644
+--- a/vendor/src/inkling2/cpu_attn.hpp
++++ b/vendor/src/inkling2/cpu_attn.hpp
+@@ -19,6 +19,10 @@ struct CpuAttnJob {
+     int nseg = 1;                // the key range in this many segments
+     int seg_stride = 1;          // slots a (row, head) has in the output; segment s is slot s
+     float *acc = nullptr, *m = nullptr, *l = nullptr;   // [nq * H][seg_stride][128], [nq * H][seg_stride]
++    /// Page selection: only the listed pages (of `page` keys, clipped to [kmin, kmax]) of each (row, KV head),
++    /// pages[(row * HKV + kvh) * n_pages + i]; the segments split that list.
++    const int32_t* pages = nullptr;
++    int n_pages = 0, page = 64;
+ };
+ 
+ /// Worker threads shared by every engine of the process; run() takes one job at a time.
+diff --git a/vendor/src/inkling2/ink_engine.cu b/vendor/src/inkling2/ink_engine.cu
+index 521ec43..fa76490 100644
+--- a/vendor/src/inkling2/ink_engine.cu
++++ b/vendor/src/inkling2/ink_engine.cu
+@@ -208,6 +208,8 @@ struct Kv {
+     int8_t *hk = nullptr, *hv = nullptr;   // tiered: every position in pinned host memory, [kvh][hcells][128]
+     float *hks = nullptr, *hvs = nullptr;
+     int hcells = 0;
++    __half *pmn = nullptr, *pmx = nullptr;   // page selection: each page's per-channel key bounds, [kvh][npages][128]
++    int npages = 0;
+ };
+ 
+ template <bool Q8>
+@@ -341,6 +343,111 @@ __global__ void __launch_bounds__(128) k_attn_part(const float* q, const float*
+     }
+ }
+ 
++int g_page = 64;                  // the tokens of a page that page selection keeps or drops whole (--kv-page)
++
++/// The key bounds of the pages [pg0, pg1] from the VRAM cache (which still holds every cell of them).
++__global__ void k_page_sum(Kv c, int pg0, int pmax, int pg_len) {
++    const int page = pg0 + blockIdx.x, kh = blockIdx.y, i = threadIdx.x;
++    const int a = page * pg_len, b = min(a + pg_len - 1, pmax);
++    float mn = INFINITY, mx = -INFINITY;
++    for (int kp = a; kp <= b; ++kp) {
++        const size_t ro = (size_t) kh * c.cells + (c.ring > 0 ? kp % c.ring : kp);
++        const float x = (float) ((const int8_t*) c.k)[ro * kHD + i] * c.ks[ro];
++        mn = fminf(mn, x);
++        mx = fmaxf(mx, x);
++    }
++    const size_t o = ((size_t) kh * c.npages + page) * kHD + i;
++    c.pmn[o] = __float2half_rd(mn);
++    c.pmx[o] = __float2half_ru(mx);
++}
++
++/// Each page's upper bound on q.k * scale over a KV head's query heads (Quest), a warp a page; page 0 always kept.
++__global__ void __launch_bounds__(256) k_page_score(const float* q, Kv c, int np, int t0, int H, int G, float scale,
++                                                    float* out) {
++    __shared__ float qs[kMaxG][kHD];
++    const int kh = blockIdx.y, row = blockIdx.z, t = t0 + row;
++    for (int i = threadIdx.x; i < G * kHD; i += blockDim.x) qs[i / kHD][i % kHD] = q[((size_t) t * H + kh * G + i / kHD) * kHD + i % kHD];
++    __syncthreads();
++    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, page = blockIdx.x * 8 + warp;
++    if (page >= np) return;
++    const size_t o = ((size_t) kh * c.npages + page) * kHD + lane * 4;
++    const uint2 un = *reinterpret_cast<const uint2*>(c.pmn + o), ux = *reinterpret_cast<const uint2*>(c.pmx + o);
++    const float2 n0 = __half22float2(*reinterpret_cast<const __half2*>(&un.x)), n1 = __half22float2(*reinterpret_cast<const __half2*>(&un.y));
++    const float2 x0 = __half22float2(*reinterpret_cast<const __half2*>(&ux.x)), x1 = __half22float2(*reinterpret_cast<const __half2*>(&ux.y));
++    const float mn[4] = {n0.x, n0.y, n1.x, n1.y}, mx[4] = {x0.x, x0.y, x1.x, x1.y};
++    float best = -INFINITY;
++    for (int g = 0; g < G; ++g) {
++        float b = 0.f;
++#pragma unroll
++        for (int e = 0; e < 4; ++e) {
++            const float qv = qs[g][lane * 4 + e];
++            b += fmaxf(qv * mn[e], qv * mx[e]);
++        }
++        for (int off = 16; off > 0; off >>= 1) b += __shfl_xor_sync(0xffffffffu, b, off);
++        best = fmaxf(best, b * scale);
++    }
++    if (lane == 0) out[((size_t) row * gridDim.y + kh) * np + page] = page == 0 ? INFINITY : best;
++}
++
++__device__ __forceinline__ uint32_t order_key(float f) {
++    const uint32_t u = __float_as_uint(f);
++    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
++}
++
++/// The nsel best pages of each (row, KV head), in page order (ties by page), or all of them when np <= nsel.
++__global__ void __launch_bounds__(256) k_page_topk(const float* score, int np, int nsel, int32_t* sel) {
++    __shared__ int sh[kThreads], wsum[8], tot;
++    const int r = blockIdx.x, tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
++    const float* sc = score + (size_t) r * np;
++    int32_t* out = sel + (size_t) r * nsel;
++    if (np <= nsel) {
++        for (int i = tid; i < np; i += blockDim.x) out[i] = i;
++        return;
++    }
++    uint32_t T = 0;
++    for (int bit = 31; bit >= 0; --bit) {   // the largest T with at least nsel keys >= T: the nsel-th key
++        const uint32_t cand = T | (1u << bit);
++        int n = 0;
++        for (int i = tid; i < np; i += blockDim.x) n += order_key(sc[i]) >= cand;
++        if (block_sum((float) n, (float*) sh) >= (float) nsel) T = cand;
++        __syncthreads();
++    }
++    int base = 0;
++    for (int pass = 0; pass < 2; ++pass) {   // the keys above T, then those equal to it while there is room
++        for (int i0 = 0; i0 < np && base < nsel; i0 += blockDim.x) {
++            const int i = i0 + tid;
++            const uint32_t k = i < np ? order_key(sc[i]) : 0u;
++            const bool f = i < np && (pass == 0 ? k > T : k == T);
++            const unsigned bal = __ballot_sync(0xffffffffu, f);
++            if (lane == 0) wsum[warp] = __popc(bal);
++            __syncthreads();
++            int off = 0;
++            for (int w = 0; w < warp; ++w) off += wsum[w];
++            const int at = base + off + __popc(bal & ((1u << lane) - 1u));
++            if (f && at < nsel) out[at] = i;
++            if (tid == 0) {
++                int s2 = 0;
++                for (int w = 0; w < 8; ++w) s2 += wsum[w];
++                tot = s2;
++            }
++            __syncthreads();
++            base += tot;
++            __syncthreads();
++        }
++    }
++    // the selected pages in page order across both passes
++    __syncthreads();
++    if (tid == 0) {
++        int n = min(base, nsel);
++        for (int a = 1; a < n; ++a) {   // insertion sort: the second pass's few ties into the first's order
++            const int32_t v = out[a];
++            int b = a - 1;
++            while (b >= 0 && out[b] > v) { out[b + 1] = out[b]; --b; }
++            out[b + 1] = v;
++        }
++    }
++}
++
+ /// One store of a visit's cells for attention: the VRAM cache (ring or by position) or the host copy (by position).
+ struct KvSrc {
+     const void *k, *v;
+@@ -1543,7 +1650,10 @@ uint64_t row_bytes_est(const HP& hp) {
+     const uint64_t floats = 30 * N + 4 * QD + 4 * KD + 2 * (uint64_t) hp.n_head * hp.n_rel + 64 + hp.n_expert + Kp;
+     return floats * 4 + Kp * N * (2 + 4) + Kp * hp.n_ff * 2 + 2 * QD * 2 + 4 * N + Kp * 16;
+ }
+-uint64_t cache_bytes(const Model& m, int d, int ctx, int tmax, bool q8, int resident) {
++/// VRAM for a visit's page bounds (page selection).
++uint64_t page_sum_bytes(int n_kv, int ctx) { return (uint64_t) n_kv * ((ctx + g_page - 1) / g_page) * kHD * 2 * 2; }
++
++uint64_t cache_bytes(const Model& m, int d, int ctx, int tmax, bool q8, int resident, bool sel) {
+     const HP& hp = m.hp;
+     uint64_t b = 0;
+     for (int il = 0; il < hp.n_vis; ++il) {
+@@ -1553,11 +1663,13 @@ uint64_t cache_bytes(const Model& m, int d, int ctx, int tmax, bool q8, int resi
+         const uint64_t cells = swa ? (uint64_t) (hp.swa + tmax) : full;
+         const uint64_t per_cell = swa || !q8 ? (uint64_t) hp.n_kv * kHD * 2 * 2 : (uint64_t) hp.n_kv * (kHD + 4) * 2;
+         b += cells * per_cell + (uint64_t) (2 * hp.n_kv * kHD + 2 * hp.n_embd) * 3 * 4;
++        if (!swa && sel && full < (uint64_t) ctx) b += page_sum_bytes(hp.n_kv, ctx);
+     }
+     return b;
+ }
+ 
+-bool load(const std::string& path, Model& m, int ctx, int tmax, bool q8, int n_sess, int resident, std::string& err) {
++bool load(const std::string& path, Model& m, int ctx, int tmax, bool q8, int n_sess, int resident, bool sel,
++          std::string& err) {
+     const auto t0 = Clock::now();
+     m.file = std::make_shared<strata::GgufModel>(strata::GgufModel::open(path));
+     const strata::GgufModel& gm = *m.file;
+@@ -1578,7 +1690,8 @@ bool load(const std::string& path, Model& m, int ctx, int tmax, bool q8, int n_s
+         const uint64_t full = q8 && resident > 0 && resident < ctx ? (uint64_t) resident : (uint64_t) ctx;
+         const uint64_t cells = swa ? (uint64_t) (hp.swa + tmax) : full;
+         const uint64_t per_cell = swa || !q8 ? (uint64_t) hp.n_kv * hp.hd * 2 * 2 : (uint64_t) hp.n_kv * (hp.hd + 4) * 2;
+-        kv[(size_t) ip] += (cells * per_cell + conv_bytes) * (uint64_t) n_sess;
++        const uint64_t sums = !swa && sel && full < (uint64_t) ctx ? page_sum_bytes(hp.n_kv, ctx) : 0;
++        kv[(size_t) ip] += (cells * per_cell + conv_bytes + sums) * (uint64_t) n_sess;
+     }
+     size_t hs = 0;
+     const strata::TensorInfo* th = gm.find("output.weight", &hs);
+@@ -1810,6 +1923,8 @@ struct Dev {
+     cudaStream_t hs = nullptr;                                    // the CPU share of a decode's RAM part
+     cudaEvent_t evq = nullptr, evcpu = nullptr;
+     float *qh = nullptr, *cacc = nullptr, *cm = nullptr, *cl = nullptr;   // pinned: its query rows and partials
++    float* psc = nullptr;                                         // page selection: page scores, the chosen pages
++    int32_t *psel = nullptr, *pselh = nullptr;
+     int32_t* ent_inv = nullptr;
+ };
+ 
+@@ -1820,6 +1935,7 @@ struct Engine {
+     int nd = 0;
+     bool q8_kv = true;
+     int kv_resident = 0;              // > 0: a full-attention visit keeps its last kv_resident cells in VRAM, all in RAM
++    int kv_select = 0;                // > 0 (tiered): a decode reads only the best pages of the RAM part, this many tokens
+     /// A decode's read of a RAM part on CPU threads, one record a (visit, row group): the job the host function runs,
+     /// and the times of both shares, which set the next split.
+     struct CpuRec {
+@@ -1830,6 +1946,7 @@ struct Engine {
+         bool pending = false;
+     };
+     std::vector<CpuRec> cpu_rec;
++    int sel_pages() const { return (kv_select + g_page - 1) / g_page; }
+     float cpu_frac = 0.4f;            // the CPU's share of a RAM part
+     static void CUDART_CB cpu_run(void* p) {
+         CpuRec& r = *static_cast<CpuRec*>(p);
+@@ -1996,6 +2113,12 @@ struct Engine {
+                 CK(cudaHostAlloc((void**) &D.cacc, rq * kCpuSegs * kHD * 4, cudaHostAllocPortable));
+                 CK(cudaHostAlloc((void**) &D.cm, rq * kCpuSegs * 4, cudaHostAllocPortable));
+                 CK(cudaHostAlloc((void**) &D.cl, rq * kCpuSegs * 4, cudaHostAllocPortable));
++                if (kv_select > 0) {
++                    const size_t np = (size_t) (ctx + g_page - 1) / g_page, ns = (size_t) sel_pages();
++                    D.psc = dalloc(rq / H * HKV * np);
++                    D.psel = dalloc_t<int32_t>(rq / H * HKV * ns);
++                    CK(cudaHostAlloc((void**) &D.pselh, rq / H * HKV * ns * 4, cudaHostAllocPortable));
++                }
+             }
+             if (T >= (size_t) kExpertGemmT) {
+                 D.xg = dalloc_t<__half>(T * Kp * N);
+@@ -2059,6 +2182,11 @@ struct Engine {
+                 CK(cudaHostAlloc((void**) &c.hv, hb * kHD, cudaHostAllocPortable | cudaHostAllocMapped));
+                 CK(cudaHostAlloc((void**) &c.hks, hb * 4, cudaHostAllocPortable | cudaHostAllocMapped));
+                 CK(cudaHostAlloc((void**) &c.hvs, hb * 4, cudaHostAllocPortable | cudaHostAllocMapped));
++                if (kv_select > 0) {
++                    c.npages = (ctx + g_page - 1) / g_page;
++                    c.pmn = dalloc_t<__half>(HKV * (size_t) c.npages * kHD);
++                    c.pmx = dalloc_t<__half>(HKV * (size_t) c.npages * kHD);
++                }
+             }
+             if (q8) {
+                 c.k = dalloc_t<int8_t>(HKV * cells * kHD);
+@@ -2294,6 +2422,10 @@ struct Engine {
+             const float scale = 1.0f / std::sqrt((float) kHD);
+             const int win = L.swa ? hp.swa : 0, G = H / HKV;
+             const int pmax = pos0 + T - 1;
++            if (cv.pmn) {   // the bounds of the pages this forward wrote to
++                const int pg0 = pos0 / g_page, pg1 = pmax / g_page;
++                k_page_sum<<<dim3((unsigned) (pg1 - pg0 + 1), (unsigned) HKV), kHD, 0, D->st>>>(cv, pg0, pmax, g_page);
++            }
+             const bool tier = cv.hk != nullptr;
+             const int res_lo = tier ? std::max(0, pmax - kv_resident + 1) : 0;   // the cells the VRAM ring still holds
+             const KvSrc vram{cv.k, cv.v, cv.ks, cv.vs, cv.ring, cv.cells, 0};
+@@ -2326,13 +2458,14 @@ struct Engine {
+                 const int base = (L.swa ? std::max(0, p_first - hp.swa + 1) : res_lo) / kChunkKeys * kChunkKeys;
+                 const int nc_r = (p_last - base) / kChunkKeys + 1;
+                 // The RAM part: [0, g_end) through VRAM, [g_end, res_lo) on CPU threads at the same time.
+-                const bool on_cpu = tier && res_lo >= kCpuMin && q8 && G <= kMaxG && t0 / att_q < kAttTileT;
++                const bool sel = tier && cv.pmn != nullptr && res_lo > 0;   // page selection: the CPU reads the best pages
++                const bool on_cpu = tier && (sel || res_lo >= kCpuMin) && q8 && G <= kMaxG && t0 / att_q < kAttTileT;
+                 int g_end = res_lo;
+                 CpuRec* cr = nullptr;
+                 if (on_cpu) {
+                     if (cpu_rec.empty()) cpu_rec.resize((size_t) hp.n_vis * kAttTileT);
+                     cr = &cpu_rec[(size_t) il * kAttTileT + (size_t) (t0 / att_q)];
+-                    if (cr->pending && t0 == 0) {   // the last split's times set this one
++                    if (cr->pending && t0 == 0 && !sel) {   // the last split's times set this one
+                         float gms = 0.f;
+                         if (cudaEventQuery(cr->g1) == cudaSuccess && cudaEventElapsedTime(&gms, cr->g0, cr->g1) == cudaSuccess &&
+                             gms > 0.f && cr->cpu_ms > 0 && cr->cpu_keys > 0 && cr->gpu_keys > 0) {
+@@ -2344,11 +2477,18 @@ struct Engine {
+                         CK(cudaEventCreate(&cr->g0));
+                         CK(cudaEventCreate(&cr->g1));
+                     }
+-                    g_end = (int) ((double) res_lo * (1.0 - cpu_frac)) / kChunkKeys * kChunkKeys;
++                    g_end = sel ? 0 : (int) ((double) res_lo * (1.0 - cpu_frac)) / kChunkKeys * kChunkKeys;
+                 }
++                const int np = (res_lo + g_page - 1) / g_page, nsel = sel ? std::min(np, sel_pages()) : 0;
+                 const int nc_h = g_end > 0 ? (g_end - 1) / kChunkKeys + 1 : 0;
+-                const int nseg = on_cpu ? kCpuSegs : 0, c_cpu = nc_r + nc_h;
++                const int nseg = on_cpu ? (sel ? std::min(kCpuSegs, nsel) : kCpuSegs) : 0, c_cpu = nc_r + nc_h;
+                 const int nc = c_cpu + nseg;
++                if (on_cpu && sel) {   // each (row, KV head) keeps its nsel pages of the best bound
++                    k_page_score<<<dim3((unsigned) ((np + 7) / 8), (unsigned) HKV, (unsigned) nq), 256, 0, D->st>>>(
++                        D->qb, cv, np, t0, H, G, scale, D->psc);
++                    k_page_topk<<<(unsigned) (nq * HKV), 256, 0, D->st>>>(D->psc, np, nsel, D->psel);
++                    CK(cudaMemcpyAsync(D->pselh, D->psel, (size_t) nq * HKV * nsel * 4, cudaMemcpyDeviceToHost, D->st));
++                }
+                 if (on_cpu) {
+                     CK(cudaMemcpyAsync(D->qh, D->qb + (size_t) t0 * H * kHD, (size_t) nq * H * kHD * 4, cudaMemcpyDeviceToHost, D->st));
+                     CK(cudaEventRecord(D->evq, D->st));
+@@ -2361,10 +2501,15 @@ struct Engine {
+                     j.hcells = cv.hcells; j.kmin = g_end; j.kmax = res_lo - 1;
+                     j.scale = scale; j.nseg = nseg; j.seg_stride = nseg;
+                     j.acc = D->cacc; j.m = D->cm; j.l = D->cl;
++                    if (sel) {
++                        j.pages = D->pselh;
++                        j.n_pages = nsel;
++                        j.page = g_page;
++                    }
+                     cr->cpu_keys = res_lo - g_end;
+                     cr->gpu_keys = g_end;
+                     cr->cpu_ms = 0;
+-                    cr->pending = true;
++                    cr->pending = !sel;
+                     CK(cudaLaunchHostFunc(D->hs, cpu_run, cr));
+                     const size_t hgt = (size_t) nq * H;
+                     CK(cudaMemcpy2DAsync(D->pacc + (size_t) c_cpu * kHD, (size_t) nc * kHD * 4, D->cacc, (size_t) nseg * kHD * 4,
+@@ -2876,7 +3021,7 @@ int strata::inkling2::run(int argc, char** argv) {
+     std::string model, tokens, force, dump_full;
+     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0;
+     bool serve_mode = false, ppl = false, q8_kv = true;
+-    int n_lanes = 1, kv_res = 0, ppl_from = 0;
++    int n_lanes = 1, kv_res = 0, kv_sel = 0, ppl_from = 0;
+     for (int i = 1; i < argc; ++i) {
+         const std::string a = argv[i];
+         auto next = [&]() -> std::string {
+@@ -2893,6 +3038,8 @@ int strata::inkling2::run(int argc, char** argv) {
+         else if (a == "--batch" || a == "--slots") n_lanes = std::max(1, std::min(kMaxLanes, std::atoi(next().c_str())));
+         else if (a == "--kv") q8_kv = next() != "fp16";   // the full-attention caches: int8 (default) or fp16
+         else if (a == "--kv-resident") kv_res = std::atoi(next().c_str());   // cells of each full-attention cache in VRAM
++        else if (a == "--kv-select") kv_sel = std::atoi(next().c_str());     // decode reads this many RAM-part tokens (Quest pages)
++        else if (a == "--kv-page") g_page = std::max(8, std::atoi(next().c_str()));
+         else if (a == "--max-context" || a == "--ctx") ctx = std::atoi(next().c_str());
+         else if (a == "--chunk" || a == "--prefill") { const std::string v = next(); chunk = std::isdigit((unsigned char) v[0]) ? std::atoi(v.c_str()) : 0; }
+         else if (a == "--tokens") {
+@@ -2928,6 +3075,7 @@ int strata::inkling2::run(int argc, char** argv) {
+     const bool auto_chunk = chunk == 0;
+     if (auto_chunk) chunk = 512;
+     if (kv_res >= ctx || !q8_kv) kv_res = 0;
++    if (kv_res == 0) kv_sel = 0;
+     if (kv_res > 0) kv_res = std::max(kv_res, std::max(chunk, 4096) + 1024);   // a whole prompt chunk and the bias range
+     if (chunk < kGemmT || chunk > 4096 || ctx < 256) { std::fprintf(stderr, "strata-inkling2: bad --chunk / --max-context\n"); return 2; }
+ #if !defined(_WIN32)
+@@ -2936,7 +3084,7 @@ int strata::inkling2::run(int argc, char** argv) {
+     Model m;
+     std::string err;
+     try {
+-        if (!load(model, m, ctx, chunk, q8_kv, n_lanes, kv_res, err)) { std::fprintf(stderr, "strata-inkling2: %s\n", err.c_str()); return 1; }
++        if (!load(model, m, ctx, chunk, q8_kv, n_lanes, kv_res, kv_sel > 0, err)) { std::fprintf(stderr, "strata-inkling2: %s\n", err.c_str()); return 1; }
+         for (const char* k : {"tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id"})
+             if (const strata::MetaValue* v = m.file->meta().get(k))
+                 if (!is_eos((int) v->u)) g_eos.push_back((int32_t) v->u);
+@@ -2951,7 +3099,7 @@ int strata::inkling2::run(int argc, char** argv) {
+                 CK(cudaSetDevice(m.dev_ids[(size_t) d]));
+                 size_t fr = 0, tot = 0;
+                 CK(cudaMemGetInfo(&fr, &tot));
+-                const uint64_t need = cache_bytes(m, d, ctx, c, q8_kv, kv_res) * (uint64_t) n_lanes + (uint64_t) c * row_bytes_est(m.hp) + (640ull << 20);
++                const uint64_t need = cache_bytes(m, d, ctx, c, q8_kv, kv_res, kv_sel > 0) * (uint64_t) n_lanes + (uint64_t) c * row_bytes_est(m.hp) + (640ull << 20);
+                 fits = fits && fr > need + (768ull << 20);
+             }
+             if (fits) {
+@@ -2963,11 +3111,13 @@ int strata::inkling2::run(int argc, char** argv) {
+     const int ring = m.hp.swa + std::max(chunk, kGemmT);
+     if (kv_res > 0)
+         std::fprintf(stderr, "strata-inkling2: full-attention caches tiered: the last %d cells in VRAM, all %d in RAM "
+-                     "(%.2f GiB of pinned memory per session)\n", kv_res, ctx,
+-                     (double) ctx * m.hp.n_kv * (kHD + 4) * 2 * 8 / (1 << 30));
++                     "(%.2f GiB of pinned memory per session)%s\n", kv_res, ctx,
++                     (double) ctx * m.hp.n_kv * (kHD + 4) * 2 * 8 / (1 << 30),
++                     kv_sel > 0 ? (", decode reads " + std::to_string(kv_sel) + " RAM-part tokens a head (page selection)").c_str() : "");
+     Engine E;
+     E.q8_kv = q8_kv;
+     E.kv_resident = kv_res;
++    E.kv_select = kv_sel;
+     E.init(m, ctx, chunk, ring);
+     if (serve_mode) {
+         std::vector<std::unique_ptr<Lane>> lanes;
+@@ -2976,6 +3126,7 @@ int strata::inkling2::run(int argc, char** argv) {
+             L->ex = std::make_unique<Engine>();
+             L->ex->q8_kv = q8_kv;
+             L->ex->kv_resident = kv_res;
++            L->ex->kv_select = kv_sel;
+             L->ex->init(m, ctx, kGemmT, ring);
+             E.alloc_session(L->sess);
+             L->ex->S = &L->sess;
+@@ -3069,6 +3220,6 @@ int strata::inkling2::run(int argc, char** argv) {
+     std::fprintf(stderr, "strata-inkling2: prompt %zu tokens in %.1f ms (%.1f tok/s), %zu generated in %.1f ms (%.1f tok/s)\n",
+                  prompt.size(), pp_ms, prompt.size() / (pp_ms / 1000.0), gen.size(), ms_since(t1),
+                  gen.size() / (ms_since(t1) / 1000.0));
+-    if (kv_res > 0) std::fprintf(stderr, "strata-inkling2: CPU share of the RAM part %.0f%%\n", 100.0 * E.cpu_frac);
++    if (kv_res > 0 && kv_sel == 0) std::fprintf(stderr, "strata-inkling2: CPU share of the RAM part %.0f%%\n", 100.0 * E.cpu_frac);
+     return 0;
+ }
+-- 
+2.56.1
+

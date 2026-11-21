@@ -19,8 +19,8 @@ import sys
 from pathlib import Path
 
 import prepare
-from common import ROOT, SetupError, engine_program, first_shard, mmproj_near
-from settings import ModelPaths, Prepare, Settings, Vision
+from common import ROOT, SetupError, engine_program, first_shard, gguf_architecture, mmproj_near
+from settings import Drafter, ModelPaths, Prepare, Settings, Vision
 
 ENGINE = Path(ROOT, "engine")
 
@@ -188,14 +188,29 @@ class Launcher:
             raise SetupError(f"unknown command {command}: serve (default), prepare or print-config")
         self.settings = settings
         self.command = command
+        self.inkling = False
 
     def run(self) -> None:
         paths = ModelPaths.from_settings(self.settings)
         model, mmproj = self.model_files(paths)
+        if gguf_architecture(model) == "inkling2":
+            # Inkling 2 runs without Qwen's MTP layer, DFlash2 and picture reader
+            for name, on in (("DRAFTER", paths.mtp is not None or self.settings.drafter != Drafter.OFF),
+                             ("VISION", mmproj is not None or self.settings.vision_on)):
+                if on:
+                    log.warning(f"{name} is not used with an Inkling 2 model")
+            paths.mtp = None
+            mmproj = None
+            self.inkling = True
         if self.command == "prepare":
             return
 
-        config_path = self.write_config(Config(self.settings, paths, model, mmproj).build())
+        cfg = Config(self.settings, paths, model, mmproj).build()
+        if self.inkling:
+            cfg["drafting"] = str(Drafter.OFF)
+            if cfg.pop("layer_split", None) is not None:
+                log.info("CONFIG_LAYER_SPLIT is not used with an Inkling 2 model: its engine splits the layers itself")
+        config_path = self.write_config(cfg)
         if self.command == "serve":
             self.start_server(config_path)
 

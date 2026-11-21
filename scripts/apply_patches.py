@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Apply local fixes from patches/ to the engine sources in a build stage (both Dockerfiles run it).
 
-    apply_patches.py <patches dir> <source root> "<PATCHES>"
+    apply_patches.py <patches dir> <source root> "<PATCHES>" [engine|server]
 
 PATCHES: empty or "none" (the default): nothing, the build is upstream's own code.
          "all": every *.patch, in name order.
          a comma list: just those, by file name with or without .patch, or by number ("0001,0002").
 The patch files name paths as vendor/...; the source root is where vendor/'s contents are (/src in the build stage).
-Writes the applied names, comma-separated, to <source root>/PATCHES (empty for none) for BUILD.json.
+A patch is either the engine's or the server's (serve/, strata_control/, strata_cli/, data/, tools/*.py); each stage
+applies its own. The engine stage writes every applied name, comma-separated, to <source root>/PATCHES for BUILD.json.
 """
 from __future__ import annotations
 
@@ -43,9 +44,29 @@ def pick(folder: Path, want: str) -> list[Path]:
     return picked
 
 
-def apply(folder: Path, root: Path, want: str) -> None:
+SERVER_DIRS = ("serve/", "strata_control/", "strata_cli/", "data/")
+
+
+def side(patch: Path) -> str:
+    """engine or server, from the files the patch names (it may not name both)."""
+    sides = set()
+    for line in patch.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith(("--- a/vendor/", "+++ b/vendor/")):
+            rel = line[len("--- a/vendor/"):]
+            server = rel.startswith(SERVER_DIRS) or (rel.startswith("tools/") and rel.count("/") == 1 and rel.endswith(".py"))
+            sides.add("server" if server else "engine")
+    if len(sides) > 1:
+        raise PatchError(f"{patch.name} changes both engine and server files: split it in two")
+    return sides.pop() if sides else "engine"
+
+
+def apply(folder: Path, root: Path, want: str, stage: str = "engine") -> None:
     applied = []
     for patch in pick(folder, want):
+        if side(patch) != stage:
+            applied.append(patch.stem)
+            log.info(f"{patch.name} changes the {side(patch)}: applied in the {side(patch)}'s step")
+            continue
         with patch.open("rb") as f:
             done = subprocess.run(["patch", "-d", str(root), "-p2", "--forward", "--batch", "--no-backup-if-mismatch"],
                                   stdin=f)
@@ -55,15 +76,17 @@ def apply(folder: Path, root: Path, want: str) -> None:
         log.info(f"patch applied: {patch.name}")
     if not applied:
         log.info("no patches: upstream's code as released")
-    Path(root, "PATCHES").write_text(f"{','.join(applied)}\n")
+    if stage == "engine":
+        Path(root, "PATCHES").write_text(f"{','.join(applied)}\n")
 
 
 if __name__ == "__main__":
     logging.basicConfig(format="[patches] %(levelname)s %(message)s", level="INFO")
-    if len(sys.argv) not in (3, 4):
-        sys.exit('usage: apply_patches.py <patches dir> <source root> "<PATCHES>"')
+    if len(sys.argv) not in (3, 4, 5) or (len(sys.argv) == 5 and sys.argv[4] not in ("engine", "server")):
+        sys.exit('usage: apply_patches.py <patches dir> <source root> "<PATCHES>" [engine|server]')
     try:
-        apply(Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3] if len(sys.argv) == 4 else "")
+        apply(Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3] if len(sys.argv) >= 4 else "",
+              sys.argv[4] if len(sys.argv) == 5 else "engine")
     except PatchError as e:
         log.error(e)
         sys.exit(1)

@@ -229,6 +229,20 @@ curl -fsSL https://raw.githubusercontent.com/LegendaryFire/strata-slim/main/conf
 
 The size is the download; the pack built from it needs about as much disk again.
 
+## Inkling-2-Mini
+
+[Unsloth's Inkling-2-Mini GGUFs](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) run on the patched CUDA images
+(`0004` and `0005`, see [patches](patches/README.md)), split by layers over the GPUs when one card can't hold them:
+
+```ini
+MODEL_REPO=unsloth/Inkling-2-Mini-GGUF
+MODEL_QUANT=UD-Q4_K_XL
+```
+
+The setup exports only its tokenizer (the engine reads the GGUF), and the drafters and the picture reader stay off.
+`UD-Q4_K_XL` (17.6 GB) is the tested quant; on two 12 GB cards it reads a prompt at about 1100 tokens/s and writes about
+42 tokens/s. The `IQ1`/`IQ2` quants and `UD-Q8_K_XL` use weight types this engine path doesn't take yet.
+
 ## Common settings
 
 | Variable | Valid values | Default |

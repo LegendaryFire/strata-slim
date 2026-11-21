@@ -1,0 +1,342 @@
+From f1375d04d005cf7489f7f74e44c4cefebe825918 Mon Sep 17 00:00:00 2001
+From: LegendaryFire <tristan.balon@outlook.com>
+Date: Fri, 20 Nov 2026 18:05:05 -0700
+Subject: [PATCH] Serve Inkling 2: its tokenizer, chat template and reply
+ format
+
+The tokenizer had no rule for the inkling2 pre-tokenizer (llama.cpp's
+GPT4O), the chat template's {% generation %} tag did not parse, the
+reply was read as Qwen's <think>/<tool_call> markup and the end of a
+turn was not a stop token. Now the tokenizer splits with the o200k
+pattern, the tag renders its body, InklingOutputParser reads the
+thinking / text / tool-call blocks (llama.cpp's common/parsers/
+inkling.cpp), the effort words are the template's, and the GGUF's
+eos / eot end a reply. The thinking budget and the forced call, which
+write Qwen's markup, are off for this family.
+---
+ vendor/serve/frontend.py                | 148 +++++++++++++++++++++++-
+ vendor/serve/server.py                  |   9 +-
+ vendor/serve/server_parts/end_tokens.py |   7 +-
+ vendor/serve/server_parts/http_api.py   |   3 +
+ vendor/tools/strata_tokenizer.py        |  22 +++-
+ 5 files changed, 182 insertions(+), 7 deletions(-)
+
+diff --git a/vendor/serve/frontend.py b/vendor/serve/frontend.py
+index 03f09f8..85d672f 100644
+--- a/vendor/serve/frontend.py
++++ b/vendor/serve/frontend.py
+@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
+ from pathlib import Path
+ 
+ import jinja2
++from jinja2 import nodes
++from jinja2.ext import Extension
+ from jinja2.sandbox import ImmutableSandboxedEnvironment
+ 
+ LOGGER = logging.getLogger(__name__)
+@@ -37,6 +39,16 @@ class TemplateRequestError(jinja2.exceptions.TemplateError, ValueError):
+     client gets a 400 with the template's message instead of a dropped connection (#365)."""
+ 
+ 
++class _GenerationTag(Extension):
++    """transformers' {% generation %}: rendered as its body."""
++    tags = {"generation"}
++
++    def parse(self, parser):
++        lineno = next(parser.stream).lineno
++        body = parser.parse_statements(("name:endgeneration",), drop_needle=True)
++        return nodes.Scope(body, lineno=lineno)
++
++
+ class ChatTemplate:
+     """The model's chat template, rendered with the same Jinja settings as transformers' apply_chat_template."""
+ 
+@@ -47,7 +59,7 @@ class ChatTemplate:
+         def tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
+             return json.dumps(x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)
+ 
+-        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"])
++        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols", _GenerationTag])
+         env.filters["tojson"] = tojson
+         env.globals["raise_exception"] = raise_exception
+         self.source = Path(path).read_text(encoding="utf-8")
+@@ -136,12 +148,15 @@ EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false":
+ 
+ 
+ _EFFORT_QWEN = dict(EFFORT)
++# Inkling 2 had only the Qwen words, so now its template's own effort names are used
++_EFFORT_INKLING = {"none": "none", "off": "none", "disabled": "none", "false": "none", "minimal": "minimal", "low": "low",
++                   "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max", "maximum": "max"}
+ 
+ 
+ def use_family(family: str | None) -> None:
+     """The reasoning-effort words of the model family this server runs (module state, like ENV_TO_USER): the Qwen table."""
+     EFFORT.clear()
+-    EFFORT.update(_EFFORT_QWEN)
++    EFFORT.update(_EFFORT_INKLING if family == "inkling2" else _EFFORT_QWEN)
+ 
+ 
+ def effort_kwargs(value) -> dict:
+@@ -2707,9 +2722,138 @@ class JsonOutputParser(OutputParser):
+                          declared_only=declared_only, deferred=deferred)
+ 
+ 
++INK_HEADER = "<|message_model|>"
++INK_THINK = "<|content_thinking|>"
++INK_TEXT = "<|content_text|>"
++INK_TOOL = "<|content_invoke_tool_json|>"
++INK_END = "<|end_message|>"
++_INK_MARKERS = (INK_HEADER, INK_THINK, INK_TEXT, INK_TOOL, INK_END)
++
++
++def is_inkling_template(source: str | None) -> bool:
++    """llama.cpp's test for an Inkling template (common/parsers/inkling.cpp)."""
++    return bool(source) and "<|message_user|>" in source and "<|content_image|>" in source
++
++
++class InklingOutputParser(OutputParser):
++    """Inkling's reply blocks (thinking, text, tool calls), each closed by <|end_message|>."""
++
++    def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
++                 recover: bool = False, declared_only: bool = False, deferred: bool = False):
++        super().__init__(thinking=False, tools=tools, stream_tools=False, recover=False, declared_only=declared_only,
++                         deferred=deferred)
++        self.mode = "between"        # between | head | think | text | tool
++        self.tool_name = ""
++
++    @property
++    def clean(self) -> bool:
++        return not self.buf
++
++    @staticmethod
++    def _held_tail(text: str) -> int:
++        start = text.rfind("<", max(0, len(text) - max(len(m) for m in _INK_MARKERS)))
++        if start < 0:
++            return 0
++        tail = text[start:]
++        return len(tail) if any(m.startswith(tail) for m in _INK_MARKERS) else 0
++
++    def _call(self, name: str, body: str) -> list[Event]:
++        try:
++            obj = json.loads(body)
++            args = obj.get("args") if isinstance(obj, dict) else None
++            if not isinstance(args, dict):
++                raise ValueError("no args object")
++        except ValueError:
++            return [Event("content", INK_HEADER + name + INK_TOOL + body)]
++        if self.schemas and name not in self.schemas and not self.deferred:
++            name = self.aliases.get(name, name)
++        if (self.schemas or self.declared_only) and name not in self.schemas and not self.deferred:
++            self.unread += 1
++            return [Event("content", INK_HEADER + name + INK_TOOL + body)]
++        return [Event("tool_call", call=ToolCall(name, args))]
++
++    def _ink(self, final: bool) -> list[Event]:
++        out: list[Event] = []
++        while self.buf:
++            if self.mode == "between":
++                if self.buf.startswith(INK_HEADER):
++                    self.buf = self.buf[len(INK_HEADER):]
++                    self.mode = "head"
++                    continue
++                if not final and INK_HEADER.startswith(self.buf):
++                    break
++                if self.buf.startswith(INK_END):            # a stray end marker
++                    self.buf = self.buf[len(INK_END):]
++                    continue
++                for m, mode in ((INK_THINK, "think"), (INK_TEXT, "text")):   # a block without its header
++                    if self.buf.startswith(m):
++                        self.buf = self.buf[len(m):]
++                        self.mode = mode
++                        break
++                else:
++                    self.mode = "text"                     # text outside any block is the answer
++                continue
++            if self.mode == "head":
++                if self.buf.startswith(INK_THINK):
++                    self.buf, self.mode, self.state = self.buf[len(INK_THINK):], "think", "reasoning"
++                    continue
++                if self.buf.startswith(INK_TEXT):
++                    self.buf, self.mode, self.state = self.buf[len(INK_TEXT):], "text", "content"
++                    continue
++                i = self.buf.find(INK_TOOL)
++                if i > 0 and "<" not in self.buf[:i]:
++                    self.tool_name = self.buf[:i]
++                    self.buf, self.mode, self.state = self.buf[i + len(INK_TOOL):], "tool", "call"
++                    continue
++                if not final and len(self.buf) < 256 and ("<" not in self.buf or self._held_tail(self.buf)):
++                    break
++                self.mode, self.state = "text", "content"   # a header with no content marker: its text is the answer
++                continue
++            if self.mode in ("think", "text"):
++                kind = "reasoning" if self.mode == "think" else "content"
++                ends = [i for i in (self.buf.find(INK_END), self.buf.find(INK_HEADER)) if i >= 0]
++                if ends:
++                    i = min(ends)
++                    if i:
++                        out.append(Event(kind, self.buf[:i]))
++                    self.buf = self.buf[i + (len(INK_END) if self.buf.startswith(INK_END, i) else 0):]
++                    self.mode, self.state = "between", "content"
++                    continue
++                keep = 0 if final else self._held_tail(self.buf)
++                if len(self.buf) > keep:
++                    out.append(Event(kind, self.buf[:len(self.buf) - keep]))
++                    self.buf = self.buf[len(self.buf) - keep:]
++                break
++            if self.mode == "tool":
++                i = self.buf.find(INK_END)
++                if i < 0:
++                    if final:
++                        out.append(Event("content", INK_HEADER + self.tool_name + INK_TOOL + self.buf))
++                        self.buf = ""
++                    break
++                out += self._call(self.tool_name, self.buf[:i])
++                self.buf = self.buf[i + len(INK_END):]
++                self.mode, self.state = "between", "content"
++                continue
++        return out
++
++    def feed(self, delta: str) -> list[Event]:
++        self.buf += delta
++        return self._ink(False)
++
++    def finish(self, reason: str | None = None) -> list[Event]:
++        out = self._ink(True)
++        if self.buf:
++            out.append(Event("content", self.buf))
++            self.buf = ""
++        return out
++
++
+ def parser_for_template(source: str | None):
+     """The OutputParser class for a chat template's text, by the tool-call form the template documents (serve/toolformat.py):
+     the JSON form gets JsonOutputParser; the XML form every Strata model ships with, templates without tools, and forms nothing
+     here reads keep OutputParser (the same class as before this existed)."""
+     from serve import toolformat
++    if is_inkling_template(source):
++        return InklingOutputParser
+     return JsonOutputParser if toolformat.tool_format(source or "") == "json" else OutputParser
+diff --git a/vendor/serve/server.py b/vendor/serve/server.py
+index b91f8bf..d5f4da7 100644
+--- a/vendor/serve/server.py
++++ b/vendor/serve/server.py
+@@ -3947,6 +3947,8 @@ class Service:
+     def set_family(self, family: str | None) -> None:
+         """The model family (None: the Qwen form this server was written for)."""
+         self.family = family
++        if family == "inkling2":
++            self._force_text = lambda force: None
+         import serve.frontend as _frontend
+         _frontend.use_family(family)
+ 
+@@ -5233,6 +5235,8 @@ class Service:
+              declared_only=False, deferred=False) -> Iterator[tuple[str, object]]:
+         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
+         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
++        if self.family == "inkling2":                   # its thinking was cut with Qwen's </think>, so now it is not cut
++            thinking, force = False, None
+         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
+         # apps; the request's own fields win over all of them
+         card = model_card_sampling(self.model_arch, thinking,
+@@ -8432,8 +8436,9 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
+     svc.max_queue = max_queue
+     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None
+     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
+-        svc.model_arch = cfg.get("arch") or "qwen4exp"
+-        svc.set_family(None)
++        inkling = tcfg.get("pre") == "inkling2"         # Inkling 2 was read as a Qwen family, so now its tokenizer names it
++        svc.model_arch = "inkling2" if inkling else cfg.get("arch") or "qwen4exp"
++        svc.set_family("inkling2" if inkling else None)
+         requested = cfg.get("parallel")
+         if requested is None:
+             args = cfg.get("args", [])
+diff --git a/vendor/serve/server_parts/end_tokens.py b/vendor/serve/server_parts/end_tokens.py
+index 239bc39..70e72dc 100644
+--- a/vendor/serve/server_parts/end_tokens.py
++++ b/vendor/serve/server_parts/end_tokens.py
+@@ -18,8 +18,13 @@ def end_token_ids(tokenizer) -> set[int]:
+         got = tokenizer.encode(marker, parse_special=True)
+         if len(got) == 1:
+             ids.add(int(got[0]))
++    specials = getattr(tokenizer, "special_ids", None) or {}
+     if not ids:
+-        eos = (getattr(tokenizer, "special_ids", None) or {}).get("eos")
++        eos = specials.get("eos")
+         if eos is not None:
+             ids.add(int(eos))
++    # Inkling 2's end of turn was not <|im_end|>, so now the GGUF's eos / eot ids end a reply too
++    for key in ("tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id"):
++        if getattr(tokenizer, "pre", None) == "inkling2" and specials.get(key) is not None:
++            ids.add(int(specials[key]))
+     return ids
+diff --git a/vendor/serve/server_parts/http_api.py b/vendor/serve/server_parts/http_api.py
+index 999d478..a237dac 100644
+--- a/vendor/serve/server_parts/http_api.py
++++ b/vendor/serve/server_parts/http_api.py
+@@ -613,6 +613,9 @@ MODEL_CARD_SAMPLING = {
+     # Qwen3.6-35B-A3B: the general-task sets (the card's precise-coding set is temperature 0.6, presence_penalty 0)
+     "qwen35moe": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5},
+                   "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
++    # Inkling 2 (the GGUF's general.sampling)
++    "inkling2": {"thinking": {"temperature": 1.0, "top_p": 1.0, "top_k": 0},
++                 "instruct": {"temperature": 1.0, "top_p": 1.0, "top_k": 0}},
+ }
+ 
+ 
+diff --git a/vendor/tools/strata_tokenizer.py b/vendor/tools/strata_tokenizer.py
+index 0d44ade..20a93ac 100644
+--- a/vendor/tools/strata_tokenizer.py
++++ b/vendor/tools/strata_tokenizer.py
+@@ -83,6 +83,18 @@ DEEPSEEK3_PATTERNS = (
+ )
+ 
+ 
++# Inkling 2's `inkling2` pre-tokenizer had no rule, so now it is llama.cpp's GPT4O (the tokenizer.json original)
++GPT4O_PATTERN = (
++    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
++    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
++    r"|\p{N}{1,3}"
++    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*"
++    r"|\s*[\r\n]+"
++    r"|\s+(?!\S)"
++    r"|\s+"
++)
++
++
+ def _sequence_findall(patterns, text: str) -> list[str]:
+     """llama.cpp's unicode_regex_split: the pieces of `text` after each pattern in turn splits every piece into its
+     matches and the unmatched spans between them."""
+@@ -114,6 +126,8 @@ def pre_tokenizer_kind(pre) -> str | None:
+         return "qwen35"
+     if p.startswith("deepseek"):
+         return "deepseek3"
++    if p == "inkling2":
++        return "gpt4o"
+     return None
+ 
+ 
+@@ -150,6 +164,9 @@ class Tokenizer:
+         else:
+             self._re = regex.compile(QWEN35_PATTERN)
+             self._split = self._re.findall
++        if pre_tokenizer_kind(pre) == "gpt4o":
++            self._re = regex.compile(GPT4O_PATTERN)
++            self._split = self._re.findall
+ 
+         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
+         # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:
+@@ -503,8 +520,9 @@ def extract(gguf_path, out_dir) -> dict:
+         "add_bos_token": False,
+         # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
+         # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
+-        "pre_pattern": QWEN35_PATTERN,
+-        "pre_pattern_source": ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
++        "pre_pattern": GPT4O_PATTERN if pre_tokenizer_kind(tk.pre) == "gpt4o" else QWEN35_PATTERN,
++        "pre_pattern_source": "tokenizer.json (o200k, LLAMA_VOCAB_PRE_TYPE_GPT4O)" if pre_tokenizer_kind(tk.pre) == "gpt4o"
++                              else ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
+     }
+     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
+     (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in
+-- 
+2.56.1
+

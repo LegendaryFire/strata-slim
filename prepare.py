@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import hf
-from common import ROOT, Progress, SetupError, engine_program, first_shard, mmproj_near, size_text
+from common import ROOT, Progress, SetupError, engine_program, first_shard, gguf_architecture, mmproj_near, size_text
 from hf import HuggingFace, RemoteFile
 from settings import DraftVocab, Drafter, ModelPaths, Settings
 from strata_control import acquisition, drafting, drafting_fetch
@@ -108,11 +108,17 @@ class Preparer:
                 raise SetupError("MODEL_REPO is set: MODEL_GGUF must be the folder the files go into, not a file")
             self.download_model(model_folder)
 
+        model = first_shard(self.paths.model)
+        if gguf_architecture(model) == "inkling2":
+            # Inkling 2 has its own engine path: the experts stay in the GGUF, and the drafters and picture reader are Qwen's
+            self.build_tokenizer(model)
+            log.info("model ready")
+            return model, None
+
         mmproj = None
         if self.settings.vision_on:
             mmproj = self.get_mmproj(model_folder)
 
-        model = first_shard(self.paths.model)
         self.build_pack(model)
         if self.paths.mtp:
             self.build_mtp()
@@ -270,6 +276,15 @@ class Preparer:
         log.info(f"building the pack {pack} from {model.name}")
         pack.parent.mkdir(parents=True, exist_ok=True)
         tool("iq_pack.py", "--gguf", str(model), "--out", str(pack), *shlex.split(self.settings.pack_args))
+
+    def build_tokenizer(self, model: Path) -> None:
+        """The pack of a model whose engine reads its weights from the GGUF: the tokenizer and chat template only."""
+        pack = self.paths.pack
+        if Path(pack, "tokenizer", "vocab.json").is_file() and Path(pack, "tokenizer", "chat_template.jinja").is_file():
+            return
+        log.info(f"exporting the tokenizer of {model.name} to {pack}")
+        pack.mkdir(parents=True, exist_ok=True)
+        tool("strata_tokenizer.py", "--gguf", str(model), "--out", str(pack))
 
     def build_mtp(self) -> None:
         rt = self.paths.mtp

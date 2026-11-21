@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import struct
 import time
 from pathlib import Path
 
@@ -85,3 +86,35 @@ def mmproj_near(model_folder: Path) -> Path | None:
     """The mmproj*.gguf in the model folder or beside it, when there is exactly one."""
     found = sorted(model_folder.glob("mmproj*.gguf")) + sorted(model_folder.parent.glob("mmproj*.gguf"))
     return found[0] if len(found) == 1 else None
+
+
+def gguf_architecture(path: Path) -> str | None:
+    """general.architecture from a GGUF header, or None when the file has none (or is not a GGUF)."""
+    sizes = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+    with open(path, "rb") as f:
+        def read(fmt):
+            return struct.unpack("<" + fmt, f.read(struct.calcsize("<" + fmt)))
+
+        def skip(kind):
+            if kind == 8:
+                f.seek(read("Q")[0], 1)
+            elif kind == 9:
+                item, count = read("IQ")
+                if item in sizes:
+                    f.seek(sizes[item] * count, 1)
+                else:
+                    for _ in range(count):
+                        skip(item)
+            else:
+                f.seek(sizes[kind], 1)
+
+        if f.read(4) != b"GGUF":
+            return None
+        _, _, n_kv = read("IQQ")
+        for _ in range(n_kv):
+            key = f.read(read("Q")[0]).decode("utf-8", "replace")
+            kind = read("I")[0]
+            if key == "general.architecture" and kind == 8:
+                return f.read(read("Q")[0]).decode("utf-8", "replace")
+            skip(kind)
+    return None

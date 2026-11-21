@@ -110,6 +110,14 @@ if [ -f build-vision/bin/strata-vision ]; then cp build-vision/bin/strata-vision
 python3 /usr/local/bin/build_info.py cuda "$CUDA_ARCHITECTURES" /src /out/engine
 EOF
 
+# the server's files with the server-side patches (PATCHES): after the engine, so a change to them does not recompile it
+COPY vendor/serve/          /server/serve/
+COPY vendor/strata_control/ /server/strata_control/
+COPY vendor/strata_cli/     /server/strata_cli/
+COPY vendor/data/           /server/data/
+COPY vendor/tools/*.py      /server/tools/
+RUN python3 /usr/local/bin/apply_patches.py /patches /server "$PATCHES" server
+
 # ---- 2. runtime --------------------------------------------------------------------------------------------------
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-${UBUNTU}
 ENV DEBIAN_FRONTEND=noninteractive PIP_DISABLE_PIP_VERSION_CHECK=1 PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
@@ -124,11 +132,11 @@ RUN python3 -m venv /venv && /venv/bin/pip install --no-cache-dir -r /tmp/requir
 WORKDIR /opt/strata
 COPY --from=build /out/engine/ /opt/strata/engine/
 COPY --from=build /opt/llama.cpp/gguf-py/ /opt/strata/third_party/llama.cpp/gguf-py/
-COPY vendor/serve/          /opt/strata/serve/
-COPY vendor/strata_control/ /opt/strata/strata_control/
-COPY vendor/strata_cli/     /opt/strata/strata_cli/
-COPY vendor/data/           /opt/strata/data/
-COPY vendor/tools/*.py      /opt/strata/tools/
+COPY --from=build /server/serve/          /opt/strata/serve/
+COPY --from=build /server/strata_control/ /opt/strata/strata_control/
+COPY --from=build /server/strata_cli/     /opt/strata/strata_cli/
+COPY --from=build /server/data/           /opt/strata/data/
+COPY --from=build /server/tools/          /opt/strata/tools/
 COPY vendor/UPSTREAM vendor/.config-keys vendor/LICENSE /opt/strata/
 COPY launch.py prepare.py hf.py common.py settings.py /opt/strata/
 

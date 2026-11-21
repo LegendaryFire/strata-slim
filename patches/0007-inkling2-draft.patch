@@ -1,0 +1,445 @@
+From 4eb373205ce1f6cb7696a9dbe2c489f16349398d Mon Sep 17 00:00:00 2001
+From: LegendaryFire <tristan.balon@outlook.com>
+Date: Fri, 20 Nov 2026 23:02:05 -0700
+Subject: [PATCH] Draft Inkling 2's tokens from the conversation and verify
+ them
+
+A decode step wrote one token, so a long context paid its whole cache
+read (from RAM when tiered) for each one. Now a step drafts the tokens
+that followed the latest earlier occurrence of the last 4, 3 or 2
+tokens (prompt lookup, no draft model) and runs them with the pending
+token in one forward of up to 8 rows. Each row's token is picked as
+plain decoding would pick it: a draft stands when it is that token
+(greedy), or with its probability under sampling, a turned-down draft
+left out of the redraw, so the output distribution is unchanged. The
+short-conv histories wait for the verdict (a verify forward keeps its
+conv inputs and commits the rows kept); the caches are written by
+position, so the position moving back is all a rejection needs.
+
+The draft length comes from the measured acceptance and the measured
+time of a forward of each row count (an extra row costs about 7-10 ms on
+2x RTX 3060, mostly its experts), so a step drafts nothing when that
+does not pay. --lookup-max-t N caps a step's drafts (the main engine's
+name for its lookup drafting; 0 turns it off, default 7: --draft is the
+server's drafter switch and does not reach the engine).
+
+Greedy output is identical with and without (checked at 1.5K, 24K and
+58K). Copying from the context: 1.5K 40.6 -> 54.7 tok/s, 24K 29.9 ->
+35.7, 58K tiered (8K window) 19.4 -> 42.0 (3.4 tokens a forward, 92%
+of drafted tokens kept). Prose that copies little: 30.0 -> 29.0 at 24K.
+
+Through the server (2 lanes, 65K context, the model card's sampling,
+~15K-token prompts): an edit that returns a function 42.3 -> 66.3
+tok/s, its follow-up 42.4 -> 69.8, prose 42.4 -> 42.8.
+---
+ vendor/src/inkling2/ink_engine.cu | 290 ++++++++++++++++++++++++++----
+ 1 file changed, 260 insertions(+), 30 deletions(-)
+
+diff --git a/vendor/src/inkling2/ink_engine.cu b/vendor/src/inkling2/ink_engine.cu
+index 3ec3ca8..0e1244f 100644
+--- a/vendor/src/inkling2/ink_engine.cu
++++ b/vendor/src/inkling2/ink_engine.cu
+@@ -15,6 +15,8 @@
+ #include <atomic>
+ #include <cctype>
+ #include <chrono>
++#include <stdexcept>
++#include <unordered_map>
+ #include <cmath>
+ #include <condition_variable>
+ #include <cstdint>
+@@ -1674,6 +1676,8 @@ struct Value {
+ using V = std::shared_ptr<Value>;
+ 
+ struct Dev {
++    float* cv_save = nullptr;   // a verify forward's conv inputs, kept until commit() knows the rows kept
++    size_t cv_cap = 0, cv_used = 0;
+     int id = 0;
+     cudaStream_t st = nullptr;
+     cudaEvent_t ev = nullptr;
+@@ -1806,6 +1810,12 @@ struct Engine {
+             D.id = m->dev_ids[(size_t) d];
+             CK(cudaSetDevice(D.id));
+             CK(cudaStreamCreateWithFlags(&D.st, cudaStreamNonBlocking));
++            {
++                size_t vis = 0;
++                for (int il = 0; il < hp.n_vis; ++il) vis += m->layers[(size_t) hp.phys(il)].dev == d;
++                D.cv_cap = vis * (size_t) conv_c * kGemmT;
++                D.cv_save = dalloc(D.cv_cap);
++            }
+             CK(cudaEventCreateWithFlags(&D.ev, cudaEventDisableTiming));
+             const int n_slots = 12;
+             for (int s = 0; s < n_slots; ++s) {
+@@ -2074,11 +2084,44 @@ struct Engine {
+     void run_conv(Dev& D, const float* x, float* hist, const float* w, const float* dyn, int nh, float* out, int C, int T,
+               float scale) {
+         k_conv<<<grid1((int64_t) C * T), kThreads, 0, D.st>>>(x, hist, w, dyn, nh, out, C, T, scale);
+-        k_conv_hist<<<grid1(C), kThreads, 0, D.st>>>(x, hist, C, T);
++        if (!defer_conv) {
++            k_conv_hist<<<grid1(C), kThreads, 0, D.st>>>(x, hist, C, T);
++            return;
++        }
++        const size_t n = (size_t) T * C;
++        if (D.cv_used + n > D.cv_cap) throw std::runtime_error("inkling2: verify rows exceed the conv save space");
++        float* sv = D.cv_save + D.cv_used;
++        D.cv_used += n;
++        CK(cudaMemcpyAsync(sv, x, n * 4, cudaMemcpyDeviceToDevice, D.st));
++        conv_recs.push_back(ConvRec{&D, hist, sv, C});
++    }
++
++    /// A verify forward (defer_conv) leaves each conv's history as it was and keeps its inputs; commit(keep) moves the
++    /// histories and the position on by the first `keep` rows only, as if just those had been run.
++    bool defer_conv = false;
++    struct ConvRec {
++        Dev* D;
++        float* hist;
++        const float* save;
++        int C;
++    };
++    std::vector<ConvRec> conv_recs;
++    void commit(int keep) {
++        for (const ConvRec& r : conv_recs) {
++            CK(cudaSetDevice(r.D->id));
++            k_conv_hist<<<grid1(r.C), kThreads, 0, r.D->st>>>(r.save, r.hist, r.C, keep);
++        }
++        conv_recs.clear();
++        S->pos -= T_now - keep;
+     }
+ 
+     void forward(const int32_t* toks, int T, int logit_rows) {
+         const HP& hp = m->hp;
++        if (defer_conv) {
++            if (T > kGemmT) throw std::runtime_error("inkling2: a verify forward takes at most 8 rows");
++            for (int i = 0; i < nd; ++i) dev[i].cv_used = 0;
++            conv_recs.clear();
++        }
+         const int N = hp.n_embd, H = hp.n_head, HKV = hp.n_kv;
+         T_now = T;
+         const int pos0 = (int) S->pos;
+@@ -2404,9 +2447,20 @@ Value::~Value() {
+ 
+ using strata::qwen35::Sampling;
+ 
+-int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>& hist, std::mt19937_64& rng) {
++/// The token distribution sampling draws from for a logit row: the kept ids and their probabilities (summing to 1);
++/// one id at probability 1 for greedy decoding.
++struct Dist {
++    std::vector<int> idx;
++    std::vector<double> p;
++};
++Dist dist(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>& hist) {
+     strata::qwen35::apply_penalties(lg, s, hist);
+-    if (s.temperature <= 0.f) return (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
++    Dist d;
++    if (s.temperature <= 0.f) {
++        d.idx = {(int) (std::max_element(lg.begin(), lg.end()) - lg.begin())};
++        d.p = {1.0};
++        return d;
++    }
+     const int kk = std::max(1, std::min(s.top_k > 0 ? s.top_k : 64, (int) lg.size()));
+     std::vector<int> idx(lg.size());
+     for (size_t i = 0; i < idx.size(); ++i) idx[i] = (int) i;
+@@ -2426,12 +2480,152 @@ int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>
+     keep = std::max<size_t>(1, keep);
+     double tot = 0;
+     for (size_t i = 0; i < keep; ++i) tot += p[i];
++    d.idx.assign(idx.begin(), idx.begin() + (long) keep);
++    d.p.resize(keep);
++    for (size_t i = 0; i < keep; ++i) d.p[i] = p[i] / tot;
++    return d;
++}
++/// A draw from d, leaving out `skip` (the drafted token a verify turned down: the rest renormalized).
++int draw(const Dist& d, std::mt19937_64& rng, int skip = -1) {
++    double tot = 0;
++    for (size_t i = 0; i < d.idx.size(); ++i) tot += d.idx[i] == skip ? 0.0 : d.p[i];
++    if (tot <= 0) return d.idx[0];
+     std::uniform_real_distribution<double> u(0.0, tot);
+     double r = u(rng);
+-    for (size_t i = 0; i < keep; ++i) {
+-        if ((r -= p[i]) <= 0) return idx[i];
++    int last = d.idx[0];
++    for (size_t i = 0; i < d.idx.size(); ++i) {
++        if (d.idx[i] == skip) continue;
++        last = d.idx[i];
++        if ((r -= d.p[i]) <= 0) return d.idx[i];
++    }
++    return last;
++}
++int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>& hist, std::mt19937_64& rng) {
++    return draw(dist(lg, s, hist), rng);
++}
++
++/// Drafts from the conversation itself (prompt lookup): the tokens that followed the latest earlier occurrence of the
++/// last 4, 3 or 2 tokens. A verify forward checks them, so a wrong draft costs time and never changes a token. How many
++/// to draft comes from the measured acceptance and the measured time of a forward of each row count: none when
++/// drafting does not pay.
++struct Drafter {
++    static constexpr int kMinN = 2, kMaxN = 4;
++    std::unordered_map<uint64_t, int32_t> ix[kMaxN - kMinN + 1];   // the n tokens ending at i -> i + 1, the latest
++    size_t done = 0;                                               // the tokens of `live` indexed
++    double acc = 3, rej = 2;                                       // decayed drafted-token outcomes
++    double t_ms[kGemmT + 1] = {};                                  // a step's time by its rows
++    int steps = 0;
++    int max_k = kGemmT - 1;                                        // --lookup-max-t: the most tokens a step drafts (0: none)
++
++    static uint64_t key(const int32_t* t, int n) {
++        uint64_t h = 0x9E3779B97F4A7C15ull * (uint64_t) n;
++        for (int i = 0; i < n; ++i) h = (h ^ (uint32_t) t[i]) * 0x100000001B3ull + (h >> 29);
++        return h;
++    }
++    void index(const std::vector<int32_t>& live) {
++        if (live.size() < done) {   // the state was reset or cut: index it again
++            for (auto& m : ix) m.clear();
++            done = 0;
++        }
++        for (size_t i = done; i < live.size(); ++i)
++            for (int n = kMinN; n <= kMaxN; ++n)
++                if (i + 1 >= (size_t) n) ix[n - kMinN][key(live.data() + i + 1 - n, n)] = (int32_t) (i + 1);
++        done = live.size();
++    }
++    /// Up to kmax tokens that may follow live + x.
++    std::vector<int32_t> draft(const std::vector<int32_t>& live, int32_t x, int kmax) {
++        std::vector<int32_t> out;
++        if (kmax <= 0) return out;
++        index(live);
++        const size_t L = live.size() + 1;
++        auto at = [&](size_t i) { return i < live.size() ? live[i] : x; };
++        for (int n = kMaxN; n >= kMinN && out.empty(); --n) {
++            if (L < (size_t) n) continue;
++            int32_t tail[kMaxN];
++            for (int i = 0; i < n; ++i) tail[i] = at(L - (size_t) n + (size_t) i);
++            const auto it = ix[n - kMinN].find(key(tail, n));
++            if (it == ix[n - kMinN].end()) continue;
++            for (size_t j = (size_t) it->second; j < L && (int) out.size() < kmax; ++j) out.push_back(at(j));
++        }
++        return out;
++    }
++    /// The drafts worth checking: the k that gives the most tokens per millisecond.
++    int choose(int avail) {
++        avail = std::min(avail, max_k);
++        if (avail <= 0) return 0;
++        ++steps;
++        const double a = std::min(0.98, acc / (acc + rej));
++        const double t1 = t_ms[1] > 0 ? t_ms[1] : 1.0;
++        int best = 0;
++        double best_rate = 1.0 / t1;
++        for (int k = 1; k <= avail; ++k) {
++            const double t = t_ms[k + 1] > 0 ? t_ms[k + 1] : t1 * (1.0 + 0.1 * k);   // unmeasured: optimistic, so it is tried
++            const double e = (1.0 - std::pow(a, k + 1)) / (1.0 - a);
++            if (e / t > best_rate) { best_rate = e / t; best = k; }
++        }
++        if (best == 0 && steps % 32 == 0) best = 1;   // keep measuring
++        return best;
++    }
++    void time(int rows, double ms) { t_ms[rows] = t_ms[rows] > 0 ? 0.8 * t_ms[rows] + 0.2 * ms : ms; }
++    void outcome(int accepted, bool rejected) {
++        acc = acc * 0.97 + accepted;
++        rej = rej * 0.97 + (rejected ? 1 : 0);
+     }
+-    return idx[keep - 1];
++};
++
++/// One decode step from x (the last token written, not yet in the state): x and the drafts in one forward, then each
++/// row's token picked as plain decoding would pick it (a draft stands when it is that token; under sampling it stands
++/// with its probability and a turned-down draft is left out of the redraw, which leaves the distribution as it was).
++/// `emit` takes each token in order and says whether to go on. The state keeps x and the drafts that stood; x becomes
++/// the last token emitted. False when emit said stop.
++template <class Emit>
++bool spec_step(Engine* ex, Session* S, std::vector<int32_t>& live, Drafter& dr, int32_t& x, int budget, int room,
++               const Sampling& smp, std::vector<int32_t>& hist, std::mt19937_64& rng, std::vector<float>& buf, Emit&& emit) {
++    std::vector<int32_t> toks{x};
++    const int kmax = std::min({kGemmT - 1, budget - 1, room - 1});
++    std::vector<int32_t> d = dr.draft(live, x, kmax);
++    d.resize((size_t) dr.choose((int) d.size()));
++    toks.insert(toks.end(), d.begin(), d.end());
++    const int T = (int) toks.size(), k = T - 1;
++    const auto t0 = std::chrono::steady_clock::now();
++    ex->S = S;
++    ex->defer_conv = k > 0;
++    ex->forward(toks.data(), T, T);
++    ex->defer_conv = false;
++    int emitted = 0, stood = 0;
++    bool go = true, turned_down = false;
++    for (int i = 0; i < T && go; ++i) {
++        const int dt = i < k ? d[(size_t) i] : -1;
++        int y;
++        if (!smp.needs_logits()) {
++            y = ex->greedy(i);
++        } else {
++            ex->host_logits(buf, i);
++            const Dist dd = dist(buf, smp, hist);
++            double pd = 0;
++            for (size_t j = 0; j < dd.idx.size(); ++j) pd += dd.idx[j] == dt ? dd.p[j] : 0.0;
++            if (dt >= 0 && pd >= 1.0) y = dt;
++            else if (dt >= 0 && pd > 0 && std::uniform_real_distribution<double>(0.0, 1.0)(rng) < pd) y = dt;
++            else y = draw(dd, rng, dt);
++        }
++        hist.push_back(y);
++        ++emitted;
++        go = emit(y);
++        if (y != dt) {
++            turned_down = dt >= 0;
++            break;
++        }
++        ++stood;
++    }
++    if (k > 0) {
++        ex->commit(emitted);
++        dr.outcome(stood, turned_down);
++    }
++    live.push_back(x);
++    for (int i = 0; i + 1 < emitted; ++i) live.push_back(toks[(size_t) i + 1]);
++    x = hist.back();
++    dr.time(T, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
++    return go;
+ }
+ 
+ std::vector<int32_t> parse_ids(const char* s) {
+@@ -2457,6 +2651,7 @@ struct Lane {
+     Session sess;
+     std::unique_ptr<Engine> ex;
+     std::vector<int32_t> live;
++    Drafter dr;
+     std::atomic<bool> busy{false};
+     uint64_t used = 0;
+     std::thread th;
+@@ -2484,6 +2679,7 @@ struct Serve {
+     std::atomic<bool> stop{false};
+     uint64_t clock = 0;
+     std::vector<float> lg;
++    int lookup_max = kGemmT - 1;   // --lookup-max-t
+ 
+     Serve(Engine& b, std::vector<std::unique_ptr<Lane>>&& l) : big(b), lanes(std::move(l)) {
+         slot_lane.resize(lanes.size());
+@@ -2634,21 +2830,27 @@ struct Serve {
+         long long produced = 0;
+         const char* finish = "length";
+         Engine* ex = r.last;
+-        for (;;) {
+-            const int nx = pick_token(ex, q.smp, hist, rng, lg);
+-            say("T %d\n", nx);
++        int32_t nx = pick_token(ex, q.smp, hist, rng, lg);
++        say("T %d\n", nx);
++        ++produced;
++        hist.push_back(nx);
++        auto emit = [&](int y) {
++            say("T %d\n", y);
+             ++produced;
+-            hist.push_back(nx);
+-            if (is_eos(nx)) { finish = "stop"; break; }
+-            if (produced >= q.max_new) break;
+-            if (stop.load()) { finish = "cancel"; break; }
+-            if (L.sess.pos + 1 > big.ctx) break;
+-            const int32_t one = nx;
+-            ex = L.ex.get();
+-            ex->S = &L.sess;
+-            ex->forward(&one, 1, 1);
+-            L.live.push_back(nx);
+-        }
++            if (is_eos(y)) { finish = "stop"; return false; }
++            if (produced >= q.max_new) return false;
++            if (stop.load()) { finish = "cancel"; return false; }
++            return true;
++        };
++        if (is_eos(nx)) finish = "stop";
++        else if (stop.load()) finish = "cancel";
++        else if (produced < q.max_new)
++            while (L.sess.pos + 1 <= big.ctx) {
++                L.dr.max_k = lookup_max;
++                if (!spec_step(L.ex.get(), &L.sess, L.live, L.dr, nx, (int) (q.max_new - produced),
++                               (int) (big.ctx - L.sess.pos), q.smp, hist, rng, lg, emit))
++                    break;
++            }
+         const double dms = ms_since(d0);
+         say("DONE %lld %zu %.1f %.1f %s 0 0 %zu 0 0 0 0 0.0 %lld 0\n", produced, q.ids.size(), r.ms, dms, finish, r.reuse,
+             (long long) r.fresh);
+@@ -2712,20 +2914,22 @@ struct Serve {
+         std::vector<float> buf;
+         Engine* ex = L.ex.get();
+         const char* fin = nullptr;
+-        while (!fin) {
+-            if (slot_stop[(size_t) sl]) { fin = "cancel"; break; }
+-            ex->S = &L.sess;
+-            ex->forward(&x, 1, 1);
+-            L.live.push_back(x);
+-            const int y = pick_token(ex, q.smp, hist, rng, buf);
++        auto emit = [&](int y) {
+             say("BT %d %d\n", sl, y);
+             ++produced;
+-            hist.push_back(y);
+-            fin = is_eos(y) ? "stop" : slot_stop[(size_t) sl] ? "cancel" : produced >= q.max_new ? "length"
+-                  : L.sess.pos + 1 > big.ctx ? "length" : nullptr;
+-            x = y;
++            fin = is_eos(y) ? "stop" : slot_stop[(size_t) sl] ? "cancel" : produced >= q.max_new ? "length" : nullptr;
++            return fin == nullptr;
++        };
++        while (!fin) {
++            if (slot_stop[(size_t) sl]) { fin = "cancel"; break; }
++            if (L.sess.pos + 1 > big.ctx) { fin = "length"; break; }
++            L.dr.max_k = lookup_max;
++            spec_step(ex, &L.sess, L.live, L.dr, x, (int) (q.max_new - produced), (int) (big.ctx - L.sess.pos), q.smp, hist,
++                      rng, buf, emit);
+         }
+         say("BDONE %d %lld %s %.1f\n", sl, produced, fin, ms_since(t0));
++        std::fprintf(stderr, "strata batch: slot %d: %lld generated in %.0f ms (%.1f tok/s) (%s)\n", sl, produced, ms_since(t0),
++                     produced / std::max(1e-9, ms_since(t0) / 1000.0), fin);
+         L.used = ++clock;
+         L.busy = false;
+     }
+@@ -2778,6 +2982,7 @@ struct Serve {
+ 
+ int strata::inkling2::run(int argc, char** argv) {
+     std::string model, tokens, force, dump_full;
++    int lookup_max = kGemmT - 1;
+     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0;
+     bool serve_mode = false, ppl = false, q8_kv = true;
+     int n_lanes = 1, kv_res = 0, ppl_from = 0;
+@@ -2793,6 +2998,8 @@ int strata::inkling2::run(int argc, char** argv) {
+         else if (a == "--greedy") {}
+         else if (a == "--serve") serve_mode = true;
+         else if (a == "--ppl") ppl = true;
++        else if (a == "--lookup-max-t")   // the most tokens a step drafts from the conversation (verified; 0: none)
++            lookup_max = std::max(0, std::min(kGemmT - 1, std::atoi(next().c_str())));
+         else if (a == "--ppl-from") { ppl = true; ppl_from = std::atoi(next().c_str()); }   // read N as a prompt, score the rest
+         else if (a == "--batch" || a == "--slots") n_lanes = std::max(1, std::min(kMaxLanes, std::atoi(next().c_str())));
+         else if (a == "--kv") q8_kv = next() != "fp16";   // the full-attention caches: int8 (default) or fp16
+@@ -2889,6 +3096,7 @@ int strata::inkling2::run(int argc, char** argv) {
+         }
+         if (n_lanes > 1) std::fprintf(stderr, "strata-inkling2: %d lanes, each its own session and decode thread\n", n_lanes);
+         Serve sv(E, std::move(lanes));
++        sv.lookup_max = lookup_max;
+         return sv.run();
+     }
+     Session s0;
+@@ -2957,6 +3165,28 @@ int strata::inkling2::run(int argc, char** argv) {
+     E.sync_all();
+     const double pp_ms = ms_since(t0);
+     const auto t1 = Clock::now();
++    if (forced.empty() && !ff && n_gen > 1) {   // plain generation: through the verify step, as the server runs it
++        std::vector<int32_t> live(prompt.begin(), prompt.end() - 1), hist;
++        Drafter dr;
++        dr.max_k = lookup_max;
++        Sampling greedy_smp;
++        std::mt19937_64 rng(0);
++        int32_t x = E.greedy();
++        gen.push_back(x);
++        live.push_back(prompt.back());
++        int steps = 0;
++        while ((int) gen.size() < n_gen && E.S->pos + 1 <= ctx) {
++            ++steps;
++            spec_step(&E, E.S, live, dr, x, n_gen - (int) gen.size(), (int) (ctx - E.S->pos), greedy_smp, hist, rng, lg,
++                      [&](int y) { gen.push_back(y); return (int) gen.size() < n_gen; });
++        }
++        std::fprintf(stderr, "strata-inkling2: %zu tokens in %d forwards (%.2f a forward), drafted-token acceptance %.0f%%, "
++                     "step ms by rows:", gen.size() - 1, steps, (double) (gen.size() - 1) / std::max(1, steps),
++                     100.0 * dr.acc / (dr.acc + dr.rej));
++        for (int r = 1; r <= kGemmT; ++r) std::fprintf(stderr, " %d:%.1f", r, dr.t_ms[r]);
++        std::fprintf(stderr, "\n");
++        n_gen = 0;
++    }
+     for (int i = 0; i < n_gen; ++i) {
+         const int a = E.greedy();
+         gen.push_back(a);
+-- 
+2.56.1
+
