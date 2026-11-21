@@ -193,7 +193,7 @@ class Launcher:
     def run(self) -> None:
         paths = ModelPaths.from_settings(self.settings)
         model, mmproj = self.model_files(paths)
-        if gguf_architecture(model) == "inkling2":
+        if gguf_architecture(model) in ("inkling2", "inkling2_loop"):
             # Inkling 2 runs without Qwen's MTP layer, DFlash2 and picture reader
             for name, on in (("DRAFTER", paths.mtp is not None or self.settings.drafter != Drafter.OFF),
                              ("VISION", mmproj is not None or self.settings.vision_on)):

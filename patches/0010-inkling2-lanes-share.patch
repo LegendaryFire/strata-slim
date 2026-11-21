@@ -1,0 +1,1100 @@
+From b8c6c4b969aba02b119d0d4fb6ef1f5c6305b661 Mon Sep 17 00:00:00 2001
+From: LegendaryFire <tristan.balon@outlook.com>
+Date: Sat, 21 Nov 2026 03:29:46 -0700
+Subject: [PATCH] Keep Inkling 2's lanes out of each other's way
+
+A lane decoding while the other read a long prompt slowed to ~2.6
+tok/s: the pool's adapt round took its lock alone every 4 steps and
+waited for the prompt chunk holding it shared (seconds deep in a long
+prompt), and the decode kernels queued behind the chunk's. Now the
+round only runs when it gets the lock at once, and a lane's streams
+are at the highest priority, the prompt executors' at the lowest:
+decoding beside a 36K-token prompt read keeps half its speed (18 vs
+36.8 tok/s; the prompt reads at 1517 tok/s meanwhile).
+
+A client that sent a conversation again while its answer was still
+being written had it read from the start on the other lane. Now a lane
+keeps a snapshot at the end of each prompt it reads (each visit's conv
+history and the last row's logits, a few MB), and a request whose
+tokens start with a busy lane's snapshot copies that lane's state
+instead: the cache cells from the RAM copy, the sliding-window rings
+(while the busy lane has written fewer tokens since than they hold
+past the window), the snapshot. A 15K-token conversation sent again
+answered after 0.3 s instead of 10.7 (the copy 34 ms), the same text.
+
+The second prompt executor (0009) is made after the lanes, their
+sessions and snapshot buffers, so they always fit: it ran the cards
+out of VRAM at start with two 512K sessions. It takes its ~1 GiB a
+card from the coldest experts (about 44 at 2x512K), each card left at
+the pool's reserve (--vram-reserve-mib) after it.
+
+A lane taking another conversation threw away the one it held, and a
+client's next turn matched what a lane held only up to the end of its
+last prompt (the answer it sends back is rendered again, not the tokens
+the model wrote, thinking and all), so most turns were read from the
+start. Now a lane's snapshot at the end of each prompt also keeps its
+sliding-window rings in pinned RAM: a turn that matches the last
+prompt but not the answer rewinds the lane to it (the rings and conv
+histories back, the VRAM window refilled from the RAM copy). A lane
+taking another conversation parks the one it held in RAM
+(--conversation-cache-mib, -slots, -min-tokens: its snapshot's cells,
+rings and conv histories, oldest used out first), and a request that
+continues a parked conversation has it copied back: three 9.5K-token
+conversations on two lanes, the first back after 0.3 s (restored in
+68 ms, 9 tokens read) instead of 5.7.
+
+The Monitor and About tabs showed no experts in VRAM: the engine now
+prints the INFO line the server reads (context, kv, the largest lane
+window as kv_resident, expert_slots, experts, expert_cache_mib, the
+conversation cache's settings) at start and before each DONE / BDONE,
+as the pool moves experts. The park and restore lines use the
+"conversation cache: ... parked=P bytes=B" form the Monitor's card
+reads. --lookup-max-t reaches the lanes again.
+
+A request matched a lane only when all the lane held started it, so
+one that shared most of a conversation but not its end (a side request
+with the same history, an edited last message) was read from token 0.
+Now a prompt read keeps checkpoints (every 8K tokens to 64K, 16K
+beyond, and at each prompt's end): each sliding-window visit's last
+swa cells and each visit's conv history, ~170 MB, copied as each visit
+of the chunk ends; the tiered caches' cells are in the RAM copy. A
+request continues from the longest checkpoint that starts it, in any
+lane or parked conversation (which keeps its checkpoints), and reads
+the rest: the same state as reading it all. Restoring a parked
+conversation no longer lets parking the lane's own drop it first.
+---
+ vendor/src/inkling2/ink_engine.cu | 755 +++++++++++++++++++++++++++++-
+ 1 file changed, 737 insertions(+), 18 deletions(-)
+
+diff --git a/vendor/src/inkling2/ink_engine.cu b/vendor/src/inkling2/ink_engine.cu
+index 5fdd1e9..97802e3 100644
+--- a/vendor/src/inkling2/ink_engine.cu
++++ b/vendor/src/inkling2/ink_engine.cu
+@@ -70,6 +70,7 @@ constexpr int kAttTileT = 16;     // from this many rows attention is the tiled
+ constexpr size_t kSplitFloats = (size_t) 4 << 20;   // the f32 products' split-K partials
+ constexpr int kMaxLanes = 8;
+ constexpr int kStage = 16384;     // cells of a RAM part staged in VRAM at a time
++int g_cc_mib = 8192, g_cc_slots = 4, g_cc_min = 2048;   // --conversation-cache-mib / -slots / -min-tokens
+ int g_prefill_pipe = -1;      // --prefill-pipe 0|1: prompt chunks on two executors at once (-1: with 2+ cards)
+ int g_reserve_mib = -1;       // --vram-reserve-mib: VRAM the pool leaves free on each card
+ int g_experts_vram = -1;      // --experts-vram N: each layer keeps N experts in VRAM (-1: all), the rest in RAM
+@@ -2051,6 +2052,28 @@ struct Session {
+     int win = 0;   // the cells of each tiered full-attention cache in VRAM (the pool grows and shrinks it)
+ };
+ 
++/// A conversation's state at `pos` besides its tiered caches' cells (which a lane's RAM copy or a parked conversation
++/// holds): each sliding-window visit's last swa cells (K then V, [HKV][swa][kHD] FP16, oldest first) and each visit's
++/// conv history, in pinned RAM. With the cells [0, pos) it is the whole state, so a request that starts with `ids`
++/// continues from it. Immutable once taken; lanes and parked conversations share them.
++struct Ckpt {
++    int64_t pos = 0;
++    std::vector<int32_t> ids;     // the tokens [0, pos)
++    std::vector<uint8_t*> swa;    // [visit], nullptr for a full-attention one
++    std::vector<float*> conv;     // [visit]
++    size_t swa_bytes = 0, conv_bytes = 0;
++    size_t bytes() const {
++        size_t b = ids.size() * 4;
++        for (auto* p : swa) b += p ? swa_bytes : 0;
++        return b + conv.size() * conv_bytes;
++    }
++    ~Ckpt() {
++        for (auto* p : swa) if (p) cudaFreeHost(p);
++        for (auto* p : conv) if (p) cudaFreeHost(p);
++    }
++};
++using CkptP = std::shared_ptr<Ckpt>;
++
+ struct Value {
+     Engine* E = nullptr;
+     int slot[kMaxDev];
+@@ -2113,6 +2136,7 @@ struct Engine {
+     Dev dev[kMaxDev];
+     int nd = 0;
+     bool q8_kv = true;
++    Ckpt* ck_out = nullptr;   // a prompt chunk's forward copies each visit's state into it, as the visit ends
+     int kv_resident = 0;              // > 0: a full-attention visit keeps its last kv_resident cells in VRAM, all in RAM;
+                                       // < 0: the pool sizes each session's window (--kv-resident auto)
+     /// A decode's read of a RAM part on CPU threads, one record a (visit, row group): the job the host function runs,
+@@ -2126,6 +2150,7 @@ struct Engine {
+     };
+     std::vector<CpuRec> cpu_rec;
+     bool experts_in_ram = false;   // some layer keeps experts in RAM: the CPU's and the staged paths
++    bool decode_first = false;     // a lane's executor: its streams at the highest priority
+     bool count_routes = false;     // the pool reads each layer's routings
+     struct MoeRec {
+         CpuMoeJob job;
+@@ -2214,7 +2239,10 @@ struct Engine {
+             Dev& D = dev[(size_t) d];
+             D.id = m->dev_ids[(size_t) d];
+             CK(cudaSetDevice(D.id));
+-            CK(cudaStreamCreateWithFlags(&D.st, cudaStreamNonBlocking));
++            int lo_pr = 0, hi_pr = 0;   // decode (a lane) before prompt chunks on the same card
++            CK(cudaDeviceGetStreamPriorityRange(&lo_pr, &hi_pr));
++            const int pr = decode_first ? hi_pr : lo_pr;
++            CK(cudaStreamCreateWithPriority(&D.st, cudaStreamNonBlocking, pr));
+             {
+                 size_t vis = 0;
+                 for (int il = 0; il < hp.n_vis; ++il) vis += m->layers[(size_t) hp.phys(il)].dev == d;
+@@ -2287,8 +2315,8 @@ struct Engine {
+                 D.run_m = dalloc(T * H);
+                 D.run_l = dalloc(T * H);
+             }
+-            CK(cudaStreamCreateWithFlags(&D.cs, cudaStreamNonBlocking));
+-            CK(cudaStreamCreateWithFlags(&D.hs, cudaStreamNonBlocking));
++            CK(cudaStreamCreateWithPriority(&D.cs, cudaStreamNonBlocking, pr));
++            CK(cudaStreamCreateWithPriority(&D.hs, cudaStreamNonBlocking, pr));
+             CK(cudaEventCreateWithFlags(&D.evq, cudaEventDisableTiming));
+             CK(cudaEventCreateWithFlags(&D.evcpu, cudaEventDisableTiming));
+             if (experts_in_ram) {
+@@ -2425,11 +2453,11 @@ struct Engine {
+     int min_window() const { return std::min(ctx, std::max(tmax, 4096) + 1024); }
+     /// Each tiered cache's VRAM ring rebuilt at w cells from the RAM copy (the old ring freed first: the copy has every
+     /// cell). The session's executors are idle (the pool holds its lock).
+-    void set_window(Session& ss, int w) const {
++    void set_window(Session& ss, int w, bool refill = false) const {
+         const HP& hp = m->hp;
+         const size_t HKV = (size_t) hp.n_kv;
+         w = std::max(min_window(), std::min(w, ctx));
+-        if (w == ss.win || ss.win == 0) return;
++        if ((w == ss.win && !refill) || ss.win == 0) return;
+         const int64_t pos = ss.pos, p0 = std::max<int64_t>(0, pos - w);
+         for (int il = 0; il < hp.n_vis; ++il) {
+             Kv& c = ss.kv[(size_t) il];
+@@ -2975,6 +3003,7 @@ struct Engine {
+             run_conv(*D, D->moe, cst + (size_t) (2 * KD + N) * 3, L.f_conv, nullptr, 1, fp, N, T, s_st);
+             k_add<<<grid1((int64_t) T * N), kThreads, 0, D->st>>>(fp, fp, at(ffn_inp, d), (int64_t) T * N);
+             cur = fo;
++            if (ck_out) ckpt_visit(*D, *ck_out, il, L.swa, pos0 + T);
+             if (piped && pipe_self) {
+                 CK(cudaEventRecord(pipe_self->ev[(size_t) il], D->st));
+                 pipe_self->done[(size_t) il].store(pipe_chunk, std::memory_order_release);
+@@ -3009,6 +3038,25 @@ struct Engine {
+         n_logit_rows = logit_rows;
+     }
+     int n_logit_rows = 0;
++    /// Visit il's state at position `end` into checkpoint k, on the visit's stream (before a later chunk changes it).
++    void ckpt_visit(Dev& D, Ckpt& k, int il, bool swa, int64_t end) {
++        const Kv& c = S->kv[(size_t) il];
++        CK(cudaMemcpyAsync(k.conv[(size_t) il], S->conv[(size_t) il], k.conv_bytes, cudaMemcpyDeviceToHost, D.st));
++        if (!swa || !k.swa[(size_t) il]) return;
++        const int64_t keep = m->hp.swa, cnt = std::min<int64_t>(end, keep), st0 = end - cnt;
++        const size_t HKV = (size_t) m->hp.n_kv, row = (size_t) kHD * 2;
++        uint8_t* kd = k.swa[(size_t) il];
++        uint8_t* vd = kd + HKV * (size_t) keep * row;
++        for (int64_t a = st0; a < end;) {   // cells a .. b - 1 are contiguous in the ring
++            const int64_t b = std::min<int64_t>(end, (a / c.ring + 1) * c.ring), n = b - a;
++            const size_t so = (size_t) (a % c.ring) * row, dofs = (size_t) (a - st0) * row;
++            CK(cudaMemcpy2DAsync(kd + dofs, (size_t) keep * row, (const uint8_t*) c.k + so, (size_t) c.cells * row, (size_t) n * row,
++                                 HKV, cudaMemcpyDeviceToHost, D.st));
++            CK(cudaMemcpy2DAsync(vd + dofs, (size_t) keep * row, (const uint8_t*) c.v + so, (size_t) c.cells * row, (size_t) n * row,
++                                 HKV, cudaMemcpyDeviceToHost, D.st));
++            a = b;
++        }
++    }
+ 
+     int64_t process(const int32_t* ids, int64_t n, const std::function<bool(int64_t)>& progress) {
+         int64_t done = 0;
+@@ -3121,6 +3169,10 @@ struct Drafter {
+         for (int i = 0; i < n; ++i) h = (h ^ (uint32_t) t[i]) * 0x100000001B3ull + (h >> 29);
+         return h;
+     }
++    void reindex() {   // the lane holds another conversation now
++        for (auto& m : ix) m.clear();
++        done = 0;
++    }
+     void index(const std::vector<int32_t>& live) {
+         if (live.size() < done) {   // the state was reset or cut: index it again
+             for (auto& m : ix) m.clear();
+@@ -3441,7 +3493,8 @@ struct Pool {
+     /// the other is copied into its slot in the background (the CPU computes it until the copy is done).
+     void tick() {
+         if (!on || ++ticks % adapt_every) return;
+-        std::unique_lock<std::shared_mutex> lk(mu);
++        std::unique_lock<std::shared_mutex> lk(mu, std::try_to_lock);   // never waits: a prompt chunk holds it for seconds
++        if (!lk.owns_lock()) return;
+         refresh();
+         publish(false);
+         for (int d = 0; d < m->n_dev; ++d) {
+@@ -3488,6 +3541,12 @@ struct Pool {
+ /// with two executors, chunk c on executor c % 2, each on a thread of its own, so the next chunk runs on one card while
+ /// this one runs on the other (Engine::PipeSide). Returns the rows read (fewer when `stop` said so) and the executor that
+ /// ran the last chunk.
++/// Which chunk ends of a prompt read keep a checkpoint, and where they go (in order, only chunks the read kept).
++struct CkPolicy {
++    std::function<bool(int64_t)> want;   // the chunk's end position
++    std::function<CkptP()> make;
++    std::vector<CkptP> got;
++};
+ struct Prompt {
+     Engine* ex[2] = {};
+     Pool* pool = nullptr;
+@@ -3507,7 +3566,7 @@ struct Prompt {
+     }
+     /// The chunks of rows [0, n) (all but a tail of at most kGemmT rows when `leave_tail`).
+     int64_t read(Session& s, const int32_t* ids, int64_t n, bool leave_tail, Engine*& last,
+-                 const std::function<bool(int64_t)>& progress) {
++                 const std::function<bool(int64_t)>& progress, CkPolicy* ckp = nullptr) {
+         std::vector<std::pair<int64_t, int>> ch;   // (first row, rows)
+         for (int64_t o = 0; n - o > (leave_tail ? kGemmT : 0);) {
+             const int T = (int) std::min<int64_t>(ex[0]->tmax, n - o);
+@@ -3520,12 +3579,19 @@ struct Prompt {
+             int64_t got = 0;
+             for (const auto& [o, T] : ch) {
+                 pool->before(s, s.pos + T, false);
++                CkptP ck = ckp && ckp->want(pos0 + o + T) ? ckp->make() : nullptr;
+                 {
+                     std::shared_lock<std::shared_mutex> lk(pool->mu);
+                     ex[0]->S = &s;
++                    ex[0]->ck_out = ck.get();
+                     ex[0]->forward(ids + o, T, o + T == ch.back().first + ch.back().second ? 1 : 0);
++                    ex[0]->ck_out = nullptr;
+                     ex[0]->sync_all();
+                 }
++                if (ck) {
++                    ck->pos = pos0 + o + T;
++                    ckp->got.push_back(ck);
++                }
+                 got = o + T;
+                 last = ex[0];
+                 if (!progress(got)) break;
+@@ -3538,6 +3604,10 @@ struct Prompt {
+         std::mutex mu;
+         std::condition_variable cv;
+         std::vector<char> done(ch.size(), 0);
++        std::vector<CkptP> cks(ch.size());
++        if (ckp)   // made here: make() is not thread-safe
++            for (size_t c = 0; c < ch.size(); ++c)
++                if (ckp->want(pos0 + ch[c].first + ch[c].second)) cks[c] = ckp->make();
+         std::atomic<bool> halt{false};
+         auto run = [&](int w) {
+             Engine& e = *ex[w];
+@@ -3549,9 +3619,12 @@ struct Prompt {
+                     e.S = &s;
+                     e.pipe_chunk = (int64_t) c;
+                     e.pipe_pos = pos0 + o;
++                    e.ck_out = cks[c].get();
+                     e.forward(ids + o, T, c + 1 == ch.size() ? 1 : 0);
++                    e.ck_out = nullptr;
+                     e.sync_all();
+                 }
++                if (cks[c]) cks[c]->pos = pos0 + o + T;
+                 std::lock_guard<std::mutex> g(mu);
+                 done[c] = 1;
+                 cv.notify_all();
+@@ -3585,11 +3658,64 @@ struct Prompt {
+             ++next;
+         }
+         for (Engine* e : ex) e->pipe_chunk = -1;
++        if (ckp)
++            for (size_t c = 0; c < next; ++c)
++                if (cks[c]) ckp->got.push_back(cks[c]);
+         s.pos = pos0 + got;
+         return got;
+     }
+ };
+ 
++/// Conversations parked in RAM (--conversation-cache-mib / -slots / -min-tokens): a lane about to take another
++/// conversation parks the one it holds, and a request that continues a parked one has it copied back into a lane
++/// instead of reading it again. A parked state: its tokens, each tiered cache's cells (from the lane's RAM copy), each
++/// other cache (the sliding-window rings, from VRAM) and each visit's conv history. Oldest used out first.
++struct Parked {
++    std::vector<int32_t> ids;
++    int64_t pos = 0;
++    std::vector<std::vector<uint8_t>> cells;   // [visit]: K, V, K scales, V scales of its cells
++    std::vector<std::vector<float>> conv;
++    std::vector<CkptP> ck;   // its checkpoints (positions <= pos)
++    uint64_t bytes = 0, used = 0;
++};
++struct ConvCache {
++    std::vector<std::unique_ptr<Parked>> list;
++    uint64_t bytes = 0, clock = 0, evictions = 0;
++    uint64_t budget() const { return (uint64_t) g_cc_mib << 20; }
++    /// The parked conversation that starts `ids` and is longest (a proper prefix: a request has a token to read).
++    Parked* best(const std::vector<int32_t>& ids, size_t than) {
++        Parked* b = nullptr;
++        for (auto& p : list)
++            if (p->ids.size() > than && p->ids.size() < ids.size() && (!b || p->ids.size() > b->ids.size()) &&
++                std::equal(p->ids.begin(), p->ids.end(), ids.begin()))
++                b = p.get();
++        return b;
++    }
++    /// P out of the list (so parking another conversation cannot drop it while it is copied from), and back.
++    std::unique_ptr<Parked> take(Parked* P) {
++        for (size_t i = 0; i < list.size(); ++i)
++            if (list[i].get() == P) {
++                std::unique_ptr<Parked> u = std::move(list[i]);
++                list.erase(list.begin() + (long) i);
++                bytes -= u->bytes;
++                return u;
++            }
++        return nullptr;
++    }
++    void put(std::unique_ptr<Parked> u) {
++        bytes += u->bytes;
++        list.push_back(std::move(u));
++    }
++    void drop_oldest() {
++        ++evictions;
++        size_t o = 0;
++        for (size_t i = 1; i < list.size(); ++i)
++            if (list[i]->used < list[o]->used) o = i;
++        bytes -= list[o]->bytes;
++        list.erase(list.begin() + (long) o);
++    }
++};
++
+ /// A conversation's lane: its session, its decode executor, the tokens its state holds, its decode thread.
+ struct Lane {
+     Session sess;
+@@ -3599,6 +3725,13 @@ struct Lane {
+     std::atomic<bool> busy{false};
+     uint64_t used = 0;
+     std::thread th;
++    // The state at the end of the lane's last prompt, for another lane to start from while this one decodes (a client
++    // that sends a conversation again before its answer is done): its tokens, each visit's conv history, the logits.
++    std::vector<int32_t> snap_ids;
++    std::vector<float*> snap_conv;
++    std::vector<uint8_t*> snap_ring;   // [visit]: a cache that lives in VRAM only (a sliding-window ring), in pinned RAM
++    float* snap_logits = nullptr;
++    std::vector<CkptP> ck;   // checkpoints of what it holds (positions <= sess.pos, ascending), its RAM copy their cells
+ };
+ 
+ struct Request {
+@@ -3615,6 +3748,7 @@ struct Serve {
+     Engine& big;
+     Pool* pool = nullptr;
+     Prompt* prompt = nullptr;
++    ConvCache cc;
+     std::vector<std::unique_ptr<Lane>> lanes;
+     std::vector<int> slot_lane;
+     std::unique_ptr<std::atomic<bool>[]> slot_stop;
+@@ -3694,7 +3828,13 @@ struct Serve {
+         for (int i = 0; i < (int) lanes.size(); ++i) {
+             const Lane& L = *lanes[(size_t) i];
+             if (L.busy) continue;
+-            const size_t l = match(L, ids);
++            size_t l = reach(L, ids);
++            for (auto it = L.ck.rbegin(); it != L.ck.rend(); ++it)
++                if ((size_t) (*it)->pos > l && (size_t) (*it)->pos < ids.size() &&
++                    std::equal((*it)->ids.begin(), (*it)->ids.end(), ids.begin())) {
++                    l = (size_t) (*it)->pos;
++                    break;
++                }
+             if (l > bl) { bl = l; best = i; }
+             if (L.live.empty() && empty < 0) empty = i;
+             if (lru < 0 || L.used < lanes[(size_t) lru]->used) lru = i;
+@@ -3713,15 +3853,24 @@ struct Serve {
+     };
+     /// The request's prompt into lane L: the part its state does not hold, in prompt chunks on the shared executor
+     /// (the last few rows on the lane's own).
+-    Read read(Lane& L, const std::vector<int32_t>& ids) {
++    Read read(Lane& L, const std::vector<int32_t>& ids, int64_t forked = -1) {
+         Read r;
+-        r.reuse = match(L, ids);
++        r.reuse = forked >= 0 ? (size_t) forked : match(L, ids);
+         L.ex->S = &L.sess;
++        if (forked >= 0 && r.reuse == ids.size()) r.last = L.ex.get();   // nothing new: the fork brought the logits
+         if (r.reuse == 0) {
++            park(L);
+             L.ex->reset();
+             L.live.clear();
++            L.ck.clear();
+             pool->shrink(L.sess);
+         }
++        ck_trim(L.ck, (int64_t) r.reuse);
++        const bool cks = ck_ok();
++        const int64_t end_pos = (int64_t) ids.size(), rows = prompt->ex[0]->tmax;
++        CkPolicy pol;
++        pol.want = [&](int64_t e) { return e + 2048 < end_pos && ck_due(e - rows, e); };
++        pol.make = [&] { return make_ckpt(); };
+         L.used = ++clock;
+         const auto t0 = Clock::now();
+         r.fresh = (int64_t) (ids.size() - r.reuse);
+@@ -3731,7 +3880,7 @@ struct Serve {
+                 (double) got / std::max(1e-9, ms_since(t0) / 1000.0));
+             return !stop.load() || got >= r.fresh;
+         };
+-        r.got = prompt->read(L.sess, src, r.fresh, true, r.last, report);   // the whole chunks (two cards at once)
++        r.got = prompt->read(L.sess, src, r.fresh, true, r.last, report, cks ? &pol : nullptr);   // the whole chunks (two cards at once)
+         if (r.got < r.fresh && stop.load() && r.got > 0) r.cancelled = true;
+         while (!r.cancelled && r.got < r.fresh) {   // the last few rows on the lane's own executor
+             const int T = (int) std::min<int64_t>(L.ex->tmax, r.fresh - r.got);
+@@ -3750,9 +3899,493 @@ struct Serve {
+             }
+         }
+         L.live.insert(L.live.end(), src, src + r.got);
++        for (auto& k : pol.got)
++            if (k->pos <= L.sess.pos) ck_add(L, k);
++        if (cks && !r.cancelled && r.got == r.fresh && r.fresh >= 256) ck_add(L, ckpt_now(L));   // the prompt's end
++        // a prompt read keeps a snapshot; a slot taking over its own conversation (a few rows) keeps the one it has
++        if (!r.cancelled && r.got == r.fresh && r.last && (forked >= 0 || r.reuse == 0 || r.fresh >= 256 || L.snap_ids.empty()))
++            snapshot(L, *r.last);
+         r.ms = ms_since(t0);
+         return r;
+     }
++    /// A VRAM-only cache's bytes (rings whole; a tiered cache has its RAM copy instead).
++    size_t ring_bytes(const Lane& L, int il) const {
++        const Kv& c = L.sess.kv[(size_t) il];
++        const bool q8 = L.sess.kv_q8[(size_t) il] != 0;
++        return (size_t) big.m->hp.n_kv * (size_t) c.cells * (q8 ? kHD * 2 + 8 : kHD * 4);
++    }
++    void ring_copy(const Lane& L, int il, uint8_t* host, bool to_host) const {   // K, V (and scales) of a VRAM-only cache
++        const Kv& c = L.sess.kv[(size_t) il];
++        const bool q8 = L.sess.kv_q8[(size_t) il] != 0;
++        const size_t n = (size_t) big.m->hp.n_kv * (size_t) c.cells, eb = q8 ? 1 : 2;
++        const cudaMemcpyKind kd = to_host ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice;
++        auto cp = [&](void* dev, size_t b) {
++            CK(to_host ? cudaMemcpy(host, dev, b, kd) : cudaMemcpy(dev, host, b, kd));
++            host += b;
++        };
++        cp(c.k, n * kHD * eb);
++        cp(c.v, n * kHD * eb);
++        if (q8) {
++            cp(c.ks, n * 4);
++            cp(c.vs, n * 4);
++        }
++    }
++    /// Lane L back to its snapshot (the end of its last prompt): the rings and conv histories copied back, the VRAM window
++    /// refilled from the RAM copy (the cells past it are rewritten before they are read). Needs tiered caches.
++    int64_t rewind(Lane& L) {
++        const HP& hp = big.m->hp;
++        const int64_t n = (int64_t) L.snap_ids.size();
++        const size_t cb = (size_t) big.conv_c * 3 * 4;
++        const auto t0 = Clock::now();
++        std::unique_lock<std::shared_mutex> lk(pool->mu);
++        for (int il = 0; il < hp.n_vis; ++il) {
++            CK(cudaSetDevice(big.m->dev_ids[(size_t) big.m->layers[(size_t) hp.phys(il)].dev]));
++            if (!L.sess.kv[(size_t) il].hk) ring_copy(L, il, L.snap_ring[(size_t) il], false);
++            CK(cudaMemcpy(L.sess.conv[(size_t) il], L.snap_conv[(size_t) il], cb, cudaMemcpyDeviceToDevice));
++        }
++        L.sess.pos = n;
++        if (L.sess.win > 0) big.set_window(L.sess, L.sess.win, true);
++        L.live = L.snap_ids;
++        ck_trim(L.ck, n);
++        L.dr.reindex();
++        std::fprintf(stderr, "strata serve: lane back to the end of its last prompt (%lld tokens, %.0f ms)\n", (long long) n, ms_since(t0));
++        return n;
++    }
++    bool tiered(const Lane& L) const {
++        for (const Kv& c : L.sess.kv)
++            if (c.ring == 0 && !c.hk) return false;   // a whole cache in VRAM only: no RAM copy to rewind from
++        return true;
++    }
++    /// How much of `ids` lane L can start from: what it holds, or its snapshot.
++    size_t reach(const Lane& L, const std::vector<int32_t>& ids) const {
++        const size_t m = match(L, ids);
++        const size_t s = L.snap_ids.size();
++        if (s > m && s < ids.size() && !L.snap_ring.empty() && tiered(L) && std::equal(L.snap_ids.begin(), L.snap_ids.end(), ids.begin()))
++            return s;
++        return m;
++    }
++    // ---- checkpoints: a request that shares a long start with any lane or parked conversation continues from the last
++    // checkpoint inside the shared part (exact: the same cells and states as reading it), whatever comes after differs.
++    bool ck_ok() const {
++        for (int il = 0; il < big.m->hp.n_vis; ++il) {
++            const Layer& Ly = big.m->layers[(size_t) big.m->hp.phys(il)];
++            if (Ly.swa && lanes[0]->sess.kv_q8[(size_t) il]) return false;   // the copies are FP16 rings
++        }
++        return tiered(*lanes[0]);
++    }
++    CkptP make_ckpt() const {
++        const HP& hp = big.m->hp;
++        auto k = std::make_shared<Ckpt>();
++        k->swa_bytes = (size_t) 2 * hp.n_kv * hp.swa * kHD * 2;
++        k->conv_bytes = (size_t) big.conv_c * 3 * 4;
++        k->swa.assign((size_t) hp.n_vis, nullptr);
++        k->conv.assign((size_t) hp.n_vis, nullptr);
++        for (int il = 0; il < hp.n_vis; ++il) {
++            if (big.m->layers[(size_t) hp.phys(il)].swa) CK(cudaHostAlloc((void**) &k->swa[(size_t) il], k->swa_bytes, cudaHostAllocPortable));
++            CK(cudaHostAlloc((void**) &k->conv[(size_t) il], k->conv_bytes, cudaHostAllocPortable));
++        }
++        return k;
++    }
++    /// Spacing: 8K tokens to 64K, 16K beyond (a 188K prompt: 16 of ~170 MB).
++    static bool ck_due(int64_t a, int64_t b) {   // a chunk [a, b) crosses a checkpoint line
++        auto line = [](int64_t x) { return x <= 65536 ? x / 8192 : 8 + (x - 65536) / 16384; };
++        return line(b) > line(a);
++    }
++    /// L's state now as a checkpoint (its executors idle).
++    CkptP ckpt_now(Lane& L) {
++        CkptP k = make_ckpt();
++        L.ex->S = &L.sess;
++        L.ex->sync_all();
++        for (int il = 0; il < big.m->hp.n_vis; ++il) {
++            const Layer& Ly = big.m->layers[(size_t) big.m->hp.phys(il)];
++            Dev& D = L.ex->dev[(size_t) Ly.dev];
++            CK(cudaSetDevice(D.id));
++            L.ex->ckpt_visit(D, *k, il, Ly.swa, L.sess.pos);
++        }
++        L.ex->sync_all();
++        k->pos = L.sess.pos;
++        return k;
++    }
++    void ck_add(Lane& L, CkptP k) {
++        if (!L.ck.empty() && L.ck.back()->pos >= k->pos) return;
++        k->ids.assign(L.live.begin(), L.live.begin() + k->pos);
++        L.ck.push_back(std::move(k));
++        constexpr size_t kMax = 40;   // past it every other one of the older half goes
++        if (L.ck.size() > kMax) {
++            std::vector<CkptP> kept;
++            for (size_t i = 0; i < L.ck.size(); ++i)
++                if (i >= L.ck.size() / 2 || i % 2 == 0) kept.push_back(L.ck[i]);
++            L.ck.swap(kept);
++        }
++    }
++    static void ck_trim(std::vector<CkptP>& v, int64_t upto) {
++        while (!v.empty() && v.back()->pos > upto) v.pop_back();
++    }
++    struct CkPick {
++        CkptP k;
++        int lane = -1;
++        Parked* P = nullptr;
++    };
++    /// The longest checkpoint whose tokens start `ids` (with a token after it to read): a lane's or a parked one's.
++    CkPick best_ck(const std::vector<int32_t>& ids) {
++        CkPick b;
++        auto look = [&](const std::vector<CkptP>& v, int lane, Parked* P) {
++            for (auto it = v.rbegin(); it != v.rend(); ++it) {
++                const Ckpt& k = **it;
++                if ((size_t) k.pos >= ids.size() || (b.k && k.pos <= b.k->pos)) continue;
++                if (std::equal(k.ids.begin(), k.ids.end(), ids.begin())) {
++                    b.k = *it;
++                    b.lane = lane;
++                    b.P = P;
++                    return;
++                }
++            }
++        };
++        for (int i = 0; i < (int) lanes.size(); ++i) look(lanes[(size_t) i]->ck, i, nullptr);
++        for (auto& P : cc.list) look(P->ck, -1, P.get());
++        return b;
++    }
++    /// Lane li continues from checkpoint c: the cells [0, pos) from where they are (its own RAM copy, another lane's,
++    /// a parked conversation's), the rings' last cells and the conv histories from the checkpoint.
++    int64_t resume_ck(int li, const CkPick& c) {
++        Lane& D = *lanes[(size_t) li];
++        const Ckpt& k = *c.k;
++        const int64_t n = k.pos;
++        std::vector<CkptP> keep = c.P ? c.P->ck : lanes[(size_t) c.lane]->ck;
++        ck_trim(keep, n);
++        std::unique_ptr<Parked> held = c.P ? cc.take(c.P) : nullptr;
++        if (c.lane != li) park(D);
++        if (held) {
++            held->used = ++cc.clock;
++            cc.put(std::move(held));
++        }
++        std::unique_lock<std::shared_mutex> lk(pool->mu);   // a busy source lane between two steps from here on
++        const auto t0 = Clock::now();
++        const HP& hp = big.m->hp;
++        const size_t HKV = (size_t) hp.n_kv, row = (size_t) kHD * 2;
++        std::vector<std::thread> th;
++        for (int il = 0; il < hp.n_vis; ++il) {
++            Kv& dk = D.sess.kv[(size_t) il];
++            if (!dk.hk || c.lane == li) continue;
++            th.emplace_back([&, il] {   // the RAM cells, a thread a visit
++                Kv& dk2 = D.sess.kv[(size_t) il];
++                for (size_t kh = 0; kh < HKV; ++kh) {
++                    const size_t o = kh * (size_t) dk2.hcells;
++                    if (c.P) {   // a parked conversation's cells: [kh][K n0][V n0][Ks n0][Vs n0]
++                        const size_t n0 = (size_t) c.P->pos;
++                        const uint8_t* r = c.P->cells[(size_t) il].data() + kh * n0 * (kHD * 2 + 8);
++                        std::memcpy(dk2.hk + o * kHD, r, (size_t) n * kHD);
++                        std::memcpy(dk2.hv + o * kHD, r + n0 * kHD, (size_t) n * kHD);
++                        std::memcpy(dk2.hks + o, r + n0 * kHD * 2, (size_t) n * 4);
++                        std::memcpy(dk2.hvs + o, r + n0 * (kHD * 2 + 4), (size_t) n * 4);
++                    } else {
++                        const Kv& sk = lanes[(size_t) c.lane]->sess.kv[(size_t) il];
++                        std::memcpy(dk2.hk + o * kHD, sk.hk + o * kHD, (size_t) n * kHD);
++                        std::memcpy(dk2.hv + o * kHD, sk.hv + o * kHD, (size_t) n * kHD);
++                        std::memcpy(dk2.hks + o, sk.hks + o, (size_t) n * 4);
++                        std::memcpy(dk2.hvs + o, sk.hvs + o, (size_t) n * 4);
++                    }
++                }
++            });
++        }
++        for (int il = 0; il < hp.n_vis; ++il) {
++            const Layer& Ly = big.m->layers[(size_t) hp.phys(il)];
++            CK(cudaSetDevice(big.m->dev_ids[(size_t) Ly.dev]));
++            CK(cudaMemcpy(D.sess.conv[(size_t) il], k.conv[(size_t) il], k.conv_bytes, cudaMemcpyHostToDevice));
++            if (!Ly.swa || !k.swa[(size_t) il]) continue;
++            const Kv& r = D.sess.kv[(size_t) il];
++            const int64_t keep_c = hp.swa, cnt = std::min<int64_t>(n, keep_c), st0 = n - cnt;
++            const uint8_t* ks = k.swa[(size_t) il];
++            const uint8_t* vs = ks + HKV * (size_t) keep_c * row;
++            for (int64_t a = st0; a < n;) {
++                const int64_t b = std::min<int64_t>(n, (a / r.ring + 1) * r.ring), m = b - a;
++                const size_t so = (size_t) (a - st0) * row, dofs = (size_t) (a % r.ring) * row;
++                CK(cudaMemcpy2D((uint8_t*) r.k + dofs, (size_t) r.cells * row, ks + so, (size_t) keep_c * row, (size_t) m * row, HKV,
++                                cudaMemcpyHostToDevice));
++                CK(cudaMemcpy2D((uint8_t*) r.v + dofs, (size_t) r.cells * row, vs + so, (size_t) keep_c * row, (size_t) m * row, HKV,
++                                cudaMemcpyHostToDevice));
++                a = b;
++            }
++        }
++        for (auto& t : th) t.join();
++        D.sess.pos = n;
++        if (D.sess.win > 0) big.set_window(D.sess, D.sess.win, true);   // the VRAM window from the RAM cells
++        D.live = k.ids;
++        D.snap_ids.clear();
++        D.dr.reindex();
++        D.ck = std::move(keep);
++        const char* from = c.P ? "a parked conversation" : c.lane == li ? "its own" : "another lane";
++        std::fprintf(stderr, "strata serve: lane %d continues from a checkpoint at %lld tokens (%s, %.0f ms)\n", li,
++                     (long long) n, from, ms_since(t0));
++        return n;
++    }
++    /// The bytes a lane's state at `n` positions takes parked.
++    uint64_t park_bytes(const Lane& L, int64_t n) const {
++        const HP& hp = big.m->hp;
++        uint64_t b = 0;
++        for (int il = 0; il < hp.n_vis; ++il) {
++            const Kv& c = L.sess.kv[(size_t) il];
++            const bool q8 = L.sess.kv_q8[(size_t) il] != 0;
++            const uint64_t cells = c.hk || c.ring == 0 ? (uint64_t) n : (uint64_t) c.cells;
++            b += (uint64_t) hp.n_kv * cells * (q8 ? kHD + 4 : kHD * 2) * 2 + (uint64_t) big.conv_c * 3 * 4;
++        }
++        return b + L.live.size() * 4;
++    }
++    /// L's conversation into the cache (when it is long enough and fits; an older parked copy of a prefix of it goes).
++    void park(Lane& L) {
++        // the state at the end of its last prompt (what a client's next turn starts with: the answer it sends back is
++        // rendered again, not the tokens the model wrote) when it has one, else what it holds
++        const bool snap = !L.snap_ids.empty() && !L.snap_ring.empty() && tiered(L);
++        const std::vector<int32_t>& ids = snap ? L.snap_ids : L.live;
++        const int64_t n = (int64_t) ids.size();
++        if (g_cc_mib == 0 || g_cc_slots == 0 || n < g_cc_min || (!snap && L.sess.pos != n)) return;
++        for (size_t i = 0; i < cc.list.size(); ++i)   // already there (it was restored and read nothing new since)
++            if ((int64_t) cc.list[i]->ids.size() == n && cc.list[i]->ids == ids) {
++                cc.list[i]->used = ++cc.clock;
++                return;
++            }
++        std::vector<CkptP> cks = L.ck;
++        ck_trim(cks, n);
++        uint64_t need = park_bytes(L, n);
++        for (auto& k : cks) need += k->bytes();
++        if (need > cc.budget()) {   // its checkpoints first
++            for (auto& k : cks) need -= k->bytes();
++            cks.clear();
++            if (need > cc.budget()) return;
++        }
++        for (size_t i = 0; i < cc.list.size();) {   // the copies this one makes redundant (prefixes of it)
++            Parked& q = *cc.list[i];
++            if (q.ids.size() < ids.size() && std::equal(q.ids.begin(), q.ids.end(), ids.begin())) {
++                cc.bytes -= q.bytes;
++                cc.list.erase(cc.list.begin() + (long) i);
++            } else
++                ++i;
++        }
++        while (!cc.list.empty() && (cc.bytes + need > cc.budget() || (int) cc.list.size() >= g_cc_slots)) cc.drop_oldest();
++        const auto t0 = Clock::now();
++        const HP& hp = big.m->hp;
++        const size_t HKV = (size_t) hp.n_kv, cb = (size_t) big.conv_c * 3;
++        auto P = std::make_unique<Parked>();
++        P->ids = ids;
++        P->pos = n;
++        P->ck = std::move(cks);
++        P->cells.resize((size_t) hp.n_vis);
++        P->conv.resize((size_t) hp.n_vis);
++        for (int il = 0; il < hp.n_vis; ++il) {
++            const Kv& c = L.sess.kv[(size_t) il];
++            const bool q8 = L.sess.kv_q8[(size_t) il] != 0;
++            CK(cudaSetDevice(big.m->dev_ids[(size_t) big.m->layers[(size_t) hp.phys(il)].dev]));
++            std::vector<uint8_t>& out = P->cells[(size_t) il];
++            const size_t eb = q8 ? 1 : 2;
++            if (c.hk) {   // the cells [0, n) of its RAM copy
++                out.resize(HKV * (size_t) n * (kHD * 2 + 8));
++                uint8_t* w = out.data();
++                for (size_t kh = 0; kh < HKV; ++kh) {
++                    const size_t o = kh * (size_t) c.hcells;
++                    std::memcpy(w, c.hk + o * kHD, (size_t) n * kHD); w += (size_t) n * kHD;
++                    std::memcpy(w, c.hv + o * kHD, (size_t) n * kHD); w += (size_t) n * kHD;
++                    std::memcpy(w, c.hks + o, (size_t) n * 4); w += (size_t) n * 4;
++                    std::memcpy(w, c.hvs + o, (size_t) n * 4); w += (size_t) n * 4;
++                }
++            } else if (c.ring > 0) {   // a ring, whole: from the snapshot in RAM, or as it is in VRAM
++                out.resize(ring_bytes(L, il));
++                if (snap) std::memcpy(out.data(), L.snap_ring[(size_t) il], out.size());
++                else ring_copy(L, il, out.data(), true);
++            } else {   // a whole cache in VRAM only: its cells [0, n)
++                const size_t cells = (size_t) n;
++                out.resize(HKV * cells * kHD * eb * 2 + (q8 ? HKV * cells * 8 : 0));
++                uint8_t* w = out.data();
++                for (size_t kh = 0; kh < HKV; ++kh) {
++                    const size_t ro = kh * (size_t) c.cells;
++                    CK(cudaMemcpy(w, (const uint8_t*) c.k + ro * kHD * eb, cells * kHD * eb, cudaMemcpyDeviceToHost)); w += cells * kHD * eb;
++                    CK(cudaMemcpy(w, (const uint8_t*) c.v + ro * kHD * eb, cells * kHD * eb, cudaMemcpyDeviceToHost)); w += cells * kHD * eb;
++                    if (q8) {
++                        CK(cudaMemcpy(w, c.ks + ro, cells * 4, cudaMemcpyDeviceToHost)); w += cells * 4;
++                        CK(cudaMemcpy(w, c.vs + ro, cells * 4, cudaMemcpyDeviceToHost)); w += cells * 4;
++                    }
++                }
++            }
++            P->conv[(size_t) il].resize(cb);
++            CK(cudaMemcpy(P->conv[(size_t) il].data(), snap ? L.snap_conv[(size_t) il] : L.sess.conv[(size_t) il], cb * 4,
++                          cudaMemcpyDeviceToHost));
++        }
++        P->bytes = need;
++        P->used = ++cc.clock;
++        cc.bytes += need;
++        cc.list.push_back(std::move(P));
++        std::fprintf(stderr, "strata serve: conversation cache: parked %lld tokens (%.2f GiB, %.0f ms; %.1f of %d GiB); "
++                     "parked=%zu bytes=%llu evictions=%llu\n", (long long) n, (double) need / (1 << 30), ms_since(t0),
++                     (double) cc.bytes / (1 << 30), g_cc_mib >> 10, cc.list.size(), (unsigned long long) cc.bytes,
++                     (unsigned long long) cc.evictions);
++    }
++    /// Parked conversation P back into lane L (idle; what it held is parked first). Returns its positions.
++    int64_t restore(Lane& L, Parked& P) {
++        std::unique_ptr<Parked> held = cc.take(&P);
++        park(L);
++        if (held) cc.put(std::move(held));
++        const auto t0 = Clock::now();
++        const HP& hp = big.m->hp;
++        const size_t HKV = (size_t) hp.n_kv, cb = (size_t) big.conv_c * 3;
++        const int64_t n = P.pos;
++        std::unique_lock<std::shared_mutex> lk(pool->mu);
++        for (int il = 0; il < hp.n_vis; ++il) {
++            Kv& c = L.sess.kv[(size_t) il];
++            const bool q8 = L.sess.kv_q8[(size_t) il] != 0;
++            const size_t eb = q8 ? 1 : 2;
++            CK(cudaSetDevice(big.m->dev_ids[(size_t) big.m->layers[(size_t) hp.phys(il)].dev]));
++            const uint8_t* r = P.cells[(size_t) il].data();
++            if (c.hk) {
++                for (size_t kh = 0; kh < HKV; ++kh) {
++                    const size_t o = kh * (size_t) c.hcells;
++                    std::memcpy(c.hk + o * kHD, r, (size_t) n * kHD); r += (size_t) n * kHD;
++                    std::memcpy(c.hv + o * kHD, r, (size_t) n * kHD); r += (size_t) n * kHD;
++                    std::memcpy(c.hks + o, r, (size_t) n * 4); r += (size_t) n * 4;
++                    std::memcpy(c.hvs + o, r, (size_t) n * 4); r += (size_t) n * 4;
++                }
++            } else if (c.ring > 0) {   // a whole ring
++                ring_copy(L, il, const_cast<uint8_t*>(r), false);
++            } else {
++                const size_t cells = (size_t) n;
++                for (size_t kh = 0; kh < HKV; ++kh) {
++                    const size_t ro = kh * (size_t) c.cells;
++                    CK(cudaMemcpy((uint8_t*) c.k + ro * kHD * eb, r, cells * kHD * eb, cudaMemcpyHostToDevice)); r += cells * kHD * eb;
++                    CK(cudaMemcpy((uint8_t*) c.v + ro * kHD * eb, r, cells * kHD * eb, cudaMemcpyHostToDevice)); r += cells * kHD * eb;
++                    if (q8) {
++                        CK(cudaMemcpy(c.ks + ro, r, cells * 4, cudaMemcpyHostToDevice)); r += cells * 4;
++                        CK(cudaMemcpy(c.vs + ro, r, cells * 4, cudaMemcpyHostToDevice)); r += cells * 4;
++                    }
++                }
++            }
++            CK(cudaMemcpy(L.sess.conv[(size_t) il], P.conv[(size_t) il].data(), cb * 4, cudaMemcpyHostToDevice));
++        }
++        L.sess.pos = n;
++        if (L.sess.win > 0) big.set_window(L.sess, L.sess.win, true);
++        L.live = P.ids;
++        L.snap_ids.clear();
++        L.dr.reindex();
++        L.ck = P.ck;
++        P.used = ++cc.clock;
++        std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens (%.0f ms); parked=%zu bytes=%llu\n",
++                     (long long) n, ms_since(t0), cc.list.size(), (unsigned long long) cc.bytes);
++        return n;
++    }
++    /// The state request `ids` can start from in lane li, other than the lane's own: a busy lane's (fork) or a parked one.
++    int64_t start_from(int li, const std::vector<int32_t>& ids) {
++        Lane& L = *lanes[(size_t) li];
++        const size_t own = reach(L, ids);
++        Parked* P = cc.best(ids, own);
++        if (ck_ok()) {   // a checkpoint inside a longer shared start than any whole state gives
++            const int fs = fork_src(li, ids);
++            const size_t whole = std::max({own, P ? P->ids.size() : (size_t) 0,
++                                           fs >= 0 ? lanes[(size_t) fs]->snap_ids.size() : (size_t) 0});
++            const CkPick c = best_ck(ids);
++            if (c.k && (size_t) c.k->pos > whole + 256) return resume_ck(li, c);
++        }
++        if (!P && own > match(L, ids)) return rewind(L);   // its own snapshot is the most there is
++        const int64_t f = fork(li, ids);                   // a busy lane's snapshot, when longer than its own
++        if (f >= 0) return f;
++        if (P) return restore(L, *P);
++        if (own > match(L, ids)) return rewind(L);
++        return -1;
++    }
++    /// L's state now (the end of its prompt) kept for a fork: the conv histories and the last row's logits copied.
++    void snapshot(Lane& L, Engine& last) {
++        const HP& hp = big.m->hp;
++        const size_t cb = (size_t) big.conv_c * 3 * 4;
++        alloc_snapshot(L);
++        last.sync_all();
++        for (int il = 0; il < hp.n_vis; ++il) {
++            CK(cudaSetDevice(big.m->dev_ids[(size_t) big.m->layers[(size_t) hp.phys(il)].dev]));
++            CK(cudaMemcpy(L.snap_conv[(size_t) il], L.sess.conv[(size_t) il], cb, cudaMemcpyDeviceToDevice));
++        }
++        for (int il = 0; il < hp.n_vis; ++il)
++            if (!L.sess.kv[(size_t) il].hk && L.snap_ring[(size_t) il]) {
++                CK(cudaSetDevice(big.m->dev_ids[(size_t) big.m->layers[(size_t) hp.phys(il)].dev]));
++                ring_copy(L, il, L.snap_ring[(size_t) il], true);
++            }
++        const Dev& hd = last.dev[(size_t) last.last_dev];
++        CK(cudaSetDevice(hd.id));
++        CK(cudaMemcpy(L.snap_logits, hd.logits, (size_t) hp.vocab_pad * 4, cudaMemcpyDeviceToDevice));
++        L.snap_ids = L.live;
++    }
++    void alloc_snapshot(Lane& L) {
++        const HP& hp = big.m->hp;
++        const size_t cb = (size_t) big.conv_c * 3 * 4;
++        if (L.snap_conv.empty()) {
++            L.snap_conv.resize((size_t) hp.n_vis);
++            for (int il = 0; il < hp.n_vis; ++il) {
++                CK(cudaSetDevice(big.m->dev_ids[(size_t) big.m->layers[(size_t) hp.phys(il)].dev]));
++                CK(cudaMalloc(&L.snap_conv[(size_t) il], cb));
++            }
++            CK(cudaSetDevice(big.m->dev_ids[(size_t) big.m->head_dev]));
++            CK(cudaMalloc(&L.snap_logits, (size_t) hp.vocab_pad * 4));
++            L.snap_ring.assign((size_t) hp.n_vis, nullptr);
++            for (int il = 0; il < hp.n_vis; ++il)
++                if (!L.sess.kv[(size_t) il].hk && L.sess.kv[(size_t) il].ring > 0)
++                    CK(cudaHostAlloc((void**) &L.snap_ring[(size_t) il], ring_bytes(L, il), cudaHostAllocPortable));
++        }
++    }
++    /// A busy lane whose last prompt starts `ids` (long enough to be worth it, and its sliding-window rings still holding
++    /// that prompt's last cells): its state copied into free lane `li` instead of reading the prompt again. The cache
++    /// cells come from the RAM copy, the rings and conv histories from VRAM. Returns the positions it brought, -1 for none.
++    int fork_src(int li, const std::vector<int32_t>& ids) const {
++        constexpr size_t kForkMin = 4096;
++        const Lane& D = *lanes[(size_t) li];
++        int si = -1;
++        for (int i = 0; i < (int) lanes.size(); ++i) {
++            const Lane& B = *lanes[(size_t) i];
++            if (i == li || !B.busy || B.snap_ids.size() < kForkMin || B.snap_ids.size() > ids.size() || B.snap_ring.empty() ||
++                !tiered(B) || B.snap_ids.size() <= reach(D, ids) || !std::equal(B.snap_ids.begin(), B.snap_ids.end(), ids.begin()))
++                continue;
++            if (si < 0 || B.snap_ids.size() > lanes[(size_t) si]->snap_ids.size()) si = i;
++        }
++        return si;
++    }
++    int64_t fork(int li, const std::vector<int32_t>& ids) {
++        Lane& D = *lanes[(size_t) li];
++        const int si = fork_src(li, ids);
++        if (si < 0) return -1;
++        Lane& B = *lanes[(size_t) si];
++        const int64_t n = (int64_t) B.snap_ids.size();
++        park(D);
++        std::unique_lock<std::shared_mutex> lk(pool->mu);   // B between two steps from here on
++        const auto t0 = Clock::now();
++        const HP& hp = big.m->hp;
++        const size_t HKV = (size_t) hp.n_kv, cb = (size_t) big.conv_c * 3 * 4;
++        for (int il = 0; il < hp.n_vis; ++il) {
++            Kv& sk = B.sess.kv[(size_t) il];
++            Kv& dk = D.sess.kv[(size_t) il];
++            CK(cudaSetDevice(big.m->dev_ids[(size_t) big.m->layers[(size_t) hp.phys(il)].dev]));
++            if (sk.hk) {   // a tiered cache: the RAM copy's cells [0, n)
++                for (size_t kh = 0; kh < HKV; ++kh) {
++                    const size_t o = kh * (size_t) sk.hcells;
++                    std::memcpy(dk.hk + o * kHD, sk.hk + o * kHD, (size_t) n * kHD);
++                    std::memcpy(dk.hv + o * kHD, sk.hv + o * kHD, (size_t) n * kHD);
++                    std::memcpy(dk.hks + o, sk.hks + o, (size_t) n * 4);
++                    std::memcpy(dk.hvs + o, sk.hvs + o, (size_t) n * 4);
++                }
++            } else {   // a ring: as B's snapshot has it in RAM
++                ring_copy(D, il, B.snap_ring[(size_t) il], false);
++            }
++            CK(cudaMemcpy(D.sess.conv[(size_t) il], B.snap_conv[(size_t) il], cb, cudaMemcpyDeviceToDevice));
++        }
++        D.sess.pos = n;
++        if (D.sess.win > 0) big.set_window(D.sess, D.sess.win, true);   // its VRAM window refilled from the copied cells
++        Engine& ex = *D.ex;   // the logits of the prompt's last row, for a request with nothing more to read
++        Dev& hd = ex.dev[(size_t) big.m->head_dev];
++        CK(cudaSetDevice(hd.id));
++        CK(cudaMemcpy(hd.logits, B.snap_logits, (size_t) hp.vocab_pad * 4, cudaMemcpyDeviceToDevice));
++        ex.last_dev = big.m->head_dev;
++        ex.n_logit_rows = 1;
++        D.live = B.snap_ids;
++        D.snap_ids.clear();
++        D.dr.reindex();
++        D.ck = B.ck;
++        ck_trim(D.ck, n);
++        std::fprintf(stderr, "strata serve: lane %d starts from lane %d's state at %lld tokens (copied in %.0f ms)\n", li, si,
++                     (long long) n, ms_since(t0));
++        return n;
++    }
+     int pick_token(Engine* ex, const Sampling& smp, const std::vector<int32_t>& hist, std::mt19937_64& rng,
+                    std::vector<float>& buf) {
+         if (!smp.needs_logits()) return ex->greedy();
+@@ -3770,9 +4403,10 @@ struct Serve {
+         const int li = pick(q.ids, -1);
+         if (li < 0) { say("ERR every lane is decoding\n"); return; }
+         Lane& L = *lanes[(size_t) li];
++        const int64_t forked = start_from(li, q.ids);
+         L.busy = true;
+         stop.store(false);
+-        const Read r = read(L, q.ids);
++        const Read r = read(L, q.ids, forked);
+         if (r.cancelled) {
+             say("DONE 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0 0 0 0.0 %lld 0\n", q.ids.size(), r.ms, r.reuse, (long long) r.got);
+             L.busy = false;
+@@ -3809,6 +4443,7 @@ struct Serve {
+                     break;
+             }
+         const double dms = ms_since(d0);
++        info();
+         say("DONE %lld %zu %.1f %.1f %s 0 0 %zu 0 0 0 0 0.0 %lld 0\n", produced, q.ids.size(), r.ms, dms, finish, r.reuse,
+             (long long) r.fresh);
+         if (pool->on) std::fprintf(stderr, "strata serve: lane %d: pool: %s\n", li, pool->state(L.sess).c_str());
+@@ -3835,10 +4470,11 @@ struct Serve {
+         slot_lane[(size_t) sl] = li;
+         Lane& L = *lanes[(size_t) li];
+         if (L.th.joinable()) L.th.join();
++        const int64_t forked = start_from(li, q.ids);
+         L.busy = true;
+         slot_stop[(size_t) sl] = false;
+         stop.store(false);
+-        const Read r = read(L, q.ids);
++        const Read r = read(L, q.ids, forked);
+         if (r.cancelled) {
+             say("DONE 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0 0 0 0.0 %lld 0\n", q.ids.size(), r.ms, r.reuse, (long long) r.got);
+             say("BADM %ld 0\n", sl);
+@@ -3888,6 +4524,7 @@ struct Serve {
+             spec_step(ex, &L.sess, L.live, L.dr, x, (int) (q.max_new - produced), (int) (big.ctx - L.sess.pos), q.smp, hist,
+                       rng, buf, emit);
+         }
++        info();
+         say("BDONE %d %lld %s %.1f\n", sl, produced, fin, ms_since(t0));
+         if (pool->on) std::fprintf(stderr, "strata batch: slot %d: pool: %s\n", sl, pool->state(L.sess).c_str());
+         std::fprintf(stderr, "strata batch: slot %d: %lld generated in %.0f ms (%.1f tok/s) (%s)\n", sl, produced, ms_since(t0),
+@@ -3896,7 +4533,24 @@ struct Serve {
+         L.busy = false;
+     }
+ 
++    /// The Monitor's figures (the server reads INFO lines at start and between requests): the experts in VRAM now, the
++    /// largest full-attention window a lane has in VRAM, the conversation cache's settings.
++    void info() {
++        long long res = 0, all = 0, bytes = 0;
++        for (const Layer& L : big.m->layers) {
++            res += L.n_res;
++            all += (long long) L.on_gpu.size();
++            bytes += (long long) L.n_res * (long long) L.stride;
++        }
++        long long win = 0;
++        for (const auto& L : lanes) win = std::max<long long>(win, L->sess.win);
++        say("INFO context=%d kv=%s kv_resident=%lld expert_slots=%lld experts=%lld expert_cache_mib=%lld lookup=%d "
++            "conversation_cache_mib=%d conversation_cache_slots=%d conversation_cache_min_tokens=%d\n",
++            big.ctx, big.q8_kv ? "int8" : "fp16", win, res, all, bytes >> 20, lookup_max > 0 ? 1 : 0, g_cc_mib, g_cc_slots,
++            g_cc_min);
++    }
+     int run() {
++        info();
+         if (lanes.size() > 1) say("INFO batch_slots=%zu slot_cache=1\n", lanes.size());
+         say("READY %d stop\n", big.ctx);
+         std::thread reader([&] {
+@@ -3989,7 +4643,10 @@ int strata::inkling2::run(int argc, char** argv) {
+         else if (a == "--bench-at") g_bench_at = std::atoi(next().c_str());
+         else if (a == "--experts-vram") g_experts_vram = std::atoi(next().c_str());   // experts a layer keeps in VRAM
+         else if (a == "--vram-reserve-mib") g_reserve_mib = std::atoi(next().c_str());
+-        else if (a == "--prefill-pipe") g_prefill_pipe = std::atoi(next().c_str());   // --bench-tg from position N, the cache unread
++        else if (a == "--prefill-pipe") g_prefill_pipe = std::atoi(next().c_str());
++        else if (a == "--conversation-cache-mib") g_cc_mib = std::max(0, std::atoi(next().c_str()));
++        else if (a == "--conversation-cache-slots") g_cc_slots = std::max(0, std::atoi(next().c_str()));
++        else if (a == "--conversation-cache-min-tokens") g_cc_min = std::max(0, std::atoi(next().c_str()));
+         else if (serve_mode && a.rfind("--", 0) == 0) {
+             const bool val = i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0;
+             std::fprintf(stderr, "strata-inkling2: ignoring %s%s%s (not an option of this engine)\n", a.c_str(),
+@@ -4059,15 +4716,71 @@ int strata::inkling2::run(int argc, char** argv) {
+     pool.init(m, E, kv_res < 0);
+     if (g_reserve_mib >= 0) pool.reserve = (uint64_t) g_reserve_mib << 20;
+     std::unique_ptr<Engine> E2;   // the second prompt executor: chunks on both cards at once
+-    if (g_prefill_pipe != 0 && m.n_dev > 1) {
++    Prompt pp;
++    // after the lanes and the sessions: the second executor only where its buffers leave the cards room to spare
++    auto second_executor = [&]() {
++        if (g_prefill_pipe == 0 || m.n_dev < 2) return;
++        // its buffers (measured about twice the row estimate: ~1.05 GiB a card at 1024 rows) and the pool's reserve after
++        // them; the pool moves up to 15% of a card's experts to RAM for them where needed (routing is skewed: its adapt
++        // rounds bring the used ones back)
++        const uint64_t want = 2 * (uint64_t) chunk * row_bytes_est(m.hp) + pool.reserve;
++        int moved = 0;
++        for (int d = 0; d < m.n_dev; ++d) {
++            CK(cudaSetDevice(m.dev_ids[(size_t) d]));
++            auto free_now = [&] {
++                size_t fr = 0, tot = 0;
++                CK(cudaMemGetInfo(&fr, &tot));
++                return (uint64_t) fr;
++            };
++            int on_card = 0;
++            for (const Layer& L : m.layers)
++                if (L.dev == d) on_card += L.n_res;
++            const int cap = on_card * 15 / 100;
++            int here = 0;
++            while (free_now() < want && pool.on && here < cap) {
++                int before = 0;
++                for (const Layer& L : m.layers)
++                    if (L.dev == d) before += L.n_res;
++                if (!pool.evict_slab(d)) break;
++                int after = 0;
++                for (const Layer& L : m.layers)
++                    if (L.dev == d) after += L.n_res;
++                here += before - after;
++                CK(cudaSetDevice(m.dev_ids[(size_t) d]));
++            }
++            moved += here;
++            if (free_now() < want) {
++                std::fprintf(stderr, "strata-inkling2: prompt chunks one executor at a time: GPU %d has %.2f GiB free, a second "
++                             "executor needs %.2f GiB\n", d, (double) free_now() / (1 << 30), (double) want / (1 << 30));
++                return;
++            }
++        }
++
+         E2 = std::make_unique<Engine>();
+         E2->q8_kv = q8_kv;
+         E2->kv_resident = kv_res;
+         E2->init(m, ctx, chunk, ring);
++        for (int d = 0; d < m.n_dev && pool.on; ++d) {   // what it took, measured: each card back to the pool's reserve
++            CK(cudaSetDevice(m.dev_ids[(size_t) d]));
++            for (int k = 0; k < 256; ++k) {
++                size_t fr = 0, tot = 0;
++                CK(cudaMemGetInfo(&fr, &tot));
++                if (fr >= pool.reserve || !pool.evict_slab(d)) break;
++                ++moved;
++                CK(cudaSetDevice(m.dev_ids[(size_t) d]));
++            }
++        }
++        std::string fr_s;
++        for (int d = 0; d < m.n_dev; ++d) {
++            CK(cudaSetDevice(m.dev_ids[(size_t) d]));
++            size_t fr = 0, tot = 0;
++            CK(cudaMemGetInfo(&fr, &tot));
++            fr_s += (d ? ", GPU " : "GPU ") + std::to_string(d) + " " + std::to_string(fr >> 20) + " MiB";
++        }
++        std::fprintf(stderr, "strata-inkling2: about %d experts to RAM for a second prompt executor; free VRAM now: %s\n",
++                     moved * kSlab, fr_s.c_str());
+         std::fprintf(stderr, "strata-inkling2: prompt chunks of %d tokens on two executors at once (--prefill-pipe 0: one)\n", chunk);
+-    }
+-    Prompt pp;
+-    pp.init(E, E2.get(), pool);
++    };
+     if (serve_mode) {
+         std::vector<std::unique_ptr<Lane>> lanes;
+         for (int i = 0; i < n_lanes; ++i) {
+@@ -4075,6 +4788,7 @@ int strata::inkling2::run(int argc, char** argv) {
+             L->ex = std::make_unique<Engine>();
+             L->ex->q8_kv = q8_kv;
+             L->ex->kv_resident = kv_res;
++            L->ex->decode_first = true;
+             L->ex->init(m, ctx, kGemmT, ring);
+             E.alloc_session(L->sess);
+             L->ex->S = &L->sess;
+@@ -4083,7 +4797,10 @@ int strata::inkling2::run(int argc, char** argv) {
+         }
+         if (n_lanes > 1) std::fprintf(stderr, "strata-inkling2: %d lanes, each its own session and decode thread\n", n_lanes);
+         Serve sv(E, std::move(lanes));
++        for (auto& L : sv.lanes) sv.alloc_snapshot(*L);   // up front, so a prompt's end never needs VRAM
+         sv.lookup_max = g_lookup_max;
++        second_executor();
++        pp.init(E, E2.get(), pool);
+         sv.pool = &pool;
+         sv.prompt = &pp;
+         return sv.run();
+@@ -4092,6 +4809,8 @@ int strata::inkling2::run(int argc, char** argv) {
+     E.alloc_session(s0);
+     E.S = &s0;
+     E.reset();
++    second_executor();
++    pp.init(E, E2.get(), pool);
+     if (bench_pp > 0 || bench_tg > 0) {
+         std::vector<int32_t> toks((size_t) std::max(bench_pp, 1));
+         std::mt19937 rng(1234);
+-- 
+2.56.1
+

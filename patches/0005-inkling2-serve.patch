@@ -1,6 +1,6 @@
-From f1375d04d005cf7489f7f74e44c4cefebe825918 Mon Sep 17 00:00:00 2001
+From 168249f444e5f334df462612c6b816804341197e Mon Sep 17 00:00:00 2001
 From: LegendaryFire <tristan.balon@outlook.com>
-Date: Fri, 20 Nov 2026 18:05:05 -0700
+Date: Sat, 21 Nov 2026 03:07:03 -0700
 Subject: [PATCH] Serve Inkling 2: its tokenizer, chat template and reply
  format
 
@@ -13,19 +13,23 @@ thinking / text / tool-call blocks (llama.cpp's common/parsers/
 inkling.cpp), the effort words are the template's, and the GGUF's
 eos / eot end a reply. The thinking budget and the forced call, which
 write Qwen's markup, are off for this family.
+
+The server reads INFO lines between requests too (the Inkling engine
+reports the experts in VRAM as its pool moves them), not only before
+READY.
 ---
  vendor/serve/frontend.py                | 148 +++++++++++++++++++++++-
- vendor/serve/server.py                  |   9 +-
+ vendor/serve/server.py                  |  14 ++-
  vendor/serve/server_parts/end_tokens.py |   7 +-
  vendor/serve/server_parts/http_api.py   |   3 +
  vendor/tools/strata_tokenizer.py        |  22 +++-
- 5 files changed, 182 insertions(+), 7 deletions(-)
+ 5 files changed, 187 insertions(+), 7 deletions(-)
 
 diff --git a/vendor/serve/frontend.py b/vendor/serve/frontend.py
-index 03f09f8..85d672f 100644
+index ef6757b..a6ad9f7 100644
 --- a/vendor/serve/frontend.py
 +++ b/vendor/serve/frontend.py
-@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
+@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
  from pathlib import Path
  
  import jinja2
@@ -34,7 +38,7 @@ index 03f09f8..85d672f 100644
  from jinja2.sandbox import ImmutableSandboxedEnvironment
  
  LOGGER = logging.getLogger(__name__)
-@@ -37,6 +39,16 @@ class TemplateRequestError(jinja2.exceptions.TemplateError, ValueError):
+@@ -38,6 +40,16 @@ class TemplateRequestError(jinja2.exceptions.TemplateError, ValueError):
      client gets a 400 with the template's message instead of a dropped connection (#365)."""
  
  
@@ -51,7 +55,7 @@ index 03f09f8..85d672f 100644
  class ChatTemplate:
      """The model's chat template, rendered with the same Jinja settings as transformers' apply_chat_template."""
  
-@@ -47,7 +59,7 @@ class ChatTemplate:
+@@ -48,7 +60,7 @@ class ChatTemplate:
          def tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
              return json.dumps(x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)
  
@@ -60,7 +64,7 @@ index 03f09f8..85d672f 100644
          env.filters["tojson"] = tojson
          env.globals["raise_exception"] = raise_exception
          self.source = Path(path).read_text(encoding="utf-8")
-@@ -136,12 +148,15 @@ EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false":
+@@ -137,12 +149,15 @@ EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false":
  
  
  _EFFORT_QWEN = dict(EFFORT)
@@ -77,7 +81,7 @@ index 03f09f8..85d672f 100644
  
  
  def effort_kwargs(value) -> dict:
-@@ -2707,9 +2722,138 @@ class JsonOutputParser(OutputParser):
+@@ -2951,9 +2966,138 @@ class JsonOutputParser(OutputParser):
                           declared_only=declared_only, deferred=deferred)
  
  
@@ -217,10 +221,22 @@ index 03f09f8..85d672f 100644
 +        return InklingOutputParser
      return JsonOutputParser if toolformat.tool_format(source or "") == "json" else OutputParser
 diff --git a/vendor/serve/server.py b/vendor/serve/server.py
-index b91f8bf..d5f4da7 100644
+index 3d6807d..19a26ea 100644
 --- a/vendor/serve/server.py
 +++ b/vendor/serve/server.py
-@@ -3947,6 +3947,8 @@ class Service:
+@@ -1032,6 +1032,11 @@ class StrataEngine:
+                 if sample is not None and self.proc is proc:
+                     self.terminal_batch_sample = {**sample, "observed_monotonic": time.monotonic()}
+                 continue                        # control telemetry never enters a request's token stream
++            if line.startswith("INFO ") and self.proc is proc:   # Inkling 2: its figures between requests (experts move)
++                for kv in line.split()[1:]:
++                    k, _, v = kv.partition("=")
++                    self.info[k] = int(v) if v.lstrip("-").isdigit() else v
++                continue
+             if line.startswith("PSTAT"):
+                 sample = parse_stage_in_flight_sample(line)
+                 if sample is not None and self.proc is proc:
+@@ -3994,6 +3999,8 @@ class Service:
      def set_family(self, family: str | None) -> None:
          """The model family (None: the Qwen form this server was written for)."""
          self.family = family
@@ -229,7 +245,7 @@ index b91f8bf..d5f4da7 100644
          import serve.frontend as _frontend
          _frontend.use_family(family)
  
-@@ -5233,6 +5235,8 @@ class Service:
+@@ -5283,6 +5290,8 @@ class Service:
               declared_only=False, deferred=False) -> Iterator[tuple[str, object]]:
          """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
          `force` (forced_call): the opening of the call the reply must make - see prepare()."""
@@ -238,7 +254,7 @@ index b91f8bf..d5f4da7 100644
          # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
          # apps; the request's own fields win over all of them
          card = model_card_sampling(self.model_arch, thinking,
-@@ -8432,8 +8436,9 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
+@@ -8511,8 +8520,9 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
      svc.max_queue = max_queue
      svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None
      if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
@@ -270,7 +286,7 @@ index 239bc39..70e72dc 100644
 +            ids.add(int(specials[key]))
      return ids
 diff --git a/vendor/serve/server_parts/http_api.py b/vendor/serve/server_parts/http_api.py
-index 999d478..a237dac 100644
+index 9e87d3d..c6f4bf3 100644
 --- a/vendor/serve/server_parts/http_api.py
 +++ b/vendor/serve/server_parts/http_api.py
 @@ -613,6 +613,9 @@ MODEL_CARD_SAMPLING = {
@@ -284,10 +300,10 @@ index 999d478..a237dac 100644
  
  
 diff --git a/vendor/tools/strata_tokenizer.py b/vendor/tools/strata_tokenizer.py
-index 0d44ade..20a93ac 100644
+index a847c94..859a004 100644
 --- a/vendor/tools/strata_tokenizer.py
 +++ b/vendor/tools/strata_tokenizer.py
-@@ -83,6 +83,18 @@ DEEPSEEK3_PATTERNS = (
+@@ -101,6 +101,18 @@ QWEN2_PATTERN = (
  )
  
  
@@ -306,8 +322,8 @@ index 0d44ade..20a93ac 100644
  def _sequence_findall(patterns, text: str) -> list[str]:
      """llama.cpp's unicode_regex_split: the pieces of `text` after each pattern in turn splits every piece into its
      matches and the unmatched spans between them."""
-@@ -114,6 +126,8 @@ def pre_tokenizer_kind(pre) -> str | None:
-         return "qwen35"
+@@ -134,6 +146,8 @@ def pre_tokenizer_kind(pre) -> str | None:
+         return "qwen2"
      if p.startswith("deepseek"):
          return "deepseek3"
 +    if p == "inkling2":
@@ -315,7 +331,7 @@ index 0d44ade..20a93ac 100644
      return None
  
  
-@@ -150,6 +164,9 @@ class Tokenizer:
+@@ -173,6 +187,9 @@ class Tokenizer:
          else:
              self._re = regex.compile(QWEN35_PATTERN)
              self._split = self._re.findall
@@ -325,7 +341,7 @@ index 0d44ade..20a93ac 100644
  
          # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
          # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:
-@@ -503,8 +520,9 @@ def extract(gguf_path, out_dir) -> dict:
+@@ -526,8 +543,9 @@ def extract(gguf_path, out_dir) -> dict:
          "add_bos_token": False,
          # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
          # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.

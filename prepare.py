@@ -109,7 +109,7 @@ class Preparer:
             self.download_model(model_folder)
 
         model = first_shard(self.paths.model)
-        if gguf_architecture(model) == "inkling2":
+        if gguf_architecture(model) in ("inkling2", "inkling2_loop"):
             # Inkling 2 has its own engine path: the experts stay in the GGUF, and the drafters and picture reader are Qwen's
             self.build_tokenizer(model)
             log.info("model ready")

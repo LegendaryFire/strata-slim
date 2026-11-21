@@ -1,4 +1,4 @@
-From 0d4d758b122ba260f341bbff38473c3cdc4519d9 Mon Sep 17 00:00:00 2001
+From 93b1ba425d806358caf1ba99396a9342588a4259 Mon Sep 17 00:00:00 2001
 From: LegendaryFire <tristan.balon@outlook.com>
 Date: Fri, 20 Nov 2026 21:35:19 -0700
 Subject: [PATCH] Select the RAM-part pages an Inkling 2 decode reads (opt-in)
@@ -68,7 +68,7 @@ index 50bf71c..ba38407 100644
  
  /// Worker threads shared by every engine of the process; run() takes one job at a time.
 diff --git a/vendor/src/inkling2/ink_engine.cu b/vendor/src/inkling2/ink_engine.cu
-index 521ec43..fa76490 100644
+index 3ec3ca8..74b93c7 100644
 --- a/vendor/src/inkling2/ink_engine.cu
 +++ b/vendor/src/inkling2/ink_engine.cu
 @@ -208,6 +208,8 @@ struct Kv {
@@ -80,7 +80,7 @@ index 521ec43..fa76490 100644
  };
  
  template <bool Q8>
-@@ -341,6 +343,111 @@ __global__ void __launch_bounds__(128) k_attn_part(const float* q, const float*
+@@ -265,6 +267,111 @@ __global__ void k_prep(const float* Q, const float* Kx, const float* Vx, const f
      }
  }
  
@@ -192,7 +192,7 @@ index 521ec43..fa76490 100644
  /// One store of a visit's cells for attention: the VRAM cache (ring or by position) or the host copy (by position).
  struct KvSrc {
      const void *k, *v;
-@@ -1543,7 +1650,10 @@ uint64_t row_bytes_est(const HP& hp) {
+@@ -1439,7 +1546,10 @@ uint64_t row_bytes_est(const HP& hp) {
      const uint64_t floats = 30 * N + 4 * QD + 4 * KD + 2 * (uint64_t) hp.n_head * hp.n_rel + 64 + hp.n_expert + Kp;
      return floats * 4 + Kp * N * (2 + 4) + Kp * hp.n_ff * 2 + 2 * QD * 2 + 4 * N + Kp * 16;
  }
@@ -204,7 +204,7 @@ index 521ec43..fa76490 100644
      const HP& hp = m.hp;
      uint64_t b = 0;
      for (int il = 0; il < hp.n_vis; ++il) {
-@@ -1553,11 +1663,13 @@ uint64_t cache_bytes(const Model& m, int d, int ctx, int tmax, bool q8, int resi
+@@ -1449,11 +1559,13 @@ uint64_t cache_bytes(const Model& m, int d, int ctx, int tmax, bool q8, int resi
          const uint64_t cells = swa ? (uint64_t) (hp.swa + tmax) : full;
          const uint64_t per_cell = swa || !q8 ? (uint64_t) hp.n_kv * kHD * 2 * 2 : (uint64_t) hp.n_kv * (kHD + 4) * 2;
          b += cells * per_cell + (uint64_t) (2 * hp.n_kv * kHD + 2 * hp.n_embd) * 3 * 4;
@@ -219,7 +219,7 @@ index 521ec43..fa76490 100644
      const auto t0 = Clock::now();
      m.file = std::make_shared<strata::GgufModel>(strata::GgufModel::open(path));
      const strata::GgufModel& gm = *m.file;
-@@ -1578,7 +1690,8 @@ bool load(const std::string& path, Model& m, int ctx, int tmax, bool q8, int n_s
+@@ -1474,7 +1586,8 @@ bool load(const std::string& path, Model& m, int ctx, int tmax, bool q8, int n_s
          const uint64_t full = q8 && resident > 0 && resident < ctx ? (uint64_t) resident : (uint64_t) ctx;
          const uint64_t cells = swa ? (uint64_t) (hp.swa + tmax) : full;
          const uint64_t per_cell = swa || !q8 ? (uint64_t) hp.n_kv * hp.hd * 2 * 2 : (uint64_t) hp.n_kv * (hp.hd + 4) * 2;
@@ -229,7 +229,7 @@ index 521ec43..fa76490 100644
      }
      size_t hs = 0;
      const strata::TensorInfo* th = gm.find("output.weight", &hs);
-@@ -1810,6 +1923,8 @@ struct Dev {
+@@ -1706,6 +1819,8 @@ struct Dev {
      cudaStream_t hs = nullptr;                                    // the CPU share of a decode's RAM part
      cudaEvent_t evq = nullptr, evcpu = nullptr;
      float *qh = nullptr, *cacc = nullptr, *cm = nullptr, *cl = nullptr;   // pinned: its query rows and partials
@@ -238,7 +238,7 @@ index 521ec43..fa76490 100644
      int32_t* ent_inv = nullptr;
  };
  
-@@ -1820,6 +1935,7 @@ struct Engine {
+@@ -1716,6 +1831,7 @@ struct Engine {
      int nd = 0;
      bool q8_kv = true;
      int kv_resident = 0;              // > 0: a full-attention visit keeps its last kv_resident cells in VRAM, all in RAM
@@ -246,7 +246,7 @@ index 521ec43..fa76490 100644
      /// A decode's read of a RAM part on CPU threads, one record a (visit, row group): the job the host function runs,
      /// and the times of both shares, which set the next split.
      struct CpuRec {
-@@ -1830,6 +1946,7 @@ struct Engine {
+@@ -1726,6 +1842,7 @@ struct Engine {
          bool pending = false;
      };
      std::vector<CpuRec> cpu_rec;
@@ -254,7 +254,7 @@ index 521ec43..fa76490 100644
      float cpu_frac = 0.4f;            // the CPU's share of a RAM part
      static void CUDART_CB cpu_run(void* p) {
          CpuRec& r = *static_cast<CpuRec*>(p);
-@@ -1996,6 +2113,12 @@ struct Engine {
+@@ -1892,6 +2009,12 @@ struct Engine {
                  CK(cudaHostAlloc((void**) &D.cacc, rq * kCpuSegs * kHD * 4, cudaHostAllocPortable));
                  CK(cudaHostAlloc((void**) &D.cm, rq * kCpuSegs * 4, cudaHostAllocPortable));
                  CK(cudaHostAlloc((void**) &D.cl, rq * kCpuSegs * 4, cudaHostAllocPortable));
@@ -267,7 +267,7 @@ index 521ec43..fa76490 100644
              }
              if (T >= (size_t) kExpertGemmT) {
                  D.xg = dalloc_t<__half>(T * Kp * N);
-@@ -2059,6 +2182,11 @@ struct Engine {
+@@ -1955,6 +2078,11 @@ struct Engine {
                  CK(cudaHostAlloc((void**) &c.hv, hb * kHD, cudaHostAllocPortable | cudaHostAllocMapped));
                  CK(cudaHostAlloc((void**) &c.hks, hb * 4, cudaHostAllocPortable | cudaHostAllocMapped));
                  CK(cudaHostAlloc((void**) &c.hvs, hb * 4, cudaHostAllocPortable | cudaHostAllocMapped));
@@ -279,7 +279,7 @@ index 521ec43..fa76490 100644
              }
              if (q8) {
                  c.k = dalloc_t<int8_t>(HKV * cells * kHD);
-@@ -2294,6 +2422,10 @@ struct Engine {
+@@ -2190,6 +2318,10 @@ struct Engine {
              const float scale = 1.0f / std::sqrt((float) kHD);
              const int win = L.swa ? hp.swa : 0, G = H / HKV;
              const int pmax = pos0 + T - 1;
@@ -290,7 +290,7 @@ index 521ec43..fa76490 100644
              const bool tier = cv.hk != nullptr;
              const int res_lo = tier ? std::max(0, pmax - kv_resident + 1) : 0;   // the cells the VRAM ring still holds
              const KvSrc vram{cv.k, cv.v, cv.ks, cv.vs, cv.ring, cv.cells, 0};
-@@ -2326,13 +2458,14 @@ struct Engine {
+@@ -2222,13 +2354,14 @@ struct Engine {
                  const int base = (L.swa ? std::max(0, p_first - hp.swa + 1) : res_lo) / kChunkKeys * kChunkKeys;
                  const int nc_r = (p_last - base) / kChunkKeys + 1;
                  // The RAM part: [0, g_end) through VRAM, [g_end, res_lo) on CPU threads at the same time.
@@ -307,7 +307,7 @@ index 521ec43..fa76490 100644
                          float gms = 0.f;
                          if (cudaEventQuery(cr->g1) == cudaSuccess && cudaEventElapsedTime(&gms, cr->g0, cr->g1) == cudaSuccess &&
                              gms > 0.f && cr->cpu_ms > 0 && cr->cpu_keys > 0 && cr->gpu_keys > 0) {
-@@ -2344,11 +2477,18 @@ struct Engine {
+@@ -2240,11 +2373,18 @@ struct Engine {
                          CK(cudaEventCreate(&cr->g0));
                          CK(cudaEventCreate(&cr->g1));
                      }
@@ -328,7 +328,7 @@ index 521ec43..fa76490 100644
                  if (on_cpu) {
                      CK(cudaMemcpyAsync(D->qh, D->qb + (size_t) t0 * H * kHD, (size_t) nq * H * kHD * 4, cudaMemcpyDeviceToHost, D->st));
                      CK(cudaEventRecord(D->evq, D->st));
-@@ -2361,10 +2501,15 @@ struct Engine {
+@@ -2257,10 +2397,15 @@ struct Engine {
                      j.hcells = cv.hcells; j.kmin = g_end; j.kmax = res_lo - 1;
                      j.scale = scale; j.nseg = nseg; j.seg_stride = nseg;
                      j.acc = D->cacc; j.m = D->cm; j.l = D->cl;
@@ -345,7 +345,7 @@ index 521ec43..fa76490 100644
                      CK(cudaLaunchHostFunc(D->hs, cpu_run, cr));
                      const size_t hgt = (size_t) nq * H;
                      CK(cudaMemcpy2DAsync(D->pacc + (size_t) c_cpu * kHD, (size_t) nc * kHD * 4, D->cacc, (size_t) nseg * kHD * 4,
-@@ -2876,7 +3021,7 @@ int strata::inkling2::run(int argc, char** argv) {
+@@ -2780,7 +2925,7 @@ int strata::inkling2::run(int argc, char** argv) {
      std::string model, tokens, force, dump_full;
      int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0;
      bool serve_mode = false, ppl = false, q8_kv = true;
@@ -354,7 +354,7 @@ index 521ec43..fa76490 100644
      for (int i = 1; i < argc; ++i) {
          const std::string a = argv[i];
          auto next = [&]() -> std::string {
-@@ -2893,6 +3038,8 @@ int strata::inkling2::run(int argc, char** argv) {
+@@ -2797,6 +2942,8 @@ int strata::inkling2::run(int argc, char** argv) {
          else if (a == "--batch" || a == "--slots") n_lanes = std::max(1, std::min(kMaxLanes, std::atoi(next().c_str())));
          else if (a == "--kv") q8_kv = next() != "fp16";   // the full-attention caches: int8 (default) or fp16
          else if (a == "--kv-resident") kv_res = std::atoi(next().c_str());   // cells of each full-attention cache in VRAM
@@ -363,7 +363,7 @@ index 521ec43..fa76490 100644
          else if (a == "--max-context" || a == "--ctx") ctx = std::atoi(next().c_str());
          else if (a == "--chunk" || a == "--prefill") { const std::string v = next(); chunk = std::isdigit((unsigned char) v[0]) ? std::atoi(v.c_str()) : 0; }
          else if (a == "--tokens") {
-@@ -2928,6 +3075,7 @@ int strata::inkling2::run(int argc, char** argv) {
+@@ -2833,6 +2980,7 @@ int strata::inkling2::run(int argc, char** argv) {
      const bool auto_chunk = chunk == 0;
      if (auto_chunk) chunk = 512;
      if (kv_res >= ctx || !q8_kv) kv_res = 0;
@@ -371,7 +371,7 @@ index 521ec43..fa76490 100644
      if (kv_res > 0) kv_res = std::max(kv_res, std::max(chunk, 4096) + 1024);   // a whole prompt chunk and the bias range
      if (chunk < kGemmT || chunk > 4096 || ctx < 256) { std::fprintf(stderr, "strata-inkling2: bad --chunk / --max-context\n"); return 2; }
  #if !defined(_WIN32)
-@@ -2936,7 +3084,7 @@ int strata::inkling2::run(int argc, char** argv) {
+@@ -2841,7 +2989,7 @@ int strata::inkling2::run(int argc, char** argv) {
      Model m;
      std::string err;
      try {
@@ -380,7 +380,7 @@ index 521ec43..fa76490 100644
          for (const char* k : {"tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id"})
              if (const strata::MetaValue* v = m.file->meta().get(k))
                  if (!is_eos((int) v->u)) g_eos.push_back((int32_t) v->u);
-@@ -2951,7 +3099,7 @@ int strata::inkling2::run(int argc, char** argv) {
+@@ -2856,7 +3004,7 @@ int strata::inkling2::run(int argc, char** argv) {
                  CK(cudaSetDevice(m.dev_ids[(size_t) d]));
                  size_t fr = 0, tot = 0;
                  CK(cudaMemGetInfo(&fr, &tot));
@@ -389,7 +389,7 @@ index 521ec43..fa76490 100644
                  fits = fits && fr > need + (768ull << 20);
              }
              if (fits) {
-@@ -2963,11 +3111,13 @@ int strata::inkling2::run(int argc, char** argv) {
+@@ -2868,11 +3016,13 @@ int strata::inkling2::run(int argc, char** argv) {
      const int ring = m.hp.swa + std::max(chunk, kGemmT);
      if (kv_res > 0)
          std::fprintf(stderr, "strata-inkling2: full-attention caches tiered: the last %d cells in VRAM, all %d in RAM "
@@ -405,7 +405,7 @@ index 521ec43..fa76490 100644
      E.init(m, ctx, chunk, ring);
      if (serve_mode) {
          std::vector<std::unique_ptr<Lane>> lanes;
-@@ -2976,6 +3126,7 @@ int strata::inkling2::run(int argc, char** argv) {
+@@ -2881,6 +3031,7 @@ int strata::inkling2::run(int argc, char** argv) {
              L->ex = std::make_unique<Engine>();
              L->ex->q8_kv = q8_kv;
              L->ex->kv_resident = kv_res;
@@ -413,7 +413,7 @@ index 521ec43..fa76490 100644
              L->ex->init(m, ctx, kGemmT, ring);
              E.alloc_session(L->sess);
              L->ex->S = &L->sess;
-@@ -3069,6 +3220,6 @@ int strata::inkling2::run(int argc, char** argv) {
+@@ -2975,6 +3126,6 @@ int strata::inkling2::run(int argc, char** argv) {
      std::fprintf(stderr, "strata-inkling2: prompt %zu tokens in %.1f ms (%.1f tok/s), %zu generated in %.1f ms (%.1f tok/s)\n",
                   prompt.size(), pp_ms, prompt.size() / (pp_ms / 1000.0), gen.size(), ms_since(t1),
                   gen.size() / (ms_since(t1) / 1000.0));

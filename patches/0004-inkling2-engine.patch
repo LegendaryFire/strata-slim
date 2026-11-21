@@ -1,16 +1,16 @@
-From 59cf3694636ebd328118107ea018f371d146ec9c Mon Sep 17 00:00:00 2001
+From 3d686f1f9aa850ee4ef2e20e68d98351366a089a Mon Sep 17 00:00:00 2001
 From: LegendaryFire <tristan.balon@outlook.com>
-Date: Fri, 20 Nov 2026 22:32:06 -0700
-Subject: [PATCH] Run Inkling 2 (GGUF architecture inkling2) on an engine path
- of its own
+Date: Fri, 20 Nov 2026 23:29:39 -0700
+Subject: [PATCH] Run Inkling 2 (GGUF architectures inkling2, inkling2_loop) on
+ an engine path of its own
 
-Unsloth's Inkling-2-Mini GGUFs (llama.cpp PR #32695, the looped
-"inkling2" layout: 48 layer visits over 24 layers, core 6-17 three
-times) had no engine path. src/inkling2 follows the PR's graph: the
-loop's message controllers, block attention residuals, the
-relative-position bias with sinks, SWA, the short convolutions, sigmoid
-routing and SITU experts (NVFP4 with per-expert scales), the
-soft-capped head. strata switches to it from the file's architecture.
+Unsloth's Inkling-2-Mini GGUFs (llama.cpp's inkling2_loop: 24 layers,
+the core 6-17 run three times, 48 layer visits) had no engine path.
+src/inkling2 follows llama.cpp's graph: the loop's message queries and
+controllers, block attention residuals, the relative-position bias
+with sinks, SWA, the short convolutions, sigmoid routing and SITU
+experts (NVFP4 with per-expert scales), the soft-capped head. strata
+switches to it from the file's architecture.
 
 The layers split over the visible GPUs when one card cannot hold them.
 Decode uses the native MMVQ and grouped expert kernels (which take SITU
@@ -56,11 +56,11 @@ scales) on UD-Q4_K_XL, 2x RTX 3060: README text perplexity 3.49 here,
  vendor/include/strata/kernels/iq_kernels.hpp |    1 +
  vendor/src/inkling2/cpu_attn.cpp             |  226 ++
  vendor/src/inkling2/cpu_attn.hpp             |   40 +
- vendor/src/inkling2/ink_engine.cu            | 2980 ++++++++++++++++++
+ vendor/src/inkling2/ink_engine.cu            | 2966 ++++++++++++++++++
  vendor/src/inkling2/ink_main.cpp             |    4 +
  vendor/src/kernels/cuda/iq_kernels.cu        |   31 +
  vendor/src/program/generate.cpp              |   18 +
- 9 files changed, 3319 insertions(+)
+ 9 files changed, 3305 insertions(+)
  create mode 100644 vendor/include/strata/inkling2/engine.hpp
  create mode 100644 vendor/src/inkling2/cpu_attn.cpp
  create mode 100644 vendor/src/inkling2/cpu_attn.hpp
@@ -68,10 +68,10 @@ scales) on UD-Q4_K_XL, 2x RTX 3060: README text perplexity 3.49 here,
  create mode 100644 vendor/src/inkling2/ink_main.cpp
 
 diff --git a/vendor/cmake/strata_gpu_engine.cmake b/vendor/cmake/strata_gpu_engine.cmake
-index 7db1732..e1fdd6d 100644
+index 6d6d907..1289272 100644
 --- a/vendor/cmake/strata_gpu_engine.cmake
 +++ b/vendor/cmake/strata_gpu_engine.cmake
-@@ -554,6 +554,17 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+@@ -571,6 +571,17 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
    target_link_libraries(strata PRIVATE strata_qwen35)
    target_compile_definitions(strata PRIVATE STRATA_HAVE_QWEN35=1)
    endif()
@@ -395,10 +395,10 @@ index 0000000..50bf71c
 +}  // namespace strata::inkling2
 diff --git a/vendor/src/inkling2/ink_engine.cu b/vendor/src/inkling2/ink_engine.cu
 new file mode 100644
-index 0000000..3ec3ca8
+index 0000000..d54e00a
 --- /dev/null
 +++ b/vendor/src/inkling2/ink_engine.cu
-@@ -0,0 +1,2980 @@
+@@ -0,0 +1,2966 @@
 +// src/inkling2/ink_engine.cu - the engine path for Inkling 2 (GGUF architecture inkling2), llama.cpp PR #32695's graph
 +#include "strata/artifact/gguf_reader.hpp"
 +#include "strata/inkling2/engine.hpp"
@@ -538,8 +538,8 @@ index 0000000..3ec3ca8
 +};
 +
 +__global__ void k_mix(States st, int ns, const float* Q, int nq, float* out, int T, int n) {
-+    __shared__ float red[kMaxStates * 4];   // [0, ns): sum of squares; ns + q * ns + s: q . s
-+    __shared__ float sc[3][kMaxStates];
++    __shared__ float red[kMaxStates * 5];   // [0, ns): sum of squares; ns + q * ns + s: q . s (up to 4 queries)
++    __shared__ float sc[4][kMaxStates];
 +    const size_t t = blockIdx.x;
 +    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, nw = blockDim.x / 32;
 +    const int tasks = ns * (1 + nq);
@@ -1523,6 +1523,7 @@ index 0000000..3ec3ca8
 +    int n_res_q = 0;
 +    const float *ffn_res_q = nullptr, *ffn_norm = nullptr, *router = nullptr, *probs_b = nullptr;
 +    const float *loop_down[4] = {}, *loop_gain[4] = {}, *loop_forget[4] = {};
++    const float* msg_q = nullptr;            // the loop's message queries (core layers)
 +    K::NativeExpertLayout L;
 +    uint8_t* blobs = nullptr;
 +    size_t stride = 0;
@@ -1542,8 +1543,6 @@ index 0000000..3ec3ca8
 +    const float *out_norm = nullptr, *out_res_q = nullptr;
 +    Mat head;
 +    int head_dev = 0;
-+    const float* loop_q[kMaxDev] = {};        // loop_res_query on every card that runs core layers
-+    const float* loop_kv_q[kMaxDev] = {};
 +};
 +
 +constexpr size_t kMmqTail = 4096;   // zeroed bytes after the last expert
@@ -1663,11 +1662,11 @@ index 0000000..3ec3ca8
 +
 +bool read_hp(const strata::GgufFile& f, HP& hp, std::string& err) {
 +    const strata::MetaValue* arch = f.get("general.architecture");
-+    if (!arch || arch->s != "inkling2") {
-+        err = "strata-inkling2 runs inkling2 files only (Unsloth's Inkling-2-Mini GGUFs)";
++    if (!arch || (arch->s != "inkling2" && arch->s != "inkling2_loop")) {
++        err = "strata-inkling2 runs inkling2 and inkling2_loop files only (llama.cpp's Inkling 2 GGUFs)";
 +        return false;
 +    }
-+    const std::string p = "inkling2.";
++    const std::string p = arch->s + ".";
 +    auto num = [&](const char* k, bool req, double def = 0) -> double {
 +        const strata::MetaValue* v = f.get(p + k);
 +        if (!v) {
@@ -1681,7 +1680,7 @@ index 0000000..3ec3ca8
 +        return v->num();
 +    };
 +    hp.n_embd = (int) num("embedding_length", true);
-+    hp.n_vis = (int) num("block_count", true);
++    hp.n_phys = (int) num("block_count", true);   // the physical layers; the loop's visits follow from loop.*
 +    hp.n_head = (int) num("attention.head_count", true);
 +    hp.n_kv = (int) num("attention.head_count_kv", true);
 +    hp.hd = (int) num("attention.key_length", true);
@@ -1705,12 +1704,18 @@ index 0000000..3ec3ca8
 +    hp.softcap = (float) num("final_logit_softcapping", false, 0.0);
 +    hp.log_alpha = (float) num("attention.log_scale_alpha", true);
 +    if (!err.empty()) return false;
-+    if (f.get(p + "loop.core_end")) {
-+        hp.core0 = (int) num("loop.core_start", true);
-+        hp.core1 = (int) num("loop.core_end", true);
-+        hp.n_pass = (int) num("num_loops", true);
++    if (arch->s == "inkling2_loop") {
++        hp.core0 = (int) num("loop.start", true);
++        hp.core1 = (int) num("loop.end", true);
++        hp.n_pass = (int) num("loop.count", true);
 +        hp.gate_rank = (int) num("loop.gate_rank", true);
-+        if (hp.n_pass < 2 || hp.core0 >= hp.core1 || hp.core1 + (hp.n_pass - 1) * (hp.core1 - hp.core0) > hp.n_vis) {
++        if (!err.empty()) return false;
++        const strata::MetaValue* varying = f.get(p + "loop.varying");
++        if (varying && varying->u != 0) {
++            err = "a loop with a varying pass count (loop.varying) is not supported";
++            return false;
++        }
++        if (hp.n_pass < 2 || hp.gate_rank <= 0 || hp.core0 >= hp.core1 || hp.core1 > hp.n_phys) {
 +            err = "invalid loop layout";
 +            return false;
 +        }
@@ -1719,20 +1724,14 @@ index 0000000..3ec3ca8
 +            return false;
 +        }
 +    }
-+    if (!err.empty()) return false;
-+    hp.n_phys = hp.n_vis - hp.extra();
++    hp.n_vis = hp.n_phys + hp.extra();
 +    const strata::MetaValue* pat = f.get(p + "attention.sliding_window_pattern");
-+    if (!pat || pat->type != strata::MetaType::ARRAY || (int) pat->items.size() != hp.n_vis) {
-+        err = "the sliding window pattern must name every layer visit";
++    if (!pat || pat->type != strata::MetaType::ARRAY || (int) pat->items.size() != hp.n_phys) {
++        err = "the sliding window pattern must name every layer";
 +        return false;
 +    }
 +    hp.swa_vis.resize((size_t) hp.n_vis);
-+    for (int i = 0; i < hp.n_vis; ++i) hp.swa_vis[(size_t) i] = pat->items[(size_t) i].u != 0;
-+    for (int i = 0; i < hp.n_vis; ++i)
-+        if (hp.swa_vis[(size_t) i] != hp.swa_vis[(size_t) hp.phys(i)]) {
-+            err = "a layer visit differs from the first visit of its layer";
-+            return false;
-+        }
++    for (int i = 0; i < hp.n_vis; ++i) hp.swa_vis[(size_t) i] = pat->items[(size_t) hp.phys(i)].u != 0;
 +    if (hp.hd != kHD || hp.n_head % hp.n_kv || hp.n_rel > 32 || hp.n_conv != 4 || hp.n_expert > 256 ||
 +        hp.top_k > 16 || hp.n_embd % 256 || hp.n_ff % 32 || hp.vocab > hp.vocab_pad || hp.vocab <= 0) {
 +        err = "a geometry this driver's kernels do not take (head 128, relative length <= 32, conv 4, <= 256 experts, "
@@ -1929,12 +1928,13 @@ index 0000000..3ec3ca8
 +        y.router = ld.f32(dv, nm("ffn_gate_inp.weight"));
 +        y.probs_b = ld.f32(dv, nm("exp_probs_b.bias"), false);
 +        if (hp.in_core(l)) {
-+            static const char* const mod[4] = {"attn", "k", "v", "mlp"};
++            static const char* const mod[4] = {"q", "k", "v", "ffn"};   // the controllers of Q, K, V and the FFN input
 +            for (int k = 0; k < 4; ++k) {
-+                y.loop_down[k] = ld.f32(dv, Lname(l, ("loop_" + std::string(mod[k]) + "_down.weight").c_str()));
-+                y.loop_gain[k] = ld.f32(dv, Lname(l, ("loop_" + std::string(mod[k]) + "_gain.weight").c_str()));
-+                y.loop_forget[k] = ld.f32(dv, Lname(l, ("loop_" + std::string(mod[k]) + "_forget.weight").c_str()));
++                y.loop_down[k] = ld.f32(dv, Lname(l, ("loop_" + std::string(mod[k]) + "_ctrl_down.weight").c_str()));
++                y.loop_gain[k] = ld.f32(dv, Lname(l, ("loop_" + std::string(mod[k]) + "_ctrl_gain.weight").c_str()));
++                y.loop_forget[k] = ld.f32(dv, Lname(l, ("loop_" + std::string(mod[k]) + "_ctrl_forget.weight").c_str()));
 +            }
++            y.msg_q = ld.f32(dv, Lname(l, "loop_msg_query.weight"));   // [n_embd, 4]: the Q, K, V and FFN messages
 +        }
 +        if (!ld.err.empty()) {
 +            err = ld.err;
@@ -1997,14 +1997,6 @@ index 0000000..3ec3ca8
 +    m.out_norm = ld.f32(m.head_dev, "output_norm.weight");
 +    m.out_res_q = ld.f32(m.head_dev, "output_res_query.weight");
 +    m.head = ld.mat(m.head_dev, "output.weight");
-+    if (hp.looped())
-+        for (int dv = 0; dv < m.n_dev; ++dv) {
-+            bool runs_core = false;
-+            for (int l = hp.core0; l < hp.core1; ++l) runs_core |= m.layers[(size_t) l].dev == dv;
-+            if (!runs_core) continue;
-+            m.loop_q[dv] = ld.f32(dv, "loop_res_query.weight");
-+            m.loop_kv_q[dv] = ld.f32(dv, "loop_kv_res_query.weight");
-+        }
 +    if (!ld.err.empty()) {
 +        err = ld.err;
 +        return false;
@@ -2214,7 +2206,7 @@ index 0000000..3ec3ca8
 +                D.free_slots.push_back(n_slots - 1 - s);
 +            }
 +            for (auto& p : D.xn) p = dalloc(T * N);
-+            for (auto& p : D.msg) p = dalloc(T * N);
++            D.msg[0] = dalloc(4 * T * N);   // the four messages of a looped layer, one after the other
 +            D.mixo = dalloc(3 * T * N);
 +            D.ctl = dalloc(T * N);
 +            D.cat2 = dalloc(2 * T * N);
@@ -2518,14 +2510,8 @@ index 0000000..3ec3ca8
 +            }
 +            const float* msg[4] = {};
 +            if (core && pass > 0) {
-+                const size_t row = (size_t) 2 * (ip - hp.core0);
-+                mix(*D, d, bank, bank_last, m->loop_q[d] + row * N, 2, D->mixo, T);
-+                CK(cudaMemcpyAsync(D->msg[0], D->mixo, (size_t) T * N * 4, cudaMemcpyDeviceToDevice, D->st));
-+                CK(cudaMemcpyAsync(D->msg[3], D->mixo + (size_t) T * N, (size_t) T * N * 4, cudaMemcpyDeviceToDevice, D->st));
-+                mix(*D, d, bank, bank_last, m->loop_kv_q[d] + row * N, 2, D->mixo, T);
-+                CK(cudaMemcpyAsync(D->msg[1], D->mixo, (size_t) T * N * 4, cudaMemcpyDeviceToDevice, D->st));
-+                CK(cudaMemcpyAsync(D->msg[2], D->mixo + (size_t) T * N, (size_t) T * N * 4, cudaMemcpyDeviceToDevice, D->st));
-+                for (int k = 0; k < 4; ++k) msg[k] = D->msg[k];
++                mix(*D, d, bank, bank_last, L.msg_q, 4, D->msg[0], T);   // the Q, K, V and FFN messages, [4][T][N]
++                for (int k = 0; k < 4; ++k) msg[k] = D->msg[0] + (size_t) k * T * N;
 +            }
 +            const V inpSA = cur;
 +            const float* in[3];
@@ -3390,10 +3376,10 @@ index 0000000..08ab8d1
 +
 +int main(int argc, char** argv) { return strata::inkling2::run(argc, argv); }
 diff --git a/vendor/src/kernels/cuda/iq_kernels.cu b/vendor/src/kernels/cuda/iq_kernels.cu
-index 4055a1f..bfb7bea 100644
+index fbf6c4d..af5a2e6 100644
 --- a/vendor/src/kernels/cuda/iq_kernels.cu
 +++ b/vendor/src/kernels/cuda/iq_kernels.cu
-@@ -2206,6 +2206,15 @@ __global__ void swiglu_entries_kernel(const float* __restrict__ gate, const floa
+@@ -2207,6 +2207,15 @@ __global__ void swiglu_entries_kernel(const float* __restrict__ gate, const floa
      h[i] = (g / (1.0f + __expf(-g))) * up[i];
  }
  
@@ -3409,7 +3395,7 @@ index 4055a1f..bfb7bea 100644
  template<int TD>
  __global__ void __launch_bounds__(256) native_down_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                            const int32_t* __restrict__ grp_start,
-@@ -6513,6 +6522,28 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
+@@ -6529,6 +6538,28 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
          std::exit(1);
      }
  #endif
@@ -3439,10 +3425,10 @@ index 4055a1f..bfb7bea 100644
      // launch_gu); SwiGLU, the q8_1 quantization and the down rows (GGUF, at L.down_off) are the layout's own
      static const bool v2 = [] { const char* v = std::getenv("STRATA_EXPERT_V2"); return v && v[0] == '1'; }();
 diff --git a/vendor/src/program/generate.cpp b/vendor/src/program/generate.cpp
-index 08273c3..d53f319 100644
+index 40aa448..049f127 100644
 --- a/vendor/src/program/generate.cpp
 +++ b/vendor/src/program/generate.cpp
-@@ -164,6 +164,9 @@
+@@ -168,6 +168,9 @@
  #if defined(STRATA_HAVE_QWEN35)
  #include "strata/qwen35/engine.hpp"
  #endif
@@ -3452,7 +3438,7 @@ index 08273c3..d53f319 100644
  #if defined(_WIN32)
  #ifndef WIN32_LEAN_AND_MEAN
  #define WIN32_LEAN_AND_MEAN
-@@ -3695,6 +3698,21 @@ int main(int argc, char** argv) {
+@@ -3736,6 +3739,21 @@ int main(int argc, char** argv) {
  #endif
          break;
      }
@@ -3464,7 +3450,7 @@ index 08273c3..d53f319 100644
 +        try {
 +            const strata::GgufFile meta(strata::gguf_split_paths(argv[i + 1]).front());
 +            const strata::MetaValue* arch = meta.get("general.architecture");
-+            inkling2 = arch != nullptr && arch->s == "inkling2";
++            inkling2 = arch != nullptr && (arch->s == "inkling2" || arch->s == "inkling2_loop");
 +        } catch (const std::exception&) {
 +        }
 +        if (inkling2) return strata::inkling2::run(argc, argv);

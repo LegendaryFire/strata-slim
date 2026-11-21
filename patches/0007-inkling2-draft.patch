@@ -1,4 +1,4 @@
-From 4eb373205ce1f6cb7696a9dbe2c489f16349398d Mon Sep 17 00:00:00 2001
+From b6e03ffb307cf24b52b2488a3977e3e37e290370 Mon Sep 17 00:00:00 2001
 From: LegendaryFire <tristan.balon@outlook.com>
 Date: Fri, 20 Nov 2026 23:02:05 -0700
 Subject: [PATCH] Draft Inkling 2's tokens from the conversation and verify
@@ -36,7 +36,7 @@ tok/s, its follow-up 42.4 -> 69.8, prose 42.4 -> 42.8.
  1 file changed, 260 insertions(+), 30 deletions(-)
 
 diff --git a/vendor/src/inkling2/ink_engine.cu b/vendor/src/inkling2/ink_engine.cu
-index 3ec3ca8..0e1244f 100644
+index 3ec3ca8..f72c7ea 100644
 --- a/vendor/src/inkling2/ink_engine.cu
 +++ b/vendor/src/inkling2/ink_engine.cu
 @@ -15,6 +15,8 @@
@@ -295,7 +295,15 @@ index 3ec3ca8..0e1244f 100644
  }
  
  std::vector<int32_t> parse_ids(const char* s) {
-@@ -2457,6 +2651,7 @@ struct Lane {
+@@ -2450,6 +2644,7 @@ std::vector<int32_t> parse_ids(const char* s) {
+ 
+ std::vector<int32_t> g_eos;   // tokenizer.ggml.eos_token_id / eot_token_id
+ int g_bench_at = 0;           // --bench-at
++int g_lookup_max = kGemmT - 1;   // --lookup-max-t
+ bool is_eos(int t) { return std::find(g_eos.begin(), g_eos.end(), t) != g_eos.end(); }
+ 
+ /// A conversation's lane: its session, its decode executor, the tokens its state holds, its decode thread.
+@@ -2457,6 +2652,7 @@ struct Lane {
      Session sess;
      std::unique_ptr<Engine> ex;
      std::vector<int32_t> live;
@@ -303,7 +311,7 @@ index 3ec3ca8..0e1244f 100644
      std::atomic<bool> busy{false};
      uint64_t used = 0;
      std::thread th;
-@@ -2484,6 +2679,7 @@ struct Serve {
+@@ -2484,6 +2680,7 @@ struct Serve {
      std::atomic<bool> stop{false};
      uint64_t clock = 0;
      std::vector<float> lg;
@@ -311,7 +319,7 @@ index 3ec3ca8..0e1244f 100644
  
      Serve(Engine& b, std::vector<std::unique_ptr<Lane>>&& l) : big(b), lanes(std::move(l)) {
          slot_lane.resize(lanes.size());
-@@ -2634,21 +2830,27 @@ struct Serve {
+@@ -2634,21 +2831,27 @@ struct Serve {
          long long produced = 0;
          const char* finish = "length";
          Engine* ex = r.last;
@@ -353,7 +361,7 @@ index 3ec3ca8..0e1244f 100644
          const double dms = ms_since(d0);
          say("DONE %lld %zu %.1f %.1f %s 0 0 %zu 0 0 0 0 0.0 %lld 0\n", produced, q.ids.size(), r.ms, dms, finish, r.reuse,
              (long long) r.fresh);
-@@ -2712,20 +2914,22 @@ struct Serve {
+@@ -2712,20 +2915,22 @@ struct Serve {
          std::vector<float> buf;
          Engine* ex = L.ex.get();
          const char* fin = nullptr;
@@ -386,20 +394,12 @@ index 3ec3ca8..0e1244f 100644
          L.used = ++clock;
          L.busy = false;
      }
-@@ -2778,6 +2982,7 @@ struct Serve {
- 
- int strata::inkling2::run(int argc, char** argv) {
-     std::string model, tokens, force, dump_full;
-+    int lookup_max = kGemmT - 1;
-     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0;
-     bool serve_mode = false, ppl = false, q8_kv = true;
-     int n_lanes = 1, kv_res = 0, ppl_from = 0;
 @@ -2793,6 +2998,8 @@ int strata::inkling2::run(int argc, char** argv) {
          else if (a == "--greedy") {}
          else if (a == "--serve") serve_mode = true;
          else if (a == "--ppl") ppl = true;
 +        else if (a == "--lookup-max-t")   // the most tokens a step drafts from the conversation (verified; 0: none)
-+            lookup_max = std::max(0, std::min(kGemmT - 1, std::atoi(next().c_str())));
++            g_lookup_max = std::max(0, std::min(kGemmT - 1, std::atoi(next().c_str())));
          else if (a == "--ppl-from") { ppl = true; ppl_from = std::atoi(next().c_str()); }   // read N as a prompt, score the rest
          else if (a == "--batch" || a == "--slots") n_lanes = std::max(1, std::min(kMaxLanes, std::atoi(next().c_str())));
          else if (a == "--kv") q8_kv = next() != "fp16";   // the full-attention caches: int8 (default) or fp16
@@ -407,7 +407,7 @@ index 3ec3ca8..0e1244f 100644
          }
          if (n_lanes > 1) std::fprintf(stderr, "strata-inkling2: %d lanes, each its own session and decode thread\n", n_lanes);
          Serve sv(E, std::move(lanes));
-+        sv.lookup_max = lookup_max;
++        sv.lookup_max = g_lookup_max;
          return sv.run();
      }
      Session s0;
@@ -418,7 +418,7 @@ index 3ec3ca8..0e1244f 100644
 +    if (forced.empty() && !ff && n_gen > 1) {   // plain generation: through the verify step, as the server runs it
 +        std::vector<int32_t> live(prompt.begin(), prompt.end() - 1), hist;
 +        Drafter dr;
-+        dr.max_k = lookup_max;
++        dr.max_k = g_lookup_max;
 +        Sampling greedy_smp;
 +        std::mt19937_64 rng(0);
 +        int32_t x = E.greedy();

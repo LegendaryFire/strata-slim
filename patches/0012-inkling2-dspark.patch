@@ -1,0 +1,863 @@
+From 65810e4e53b8b2e948176a3778f118bfd6f5d012 Mon Sep 17 00:00:00 2001
+From: LegendaryFire <tristan.balon@outlook.com>
+Date: Sat, 21 Nov 2026 13:44:50 -0700
+Subject: [PATCH] Draft Inkling 2 decode with its DSpark block drafter
+ (--dspark FILE)
+
+Unsloth's dspark-Inkling-2-Mini GGUF (arch dflash: three layers that
+read the target's hidden states, a recurrent head on the target's
+output head, block size 8; llama.cpp PR 32218's Inkling path) now
+drafts in strata-inkling2:
+
+- every committed token's features (the inputs of visits 5, 23 and
+  41 and the final normed hidden) go into the drafter's own cache:
+  each layer's fused context row to K and V (the sliding layers a
+  ring of 2048, the full one --dspark-window, 32768), the head's
+  context row of the last positions; a prompt's last window of rows
+  as it is read, a verify's rows once they stood
+- a draft is one pass of [last token, mask x 7] at the next positions
+  through the three layers (its attention on k_attn_dreg, the block
+  and the window before it, non-causal), then the head a token at a
+  time (greedy) on the target's head over the row and its correction
+- spec_step takes the conversation's own run (lookup) when it has 2
+  or more tokens, else a DSpark draft of the length that gives the
+  most tokens a millisecond by its record (each draft position's
+  rate, the drafts' and the verify's times; --dspark-n at most, 3)
+- verification is spec_step's: the reply is distributed as without
+  drafting
+- a lane that takes over a state it did not see made (a parked
+  conversation, a fork, another lane's checkpoint) starts the drafter
+  from there; the drafter's weights, buffers and caches take their
+  room from the pool's experts
+
+2x RTX 3060, UD-Q4_K_XL: 180K-token prompt, 512 tokens, no lookup:
+35.6 -> 57.3 tok/s (66% of drafted tokens stood, 3 a step); 60K 42.8
+-> 63.8; the server's prose 46 -> 52-57, edits and follow-ups with
+lookup as before or better. Prompt reading unchanged.
+---
+ vendor/src/inkling2/ink_engine.cu | 573 +++++++++++++++++++++++++++++-
+ 1 file changed, 570 insertions(+), 3 deletions(-)
+
+diff --git a/vendor/src/inkling2/ink_engine.cu b/vendor/src/inkling2/ink_engine.cu
+index a359395..8422fd5 100644
+--- a/vendor/src/inkling2/ink_engine.cu
++++ b/vendor/src/inkling2/ink_engine.cu
+@@ -71,6 +71,14 @@ constexpr size_t kSplitFloats = (size_t) 4 << 20;   // the f32 products' split-K
+ constexpr int kMaxLanes = 8;
+ constexpr int kStage = 16384;     // cells of a RAM part staged in VRAM at a time
+ int g_cc_mib = 8192, g_cc_slots = 4, g_cc_min = 2048;   // --conversation-cache-mib / -slots / -min-tokens
++int g_dspark_n = 3;              // --dspark-n: the most tokens DSpark drafts a step
++// Room on card d for `bytes` more (the pool moves its coldest experts to RAM; nothing without the pool): the drafter's
++// weights and buffers come after the experts filled the cards.
++std::function<void(int, size_t)> g_make_room;
++void make_room(int d, size_t bytes) {
++    if (g_make_room) g_make_room(d, bytes);
++}
++int g_dspark_window = 32768;     // --dspark-window: the drafter's full-attention layer reads this many positions back
+ int g_prefill_pipe = -1;      // --prefill-pipe 0|1: prompt chunks on two executors at once (-1: with 2+ cards)
+ int g_reserve_mib = -1;       // --vram-reserve-mib: VRAM the pool leaves free on each card
+ int g_experts_vram = -1;      // --experts-vram N: each layer keeps N experts in VRAM (-1: all), the rest in RAM
+@@ -1414,6 +1422,121 @@ __global__ void k_attn_fold(const float* pacc, const float* pm, const float* pl,
+ }
+ constexpr size_t kDrSmem = (size_t) 4 * 16 * kHD * 4 + 2 * 4 * 16 * 4;
+ 
++
++// ---- DSpark (--dspark FILE): Inkling 2's own block drafter (Unsloth's dspark GGUF, arch dflash). Three layers read
++// the target's hidden states at four visits (injected into the drafter's own cache as each token is committed) and
++// draft a block from [last token, mask x 7] in one pass; a recurrent head turns the block's rows into tokens through
++// the target's output head. Verification keeps the reply exactly as without it (see spec_step).
++struct DsMix {
++    float w[4][4];          // softmax of each fuse row: [layer 0..2, head context][feature]
++    const float* norm[4];   // dflare_norm of each layer, dspark_norm
++};
++/// out[j][t] = RMS-normed (sum_k w[j][k] feat[t][k]) * norm[j]: the drafter layers' context rows and the head's.
++__global__ void k_ds_mix(const float* feat, int n, DsMix a, float eps, float* out, int T) {
++    __shared__ float sh[kThreads];
++    const int t = blockIdx.x, j = blockIdx.y;
++    float* o = out + ((size_t) j * T + t) * n;
++    float ss = 0.f;
++    for (int i = threadIdx.x; i < n; i += blockDim.x) {
++        float x = 0.f;
++        for (int k = 0; k < 4; ++k) x += a.w[j][k] * feat[((size_t) t * 4 + k) * n + i];
++        o[i] = x;
++        ss += x * x;
++    }
++    ss = block_sum(ss, sh);
++    const float r = rsqrtf(ss / (float) n + eps);
++    for (int i = threadIdx.x; i < n; i += blockDim.x) o[i] = o[i] * r * a.norm[j][i];
++}
++/// A head's 128 values RMS-normed (times w), then NeoX-rotated at position pos (x[i], x[i + 64] a pair).
++__device__ __forceinline__ float ds_norm_rope(const float* x, const float* w, int pos, float base, float eps, float* sh) {
++    const int i = threadIdx.x;
++    const float v = x[i];
++    sh[i] = v * v;
++    __syncthreads();
++    for (int s2 = 64; s2 > 0; s2 >>= 1) {
++        if (i < s2) sh[i] += sh[i + s2];
++        __syncthreads();
++    }
++    const float r = rsqrtf(sh[0] / (float) kHD + eps);
++    __syncthreads();
++    sh[i] = v * r * w[i];
++    __syncthreads();
++    const int pi = i % 64;
++    const float th = (float) pos * powf(base, -2.0f * (float) pi / (float) kHD);
++    float sn, cs;
++    sincosf(th, &sn, &cs);
++    const float a = sh[pi], b = sh[pi + 64];
++    const float o = i < 64 ? a * cs - b * sn : b * cs + a * sn;
++    __syncthreads();
++    return o;
++}
++/// Rows' K (normed, rotated) and V into a drafter cache ring (FP16, [head][cell][128], cell = position % ring).
++__global__ void k_ds_kput(const float* K, const float* V, int pos0, const float* knorm, int ring, __half* kc, __half* vc,
++                          float eps, float base, int HKV) {
++    __shared__ float sh[kHD];
++    const int t = blockIdx.x, h = blockIdx.y, i = threadIdx.x, pos = pos0 + t;
++    const size_t src = ((size_t) t * HKV + h) * kHD;
++    const float k = ds_norm_rope(K + src, knorm, pos, base, eps, sh);
++    const size_t cell = ((size_t) h * ring + (size_t) (pos % ring)) * kHD + i;
++    kc[cell] = __float2half(k);
++    vc[cell] = __float2half(V[src + i]);
++}
++/// The block's queries (normed, rotated) laid out for k_attn_dreg as one token's heads: row (kvh, r * G + j) is block
++/// row r's head kvh * G + j, so all 8 rows x G heads of a KV head read its keys together.
++__global__ void k_ds_qprep(const float* Q, int pos0, const float* qnorm, float* qd, float eps, float base, int G, int HKV) {
++    __shared__ float sh[kHD];
++    const int r = blockIdx.x, h = blockIdx.y, i = threadIdx.x;
++    const float q = ds_norm_rope(Q + ((size_t) r * HKV * G + h) * kHD, qnorm, pos0 + r, base, eps, sh);
++    const int kvh = h / G, j = h % G;
++    qd[((size_t) kvh * (gridDim.x * G) + r * G + j) * kHD + i] = q;
++}
++/// k_attn_dreg's partials of those rows merged (no sink, no gate) back into [row][head][128].
++__global__ void k_ds_merge(const float* pacc, const float* pm, const float* pl, int nc, float* out, int nrows, int G) {
++    const int row = blockIdx.x, d = threadIdx.x;   // row = kvh * (nrows * G) + r * G + j
++    float M = -INFINITY;
++    for (int c = 0; c < nc; ++c) M = fmaxf(M, pm[(size_t) row * nc + c]);
++    float num = 0.f, den = 0.f;
++    for (int c = 0; c < nc; ++c) {
++        const size_t o = (size_t) row * nc + c;
++        if (pm[o] == -INFINITY) continue;
++        const float w = expf(pm[o] - M);
++        num += w * pacc[o * kHD + d];
++        den += w * pl[o];
++    }
++    const int per = nrows * G, kvh = row / per, r = (row % per) / G, j = row % G;
++    const int HKV = gridDim.x / per;
++    out[((size_t) r * HKV * G + kvh * G + j) * kHD + d] = den > 0.f ? num / den : 0.f;
++}
++__global__ void k_silu_mul(const float* g, const float* u, float* out, int64_t n) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i < n) out[i] = g[i] / (1.0f + expf(-g[i])) * u[i];
++}
++/// The head's input: [state, markov_w1[prev], the block row, the committed context].
++__global__ void k_ds_head_in(const uint16_t* markov, const int32_t* prev, const float* state, const float* row, const float* ctx,
++                             float* x, int rank, int n) {
++    const int i = blockIdx.x * blockDim.x + threadIdx.x, tot = 2 * rank + 2 * n;
++    if (i >= tot) return;
++    float v;
++    if (i < rank) v = state[i];
++    else if (i < 2 * rank) v = __uint_as_float((uint32_t) markov[(size_t) prev[0] * rank + (i - rank)] << 16);
++    else if (i < 2 * rank + n) v = row[i - 2 * rank];
++    else v = ctx[i - 2 * rank - n];
++    x[i] = v;
++}
++/// joint = joint_proj x + b: gate, candidate and output thirds; the state on, the latent out.
++__global__ void k_ds_state(const float* j, const float* jb, float* state, float* latent, int rank) {
++    const int i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= rank) return;
++    const float g = 1.0f / (1.0f + expf(-(j[i] + jb[i])));
++    const float c = tanhf(j[rank + i] + jb[rank + i]);
++    state[i] = c + g * (state[i] - c);
++    latent[i] = tanhf(j[2 * rank + i] + jb[2 * rank + i]);
++}
++__global__ void k_ds_u(const float* row, const float* corr, const float* b, float* u, int n) {
++    const int i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i < n) u[i] = row[i] + corr[i] + b[i];   // the head of (row + correction): one read of it for both terms
++}
++
+ /// The prompt's expert GEMM on mma.sync: a block a 64 x 128 tile (rows = the group's routed entries, columns =
+ /// output channels; gate/up: 64 gate + 64 up), 8 warps of 32 x 32; A from the gathered FP16 rows, B the GGUF blocks
+ /// copied a step ahead and converted to FP16 in shared memory; SITU in the gate/up epilogue, s_down in the down one.
+@@ -1994,6 +2117,24 @@ struct Loader {
+     std::string err;
+     uint64_t bytes[kMaxDev] = {};
+     explicit Loader(Model& m_) : m(m_), gm(*m_.file) {}
++    Loader(Model& m_, const strata::GgufModel& g) : m(m_), gm(g) {}
++    /// A BF16 tensor as it is (2 bytes a value).
++    const uint16_t* bf16(int dev, const std::string& name) {
++        size_t s = 0;
++        const strata::TensorInfo* t = find(name, s);
++        if (!t) return nullptr;
++        if (t->type != 30) {
++            err = name + " is " + t->type_name() + ", expected BF16";
++            return nullptr;
++        }
++        const uint64_t nb = strata::tensor_payload_bytes(*t);
++        CK(cudaSetDevice(m.dev_ids[(size_t) dev]));
++        uint16_t* d = nullptr;
++        CK(cudaMalloc(&d, nb));
++        CK(cudaMemcpy(d, gm.shard(s).tensor_data(*t), nb, cudaMemcpyHostToDevice));
++        bytes[dev] += nb;
++        return d;
++    }
+ 
+     const strata::TensorInfo* find(const std::string& name, size_t& s, bool required = true) {
+         const strata::TensorInfo* t = gm.find(name, &s);
+@@ -2238,6 +2379,164 @@ uint64_t cache_bytes(const Model& m, int d, int ctx, int tmax, bool q8, int resi
+     return b;
+ }
+ 
++/// The DSpark drafter's weights (on the target's head card) and its hyperparameters.
++struct DsLayer {
++    Mat wq, wk, wv, wo, kc, vc, gate, up, down;   // kc / vc: the injected context's K and V
++    const float *attn_norm = nullptr, *q_norm = nullptr, *k_norm = nullptr, *kc_norm = nullptr, *ctx_norm = nullptr,
++                *ffn_norm = nullptr;
++    bool swa = false;
++};
++struct DsModel {
++    std::shared_ptr<strata::GgufModel> file;
++    int dev = 0, n_layer = 0, block = 8, rank = 0, n_ff = 0, swa = 0, window = 32768, n_head = 0, n_kv = 0;
++    float eps = 1e-6f, base = 1e6f, softcap = 0;
++    std::vector<int> taps;   // the target visits whose input is a feature (n_vis: the final normed hidden)
++    std::vector<DsLayer> L;
++    DsMix mix{};
++    const float *out_norm = nullptr, *mask = nullptr, *joint_b = nullptr, *hidden_b = nullptr, *joint = nullptr, *hidden = nullptr;
++    const uint16_t* markov = nullptr;
++    int ring(const DsLayer& l) const { return l.swa ? 2048 : window; }
++    int tap_slot(int il) const {   // the feature slot of the input of visit il, -1 for none
++        for (size_t k = 0; k < taps.size(); ++k)
++            if (taps[k] == il) return (int) k;
++        return -1;
++    }
++};
++/// A conversation's drafter cache: each layer's K and V rings (FP16), the head's context rows of the last positions,
++/// and the first position since which every committed one was injected (the drafter forgets what came before).
++struct DsState {
++    std::vector<__half*> k, v;
++    static constexpr int kCtx = 16;
++    float* ctx = nullptr;          // [kCtx][N]
++    int64_t ctx_pos[kCtx];
++    int64_t valid_from = 0;
++    int64_t drafted = 0, accepted = 0, steps = 0;   // the drafter's record (logged a reply)
++    // decayed outcomes by draft position (draft i tried when 1 .. i - 1 stood) and the draft's time by its length
++    double tried[8] = {}, stood[8] = {}, t_draft[8] = {};
++    int64_t idle = 0;
++    double rate(int i) const { return (stood[i] + 2.0) / (tried[i] + 3.0); }   // a prior of 2 in 3
++    void outcome(int k, int n_stood) {
++        for (int i = 1; i <= k; ++i) {
++            tried[i] = tried[i] * 0.98 + (i <= n_stood + 1 ? 1.0 : 0.0);
++            stood[i] = stood[i] * 0.98 + (i <= n_stood ? 1.0 : 0.0);
++        }
++    }
++    void forget(int64_t pos) {
++        valid_from = pos;
++        for (auto& p : ctx_pos) p = -1;
++    }
++};
++
++
++/// The DSpark drafter (--dspark FILE) onto the target's head card. False with err set when the file is not an Inkling 2
++/// DSpark drafter matching the target.
++bool load_dspark(const std::string& path, Model& m, DsModel& ds, std::string& err) {
++    ds.file = std::make_shared<strata::GgufModel>(strata::GgufModel::open(path));
++    const strata::GgufModel& gm = *ds.file;
++    const strata::GgufFile& f = gm.meta();
++    const strata::MetaValue* arch = f.get("general.architecture");
++    if (!arch || arch->s != "dflash" || !gm.find("dspark_hidden_out.weight", nullptr)) {
++        err = path + " is not an Inkling 2 DSpark drafter (general.architecture dflash with dspark_hidden_out)";
++        return false;
++    }
++    auto num = [&](const char* k, double def = -1) -> double {
++        const strata::MetaValue* v = f.get(std::string("dflash.") + k);
++        if (!v) return def;
++        if (v->type == strata::MetaType::ARRAY) return v->items.empty() ? def : v->items[0].num();
++        return v->num();
++    };
++    const HP& hp = m.hp;
++    ds.n_layer = (int) num("block_count");
++    ds.block = (int) num("block_size", 8);
++    ds.n_ff = (int) num("feed_forward_length");
++    ds.n_head = (int) num("attention.head_count");
++    ds.n_kv = (int) num("attention.head_count_kv");
++    ds.swa = (int) num("attention.sliding_window") + 1;   // the anchor and the window before it
++    ds.eps = (float) num("attention.layer_norm_rms_epsilon", 1e-6);
++    ds.base = (float) num("rope.freq_base", 1e6);
++    ds.softcap = (float) num("final_logit_softcapping", 0);
++    const strata::MetaValue* tl = f.get("dflash.target_layers");
++    const strata::MetaValue* pat = f.get("dflash.attention.sliding_window_pattern");
++    if (tl && tl->type == strata::MetaType::ARRAY)
++        for (const auto& it : tl->items) ds.taps.push_back((int) it.num());
++    if ((int) num("embedding_length") != hp.n_embd || ds.n_layer != 3 || ds.block != 8 || ds.n_head != hp.n_head ||
++        ds.n_kv != hp.n_kv || ds.taps.size() != 4 || ds.taps.back() != hp.n_vis || !pat || (int) pat->items.size() != ds.n_layer ||
++        ds.n_ff % 32 || ds.swa > 2048 - ds.block) {
++        err = path + ": not a drafter for this model (its width, heads, target layers or layout differ)";
++        return false;
++    }
++    ds.dev = m.head_dev;
++    {
++        size_t need = 0;
++        for (const auto& t : gm.meta().tensors()) need += strata::tensor_payload_bytes(t);
++        make_room(ds.dev, need + (64ull << 20));
++    }
++    Loader ld(m, gm);
++    const int d = ds.dev;
++    ds.L.resize((size_t) ds.n_layer);
++    for (int l = 0; l < ds.n_layer; ++l) {
++        DsLayer& y = ds.L[(size_t) l];
++        auto nm = [&](const char* x) { return Lname(l, x); };
++        y.swa = pat->items[(size_t) l].u != 0;
++        y.wq = ld.mat(d, nm("attn_q.weight"));
++        y.wk = ld.mat(d, nm("attn_k.weight"));
++        y.wv = ld.mat(d, nm("attn_v.weight"));
++        y.wo = ld.mat(d, nm("attn_output.weight"));
++        y.kc = ld.mat(d, nm("attn_k_ctx.weight"));
++        y.vc = ld.mat(d, nm("attn_v_ctx.weight"));
++        y.gate = ld.mat(d, nm("ffn_gate.weight"));
++        y.up = ld.mat(d, nm("ffn_up.weight"));
++        y.down = ld.mat(d, nm("ffn_down.weight"));
++        y.attn_norm = ld.f32(d, nm("attn_norm.weight"));
++        y.q_norm = ld.f32(d, nm("attn_q_norm.weight"));
++        y.k_norm = ld.f32(d, nm("attn_k_norm.weight"));
++        y.kc_norm = ld.f32(d, nm("attn_k_ctx_norm.weight"));
++        y.ctx_norm = ld.f32(d, nm("dflare_norm.weight"));
++        y.ffn_norm = ld.f32(d, nm("ffn_norm.weight"));
++    }
++    ds.out_norm = ld.f32(d, "output_norm.weight");
++    ds.mask = ld.f32(d, "mask_embd.weight");
++    ds.joint = ld.f32(d, "joint_proj.weight");
++    ds.joint_b = ld.f32(d, "joint_proj.bias");
++    ds.hidden = ld.f32(d, "dspark_hidden_out.weight");
++    ds.hidden_b = ld.f32(d, "dspark_hidden_out.bias");
++    ds.markov = ld.bf16(d, "markov_w1.weight");
++    const float* dnorm = ld.f32(d, "dspark_norm.weight");
++    {   // the fuse rows' softmax, once
++        size_t sh = 0;
++        const strata::TensorInfo* t = gm.find("dspark_fuse.weight", &sh);
++        std::vector<float> h;
++        if (!t || !host_f32(*t, gm.shard(sh).tensor_data(*t), h, ld.err) || h.size() != 16) {
++            if (ld.err.empty()) ld.err = "dspark_fuse.weight: expected 4 x 4";
++        } else
++            for (int r = 0; r < 4; ++r) {
++                float mx = -INFINITY, sum = 0.f;
++                for (int k = 0; k < 4; ++k) mx = std::max(mx, h[(size_t) r * 4 + k]);
++                for (int k = 0; k < 4; ++k) sum += std::exp(h[(size_t) r * 4 + k] - mx);
++                for (int k = 0; k < 4; ++k) ds.mix.w[r][k] = std::exp(h[(size_t) r * 4 + k] - mx) / sum;
++            }
++    }
++    for (int l = 0; l < 3; ++l) ds.mix.norm[l] = ds.L[(size_t) l].ctx_norm;
++    ds.mix.norm[3] = dnorm;
++    {
++        size_t sh = 0;
++        const strata::TensorInfo* t = gm.find("markov_w1.weight", &sh);
++        ds.rank = t ? (int) t->shape[0] : 0;
++    }
++    if (!ld.err.empty()) {
++        err = path + ": " + ld.err;
++        return false;
++    }
++    if (ds.rank <= 0 || ds.rank > 256 || ds.rank % 4) {
++        err = path + ": unexpected head rank";
++        return false;
++    }
++    std::fprintf(stderr, "strata-inkling2: DSpark drafter %s: %d layers, block %d, rank %d, features of visits %d, %d, %d and "
++                 "the last, %.0f MiB on GPU %d\n", path.c_str(), ds.n_layer, ds.block, ds.rank, ds.taps[0], ds.taps[1], ds.taps[2],
++                 (double) ld.bytes[d] / (1 << 20), d);
++    return true;
++}
++
+ bool load(const std::string& path, Model& m, int ctx, int tmax, bool q8, int n_sess, int resident, std::string& err) {
+     const auto t0 = Clock::now();
+     m.file = std::make_shared<strata::GgufModel>(strata::GgufModel::open(path));
+@@ -2481,7 +2780,9 @@ template <class T> T* dalloc_t(size_t n) {
+ struct Engine;
+ 
+ /// A conversation's state: per visit its K / V cache and convolution state, and how far it has read.
++struct DsState;
+ struct Session {
++    DsState* ds = nullptr;   // the DSpark drafter's cache for this conversation (--dspark)
+     std::vector<Kv> kv;
+     std::vector<char> kv_q8;
+     std::vector<float*> conv;
+@@ -2579,6 +2880,14 @@ struct Engine {
+     bool q8_kv = true;
+     Ckpt* ck_out = nullptr;   // a prompt chunk's forward copies each visit's state into it, as the visit ends
+     bool kv_split = false;
++    // DSpark: a forward's features ([row][4][N] on the drafter's card), the injection's context rows, the draft's buffers
++    const DsModel* dsm = nullptr;
++    int ds_mode = 0, ds_from = 0;   // 1: features from row ds_from on injected at the end; 2: features only (a verify)
++    float *ds_feat = nullptr, *ds_ctxb = nullptr, *dsx = nullptr, *dsh = nullptr, *ds_g = nullptr, *ds_up = nullptr,
++          *ds_hid = nullptr, *ds_state = nullptr, *ds_lat = nullptr, *ds_j = nullptr, *ds_x = nullptr, *ds_corr = nullptr,
++          *ds_u = nullptr;
++    void* ds_q8 = nullptr;
++    int32_t *ds_tok = nullptr, *ds_tok_h = nullptr;
+     int kv_resident = 0;              // > 0: a full-attention visit keeps its last kv_resident cells in VRAM, all in RAM;
+                                       // < 0: the pool sizes each session's window (--kv-resident auto)
+     /// A decode's read of a RAM part on CPU threads, one record a (visit, row group): the job the host function runs,
+@@ -2785,6 +3094,7 @@ struct Engine {
+             CK(cudaStreamCreateWithPriority(&D.hs, cudaStreamNonBlocking, pr));
+             CK(cudaEventCreateWithFlags(&D.evq, cudaEventDisableTiming));
+             CK(cudaEventCreateWithFlags(&D.evcpu, cudaEventDisableTiming));
++            if (dsm && d == dsm->dev) ds_alloc();
+             if (kv_split) {
+                 CK(cudaStreamCreateWithPriority(&D.ps, cudaStreamNonBlocking, hi_pr));   // ahead of this card's own work: a visit there waits on it
+                 CK(cudaEventCreateWithFlags(&D.evh, cudaEventDisableTiming));
+@@ -2930,6 +3240,21 @@ struct Engine {
+             ss.kv_q8.push_back(q8 ? 1 : 0);
+             ss.conv.push_back(dalloc((size_t) conv_c * 3));
+         }
++        if (dsm) {   // the drafter's cache: each layer's ring (the sliding ones 2048 cells, the full one its window)
++            size_t need = (size_t) DsState::kCtx * hp.n_embd * 4;
++            for (const DsLayer& l : dsm->L) need += 2 * HKV * (size_t) dsm->ring(l) * kHD * 2;
++            make_room(dsm->dev, need);
++            CK(cudaSetDevice(m->dev_ids[(size_t) dsm->dev]));
++            auto* st = new DsState;
++            for (const DsLayer& l : dsm->L) {
++                const size_t n = HKV * (size_t) dsm->ring(l) * kHD;
++                st->k.push_back(dalloc_t<__half>(n));
++                st->v.push_back(dalloc_t<__half>(n));
++            }
++            st->ctx = dalloc((size_t) DsState::kCtx * hp.n_embd);
++            st->forget(0);
++            ss.ds = st;
++        }
+     }
+ 
+     /// The smallest VRAM window of a tiered cache: a prompt chunk and the bias range.
+@@ -2937,6 +3262,29 @@ struct Engine {
+     /// A split window of w positions: each half's ring (its blocks of the window, a block more for a window that does
+     /// not start on a block pair).
+     static int split_cells(int w) { return (w + 2 * kSplitB - 1) / (2 * kSplitB) * kSplitB + kSplitB; }
++    /// The DSpark buffers on the drafter's card (room made for them first).
++    void ds_alloc() {
++        const size_t T = (size_t) tmax, N = (size_t) m->hp.n_embd, FF = (size_t) dsm->n_ff, B = (size_t) dsm->block,
++                     R = (size_t) dsm->rank;
++        make_room(dsm->dev, 8 * T * N * 4 + 3 * B * FF * 4 + (8ull << 20));
++        CK(cudaSetDevice(m->dev_ids[(size_t) dsm->dev]));
++        ds_feat = dalloc(T * 4 * N);
++        ds_ctxb = dalloc(4 * T * N);
++        dsx = dalloc(B * N);
++        dsh = dalloc(B * N);
++        ds_g = dalloc(B * FF);
++        ds_up = dalloc(B * FF);
++        ds_hid = dalloc(B * FF);
++        CK(cudaMalloc(&ds_q8, K::native_q8_1_bytes((int) FF, 1) * B));
++        ds_state = dalloc(R);
++        ds_lat = dalloc(R);
++        ds_j = dalloc(3 * R);
++        ds_x = dalloc(2 * R + 2 * N);
++        ds_corr = dalloc(N);
++        ds_u = dalloc(N);
++        ds_tok = dalloc_t<int32_t>(B + 1);
++        CK(cudaHostAlloc((void**) &ds_tok_h, (B + 1) * 4, cudaHostAllocPortable));
++    }
+     void alloc_halves(Kv& c, int d) const {
+         const size_t HKV = (size_t) m->hp.n_kv, n = HKV * (size_t) c.cells;
+         CK(cudaSetDevice(m->dev_ids[(size_t) d]));
+@@ -3231,6 +3579,109 @@ struct Engine {
+         }
+     }
+ 
++    /// Rows r0 .. r0 + n - 1 of the last forward's features (positions pos ..) into the drafter's cache: each layer's
++    /// context row (the fused features, RMS-normed) to K and V, and the head's context rows of the last positions.
++    void ds_inject(Dev& D, DsState& st, int r0, int n, int64_t pos) {
++        const int N = m->hp.n_embd, HKV = m->hp.n_kv;
++        k_ds_mix<<<dim3((unsigned) n, 4), kThreads, 0, D.st>>>(ds_feat + (size_t) r0 * 4 * N, N, dsm->mix, dsm->eps, ds_ctxb, n);
++        for (int l = 0; l < dsm->n_layer; ++l) {
++            const DsLayer& y = dsm->L[(size_t) l];
++            prep(D, ds_ctxb + (size_t) l * n * N, N, n);
++            apply(D, y.kc, D.k, n);
++            apply(D, y.vc, D.v, n);
++            k_ds_kput<<<dim3((unsigned) n, (unsigned) HKV), kHD, 0, D.st>>>(D.k, D.v, (int) pos, y.kc_norm, dsm->ring(y), st.k[(size_t) l],
++                                                                            st.v[(size_t) l], dsm->eps, dsm->base, HKV);
++        }
++        for (int t = std::max(0, n - DsState::kCtx); t < n; ++t) {
++            const int64_t p = pos + t;
++            CK(cudaMemcpyAsync(st.ctx + (size_t) (p % DsState::kCtx) * N, ds_ctxb + ((size_t) 3 * n + t) * N, (size_t) N * 4,
++                               cudaMemcpyDeviceToDevice, D.st));
++            st.ctx_pos[p % DsState::kCtx] = p;
++        }
++    }
++    /// Up to kmax tokens to follow `anchor` (the last token, at position S->pos, not yet in the state): the block
++    /// [anchor, mask x 7] through the drafter's layers, then its head a token at a time (greedy). Empty when the drafter
++    /// has no context for this position (a state it did not see being made).
++    std::vector<int32_t> ds_draft(Session& ss, int32_t anchor, int kmax) {
++        std::vector<int32_t> out;
++        DsState* st = ss.ds;
++        const int64_t pos0 = ss.pos;
++        kmax = std::min(kmax, dsm ? dsm->block - 1 : 0);
++        if (!st || kmax <= 0 || pos0 < 1 || st->ctx_pos[(pos0 - 1) % DsState::kCtx] != pos0 - 1 || st->valid_from > pos0 - 1) return out;
++        const HP& hp = m->hp;
++        const int N = hp.n_embd, HKV = hp.n_kv, G = hp.n_head / hp.n_kv, B = dsm->block, R = dsm->rank;
++        Dev& D = dev[(size_t) dsm->dev];
++        CK(cudaSetDevice(D.id));
++        // row 0: the anchor's embedding, normed as the target's first step does; rows 1 ..: the mask embedding
++        std::memcpy(hemb, m->embd + (size_t) anchor * m->embd_row, m->embd_row);
++        CK(cudaMemcpyAsync(D.erows, hemb, m->embd_row, cudaMemcpyHostToDevice, D.st));
++        K::iq_embed_rows(m->embd_type, D.erows, m->embd_row, D.iota, 1, N, D.o, D.st);
++        k_rms<<<1, kThreads, 0, D.st>>>(D.o, m->tok_norm, dsx, N, hp.eps);
++        for (int r = 1; r < B; ++r) CK(cudaMemcpyAsync(dsx + (size_t) r * N, dsm->mask, (size_t) N * 4, cudaMemcpyDeviceToDevice, D.st));
++        const float scale = 1.0f / std::sqrt((float) kHD);
++        const int64_t hi = pos0 + B - 1;
++        for (int l = 0; l < dsm->n_layer; ++l) {
++            const DsLayer& y = dsm->L[(size_t) l];
++            const int ring = dsm->ring(y);
++            k_rms<<<B, kThreads, 0, D.st>>>(dsx, y.attn_norm, D.xn[0], N, dsm->eps);
++            prep(D, D.xn[0], N, B);
++            apply(D, y.wq, D.q, B);
++            apply(D, y.wk, D.k, B);
++            apply(D, y.wv, D.v, B);
++            k_ds_qprep<<<dim3((unsigned) B, (unsigned) hp.n_head), kHD, 0, D.st>>>(D.q, (int) pos0, y.q_norm, D.qb, dsm->eps, dsm->base, G, HKV);
++            k_ds_kput<<<dim3((unsigned) B, (unsigned) HKV), kHD, 0, D.st>>>(D.k, D.v, (int) pos0, y.k_norm, ring, st->k[(size_t) l],
++                                                                            st->v[(size_t) l], dsm->eps, dsm->base, HKV);
++            // every row sees the injected context in the window before the anchor and the whole block (non-causal)
++            const int64_t lo = std::max<int64_t>(st->valid_from, y.swa ? pos0 - (dsm->swa - 1) : hi + 1 - ring);
++            const int span = (int) (hi - std::max<int64_t>(0, lo) + 1);
++            const int lo_i = (int) std::max<int64_t>(0, lo);
++            const int dk = std::min(std::max(2048, (span + 64 * 64 - 1) / (64 * 64) * 64), std::max(256, (span + 16 * 64 - 1) / (16 * 64) * 64));
++            const int nc = (span - 1) / dk + 1;
++            const KvSrc src{st->k[(size_t) l], st->v[(size_t) l], nullptr, nullptr, ring, ring, 0};
++            const int GE = B * G;   // one token's "heads": the block's rows x the KV head's queries
++            k_attn_dreg<false><<<dim3((unsigned) ((GE + 15) / 16), (unsigned) HKV, (unsigned) nc), 128, kDrSmem, D.st>>>(
++                D.qb, nullptr, src, nullptr, 0, 0, (int) hi, 0, 1, HKV * GE, GE, 0, lo_i, (int) hi, lo_i, dk, 0, nc, scale, D.pacc, D.pm,
++                D.pl);
++            k_ds_merge<<<(unsigned) (HKV * GE), kHD, 0, D.st>>>(D.pacc, D.pm, D.pl, nc, D.att, B, G);
++            prep(D, D.att, hp.n_head * kHD, B);
++            apply(D, y.wo, D.o, B);
++            k_add<<<grid1((int64_t) B * N), kThreads, 0, D.st>>>(dsx, dsx, D.o, (int64_t) B * N);
++            k_rms<<<B, kThreads, 0, D.st>>>(dsx, y.ffn_norm, D.xn[0], N, dsm->eps);
++            prep(D, D.xn[0], N, B);
++            apply(D, y.gate, ds_g, B);
++            apply(D, y.up, ds_up, B);
++            k_silu_mul<<<grid1((int64_t) B * dsm->n_ff), kThreads, 0, D.st>>>(ds_g, ds_up, ds_hid, (int64_t) B * dsm->n_ff);
++            K::native_quantize_q8_1(ds_hid, ds_q8, dsm->n_ff * B, 1, D.st);
++            if (K::native_mmvq_supported(y.down.type)) K::native_mmvq(y.down.type, y.down.d, ds_q8, D.o, y.down.n_in, y.down.n_out, B, D.st);
++            else K::iq_mmvq(y.down.type, y.down.d, ds_q8, D.o, y.down.n_in, y.down.n_out, B, D.st);
++            k_add<<<grid1((int64_t) B * N), kThreads, 0, D.st>>>(dsx, dsx, D.o, (int64_t) B * N);
++        }
++        k_rms<<<B, kThreads, 0, D.st>>>(dsx, dsm->out_norm, dsh, N, dsm->eps);
++        // the head: a token at a time, each the argmax of the target's head over (row + correction), softcapped
++        ds_tok_h[0] = anchor;
++        CK(cudaMemcpyAsync(ds_tok, ds_tok_h, 4, cudaMemcpyHostToDevice, D.st));
++        CK(cudaMemsetAsync(ds_state, 0, (size_t) R * 4, D.st));
++        const float* ctx = st->ctx + (size_t) ((pos0 - 1) % DsState::kCtx) * N;
++        for (int i = 0; i < kmax; ++i) {
++            const float* row = dsh + (size_t) (i + 1) * N;
++            k_ds_head_in<<<grid1(2 * R + 2 * N), kThreads, 0, D.st>>>(dsm->markov, ds_tok + i, ds_state, row, ctx, ds_x, R, N);
++            k_gemv_f32<<<dim3((unsigned) ((3 * R + 7) / 8), 1), kThreads, 0, D.st>>>(dsm->joint, ds_x, ds_j, 2 * R + 2 * N, 3 * R);
++            k_ds_state<<<grid1(R), kThreads, 0, D.st>>>(ds_j, dsm->joint_b, ds_state, ds_lat, R);
++            k_gemv_f32<<<dim3((unsigned) ((N + 7) / 8), 1), kThreads, 0, D.st>>>(dsm->hidden, ds_lat, ds_corr, R, N);
++            k_ds_u<<<grid1(N), kThreads, 0, D.st>>>(row, ds_corr, dsm->hidden_b, ds_u, N);
++            K::native_quantize_q8_1(ds_u, D.q8, N, 1, D.st);
++            if (K::native_mmvq_supported(m->head.type)) K::native_mmvq(m->head.type, m->head.d, D.q8, D.logits, N, m->head.n_out, 1, D.st);
++            else K::iq_mmvq(m->head.type, m->head.d, D.q8, D.logits, N, m->head.n_out, 1, D.st);
++            if (dsm->softcap > 0.f)
++                k_softcap<<<grid1((int64_t) hp.vocab), kThreads, 0, D.st>>>(D.logits, hp.vocab, hp.vocab_pad, 1, dsm->softcap);
++            k_argmax<<<kArgBlocks, kThreads, 0, D.st>>>(D.logits, hp.vocab, ds_tok + i + 1, D.amv, D.ami, false);
++            k_argmax<<<1, kThreads, 0, D.st>>>(D.logits, kArgBlocks, ds_tok + i + 1, D.amv, D.ami, true);
++        }
++        CK(cudaMemcpyAsync(ds_tok_h, ds_tok, (size_t) (kmax + 1) * 4, cudaMemcpyDeviceToHost, D.st));
++        CK(cudaStreamSynchronize(D.st));
++        out.assign(ds_tok_h + 1, ds_tok_h + 1 + kmax);
++        return out;
++    }
+     /// A decode's convs (one or two) in one launch; a verify keeps their inputs for commit() as run_conv does.
+     void conv_fused(Dev& D, ConvJob a, ConvJob* b, int T) {
+         auto keep = [&](ConvJob& j) {
+@@ -3332,6 +3783,12 @@ struct Engine {
+                 D = &dev[(size_t) d];
+                 CK(cudaSetDevice(D->id));
+             }
++            if (ds_mode && dsm) {   // a DSpark feature: this visit's input rows
++                const int sl = dsm->tap_slot(il);
++                if (sl >= 0)
++                    CK(cudaMemcpy2DAsync(ds_feat + (size_t) sl * N, (size_t) 4 * N * 4, at(cur, d), (size_t) N * 4, (size_t) N * 4,
++                                         (size_t) T, cudaMemcpyDefault, D->st));
++            }
+             if (piped && pipe_other && pipe_chunk > 0) {   // the chunk before finished this visit first
+                 while (pipe_other->done[(size_t) il].load(std::memory_order_acquire) < pipe_chunk - 1) std::this_thread::yield();
+                 CK(cudaStreamWaitEvent(D->st, pipe_other->ev[(size_t) il], 0));
+@@ -3724,6 +4181,13 @@ struct Engine {
+             D = &dev[(size_t) d];
+             CK(cudaSetDevice(D->id));
+         }
++        if (ds_mode && dsm) {   // the last feature: the normed hidden rows the head reads; then (a prompt) into the drafter
++            mix(*D, d, blocks, cur, m->out_res_q, 1, D->mixo, T);
++            k_rms<<<T, kThreads, 0, D->st>>>(D->mixo, m->out_norm, D->xn[1], N, hp.eps);
++            CK(cudaMemcpy2DAsync(ds_feat + 3 * (size_t) N, (size_t) 4 * N * 4, D->xn[1], (size_t) N * 4, (size_t) N * 4, (size_t) T,
++                                 cudaMemcpyDeviceToDevice, D->st));
++            if (ds_mode == 1 && ds_from < T) ds_inject(*D, *S->ds, ds_from, T - ds_from, pos0 + ds_from);
++        }
+         if (logit_rows > 0) {
+             mix(*D, d, blocks, cur, m->out_res_q, 1, D->mixo, T);
+             const int r0 = T - logit_rows;
+@@ -3946,12 +4410,46 @@ bool spec_step(Engine* ex, Session* S, std::vector<int32_t>& live, Drafter& dr,
+     const int kmax = std::min({kGemmT - 1, budget - 1, room - 1});
+     std::vector<int32_t> d = dr.draft(live, x, kmax);
+     d.resize((size_t) dr.choose((int) d.size()));
++    // DSpark (when loaded) drafts unless the conversation itself has a longer run to copy
++    const bool dsk = S->ds && ex->dsm;
++    bool from_ds = false;
++    // A run of the conversation's own tokens (lookup) goes first; else DSpark drafts the length that gives the most
++    // tokens a millisecond by its record (the drafts' time and the verify's by rows; 0: none)
++    if (dsk && d.size() < 2 && g_dspark_n > 0) {
++        DsState& st = *S->ds;
++        const int km = std::min(g_dspark_n, kmax);
++        const double t1 = dr.t_ms[1] > 0 ? dr.t_ms[1] : 20.0;
++        int best = 0;
++        double best_rate = 1.0 / t1, p = 1.0, e = 1.0;
++        for (int kk = 1; kk <= km; ++kk) {
++            p *= st.rate(kk);
++            e += p;
++            const double tv = dr.t_ms[kk + 1] > 0 ? dr.t_ms[kk + 1] : t1 * (1.0 + 0.25 * kk);
++            const double td = st.t_draft[kk] > 0 ? st.t_draft[kk] : 2.0 + 1.5 * kk;
++            if (e / (tv + td) > best_rate) { best_rate = e / (tv + td); best = kk; }
++        }
++        if (best == 0 && ++st.idle % 32 == 0) best = 1;   // keep measuring
++        if (best > 0) {
++            const auto td0 = std::chrono::steady_clock::now();
++            std::vector<int32_t> dd = ex->ds_draft(*S, x, best);
++            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - td0).count();
++            st.t_draft[best] = st.t_draft[best] > 0 ? 0.8 * st.t_draft[best] + 0.2 * ms : ms;
++            if (dd.size() > d.size()) {
++                d = std::move(dd);
++                from_ds = true;
++            }
++        }
++    }
+     toks.insert(toks.end(), d.begin(), d.end());
+     const int T = (int) toks.size(), k = T - 1;
+     const auto t0 = std::chrono::steady_clock::now();
++    const int64_t pos_before = S->pos;
+     ex->S = S;
+     ex->defer_conv = k > 0;
++    ex->ds_mode = dsk ? (k > 0 ? 2 : 1) : 0;   // every kept row into the drafter: a verify's after the check
++    ex->ds_from = 0;
+     ex->forward(toks.data(), T, T);
++    ex->ds_mode = 0;
+     ex->defer_conv = false;
+     int emitted = 0, stood = 0;
+     bool go = true, turned_down = false;
+@@ -3980,7 +4478,14 @@ bool spec_step(Engine* ex, Session* S, std::vector<int32_t>& live, Drafter& dr,
+     }
+     if (k > 0) {
+         ex->commit(emitted);
+-        dr.outcome(stood, turned_down);
++        if (!from_ds) dr.outcome(stood, turned_down);
++        if (dsk) ex->ds_inject(ex->dev[(size_t) ex->dsm->dev], *S->ds, 0, emitted, pos_before);
++        if (from_ds) {
++            S->ds->drafted += k;
++            S->ds->accepted += stood;
++            ++S->ds->steps;
++            S->ds->outcome(k, stood);
++        }
+     }
+     live.push_back(x);
+     for (int i = 0; i + 1 < emitted; ++i) live.push_back(toks[(size_t) i + 1]);
+@@ -4277,6 +4782,14 @@ struct Prompt {
+             b->pipe_other = &side[0];
+         }
+     }
++    int64_t ds_window() const { return ex[0]->dsm ? ex[0]->dsm->window : 0; }
++    /// A chunk [p, p + T) of a read ending at `end`: its rows within the drafter's window give it their features.
++    void ds_rows(Engine& e, Session& s, int64_t p, int T, int64_t end) const {
++        e.ds_mode = 0;
++        if (!s.ds || !e.dsm || p + T <= end - ds_window()) return;
++        e.ds_mode = 1;
++        e.ds_from = (int) std::max<int64_t>(0, end - ds_window() - p);
++    }
+     /// The chunks of rows [0, n) (all but a tail of at most kGemmT rows when `leave_tail`).
+     int64_t read(Session& s, const int32_t* ids, int64_t n, bool leave_tail, Engine*& last,
+                  const std::function<bool(int64_t)>& progress, CkPolicy* ckp = nullptr) {
+@@ -4288,6 +4801,7 @@ struct Prompt {
+         }
+         if (ch.empty()) return 0;
+         const int64_t pos0 = s.pos;
++        if (s.ds && n > ds_window()) s.ds->valid_from = std::max(s.ds->valid_from, pos0 + n - ds_window());   // (rows before: no features)
+         // a long read on whole windows (both cards are busy with its chunks: a split window would have each wait on the
+         // other), split again for the decode after it; both take the same VRAM on each card
+         struct Layout {
+@@ -4313,8 +4827,10 @@ struct Prompt {
+                 {
+                     std::shared_lock<std::shared_mutex> lk(pool->mu);
+                     ex[0]->S = &s;
++                    ds_rows(*ex[0], s, pos0 + o, T, pos0 + n);
+                     ex[0]->ck_out = ck.get();
+                     ex[0]->forward(ids + o, T, o + T == ch.back().first + ch.back().second ? 1 : 0);
++                    ex[0]->ds_mode = 0;
+                     ex[0]->ck_out = nullptr;
+                     ex[0]->sync_all();
+                 }
+@@ -4349,8 +4865,10 @@ struct Prompt {
+                     e.S = &s;
+                     e.pipe_chunk = (int64_t) c;
+                     e.pipe_pos = pos0 + o;
++                    ds_rows(e, s, pos0 + o, T, pos0 + n);
+                     e.ck_out = cks[c].get();
+                     e.forward(ids + o, T, c + 1 == ch.size() ? 1 : 0);
++                    e.ds_mode = 0;
+                     e.ck_out = nullptr;
+                     e.sync_all();
+                 }
+@@ -4591,6 +5109,7 @@ struct Serve {
+         if (r.reuse == 0) {
+             park(L);
+             L.ex->reset();
++            if (L.sess.ds) L.sess.ds->forget(0);
+             L.live.clear();
+             L.ck.clear();
+             pool->shrink(L.sess);
+@@ -4618,7 +5137,10 @@ struct Serve {
+             {
+                 std::shared_lock<std::shared_mutex> lk(pool->mu);
+                 L.ex->S = &L.sess;
++                L.ex->ds_mode = L.sess.ds ? 1 : 0;   // the tail's rows into the drafter too
++                L.ex->ds_from = 0;
+                 L.ex->forward(src + r.got, T, r.got + T == r.fresh ? 1 : 0);
++                L.ex->ds_mode = 0;
+                 L.ex->sync_all();
+             }
+             r.got += T;
+@@ -4839,6 +5361,7 @@ struct Serve {
+         }
+         for (auto& t : th) t.join();
+         D.sess.pos = n;
++        if (D.sess.ds && c.lane != li) D.sess.ds->forget(n);   // the drafter did not see these positions made
+         if (D.sess.win > 0) big.set_window(D.sess, D.sess.win, true);   // the VRAM window from the RAM cells
+         D.live = k.ids;
+         D.snap_ids.clear();
+@@ -4989,6 +5512,7 @@ struct Serve {
+             CK(cudaMemcpy(L.sess.conv[(size_t) il], P.conv[(size_t) il].data(), cb * 4, cudaMemcpyHostToDevice));
+         }
+         L.sess.pos = n;
++        if (L.sess.ds) L.sess.ds->forget(n);
+         if (L.sess.win > 0) big.set_window(L.sess, L.sess.win, true);
+         L.live = P.ids;
+         L.snap_ids.clear();
+@@ -5100,6 +5624,7 @@ struct Serve {
+             CK(cudaMemcpy(D.sess.conv[(size_t) il], B.snap_conv[(size_t) il], cb, cudaMemcpyDeviceToDevice));
+         }
+         D.sess.pos = n;
++        if (D.sess.ds) D.sess.ds->forget(n);
+         if (D.sess.win > 0) big.set_window(D.sess, D.sess.win, true);   // its VRAM window refilled from the copied cells
+         Engine& ex = *D.ex;   // the logits of the prompt's last row, for a request with nothing more to read
+         Dev& hd = ex.dev[(size_t) big.m->head_dev];
+@@ -5116,6 +5641,15 @@ struct Serve {
+                      (long long) n, ms_since(t0));
+         return n;
+     }
++    /// The drafter's record over the reply, then cleared.
++    static void ds_report(Lane& L, const char* who, int id) {
++        DsState* st = L.sess.ds;
++        if (!st || !st->steps) return;
++        std::fprintf(stderr, "%s %d: DSpark: %lld of %lld drafted tokens stood (%.0f%%), %.2f tokens a step\n", who, id,
++                     (long long) st->accepted, (long long) st->drafted, 100.0 * st->accepted / std::max<int64_t>(1, st->drafted),
++                     1.0 + (double) st->accepted / (double) st->steps);
++        st->accepted = st->drafted = st->steps = 0;
++    }
+     int pick_token(Engine* ex, const Sampling& smp, const std::vector<int32_t>& hist, std::mt19937_64& rng,
+                    std::vector<float>& buf) {
+         if (!smp.needs_logits()) return ex->greedy();
+@@ -5177,6 +5711,7 @@ struct Serve {
+         say("DONE %lld %zu %.1f %.1f %s 0 0 %zu 0 0 0 0 0.0 %lld 0\n", produced, q.ids.size(), r.ms, dms, finish, r.reuse,
+             (long long) r.fresh);
+         if (pool->on) std::fprintf(stderr, "strata serve: lane %d: pool: %s\n", li, pool->state(L.sess).c_str());
++        ds_report(L, "strata serve: lane", li);
+         std::fprintf(stderr, "strata serve: lane %d: prompt %zu tokens = %zu reused + %lld read in %.0f ms (%.1f tok/s), "
+                      "%lld generated in %.0f ms (%.1f tok/s) (%s)\n", li, q.ids.size(), r.reuse, (long long) r.fresh, r.ms,
+                      r.ms > 0 ? 1000.0 * (double) r.fresh / r.ms : 0.0, produced, dms,
+@@ -5257,6 +5792,7 @@ struct Serve {
+         info();
+         say("BDONE %d %lld %s %.1f\n", sl, produced, fin, ms_since(t0));
+         if (pool->on) std::fprintf(stderr, "strata batch: slot %d: pool: %s\n", sl, pool->state(L.sess).c_str());
++        ds_report(L, "strata batch: slot", sl);
+         std::fprintf(stderr, "strata batch: slot %d: %lld generated in %.0f ms (%.1f tok/s) (%s)\n", sl, produced, ms_since(t0),
+                      produced / std::max(1e-9, ms_since(t0) / 1000.0), fin);
+         L.used = ++clock;
+@@ -5327,7 +5863,7 @@ struct Serve {
+ }  // namespace
+ 
+ int strata::inkling2::run(int argc, char** argv) {
+-    std::string model, tokens, force, dump_full;
++    std::string model, tokens, force, dump_full, dspark_path;
+     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0;
+     bool serve_mode = false, ppl = false, q8_kv = true;
+     int n_lanes = 1, kv_res = 0, ppl_from = 0;
+@@ -5343,6 +5879,9 @@ int strata::inkling2::run(int argc, char** argv) {
+         else if (a == "--greedy") {}
+         else if (a == "--serve") serve_mode = true;
+         else if (a == "--ppl") ppl = true;
++        else if (a == "--dspark") dspark_path = next();
++        else if (a == "--dspark-n") g_dspark_n = std::max(0, std::min(7, std::atoi(next().c_str())));
++        else if (a == "--dspark-window") g_dspark_window = std::max(4096, std::atoi(next().c_str())) / 64 * 64;
+         else if (a == "--lookup-max-t")   // the most tokens a step drafts from the conversation (verified; 0: none)
+             g_lookup_max = std::max(0, std::min(kGemmT - 1, std::atoi(next().c_str())));
+         else if (a == "--ppl-from") { ppl = true; ppl_from = std::atoi(next().c_str()); }   // read N as a prompt, score the rest
+@@ -5445,6 +5984,26 @@ int strata::inkling2::run(int argc, char** argv) {
+     Pool pool;
+     pool.init(m, E, kv_res < 0);
+     if (g_reserve_mib >= 0) pool.reserve = (uint64_t) g_reserve_mib << 20;
++    g_make_room = [&](int d, size_t bytes) {
++        for (int k = 0; k < 4096 && pool.on; ++k) {
++            CK(cudaSetDevice(m.dev_ids[(size_t) d]));
++            size_t fr = 0, tot = 0;
++            CK(cudaMemGetInfo(&fr, &tot));
++            if (fr >= bytes + pool.reserve || !pool.evict_slab(d)) break;
++        }
++    };
++    static DsModel dsm;   // the DSpark drafter (--dspark), on the target's head card
++    const DsModel* dsp = nullptr;
++    if (!dspark_path.empty()) {
++        dsm.window = std::min(g_dspark_window, ctx);
++        if (!load_dspark(dspark_path, m, dsm, err)) {
++            std::fprintf(stderr, "strata-inkling2: %s\n", err.c_str());
++            return 1;
++        }
++        dsp = &dsm;
++        E.dsm = dsp;
++        E.ds_alloc();
++    }
+     std::unique_ptr<Engine> E2;   // the second prompt executor: chunks on both cards at once
+     Prompt pp;
+     // after the lanes and the sessions: the second executor only where its buffers leave the cards room to spare
+@@ -5455,7 +6014,9 @@ int strata::inkling2::run(int argc, char** argv) {
+         // rounds bring the used ones back)
+         // (+ a split window's room: the other half's query rows and running result, its partials)
+         const uint64_t split_b = m.n_dev == 2 && kv_res != 0 ? 2 * (uint64_t) chunk * m.hp.n_head * kHD * 4 + (32ull << 20) : 0;
+-        const uint64_t want = 2 * (uint64_t) chunk * row_bytes_est(m.hp) + split_b + pool.reserve;
++        // (+ the drafter's features and context rows for its chunks)
++        const uint64_t ds_b = dsp ? 8 * (uint64_t) chunk * m.hp.n_embd * 4 + (16ull << 20) : 0;
++        const uint64_t want = 2 * (uint64_t) chunk * row_bytes_est(m.hp) + split_b + ds_b + pool.reserve;
+         int moved = 0;
+         for (int d = 0; d < m.n_dev; ++d) {
+             CK(cudaSetDevice(m.dev_ids[(size_t) d]));
+@@ -5491,6 +6052,7 @@ int strata::inkling2::run(int argc, char** argv) {
+         E2 = std::make_unique<Engine>();
+         E2->q8_kv = q8_kv;
+         E2->kv_resident = kv_res;
++        E2->dsm = dsp;
+         E2->init(m, ctx, chunk, ring);
+         for (int d = 0; d < m.n_dev && pool.on; ++d) {   // what it took, measured: each card back to the pool's reserve
+             CK(cudaSetDevice(m.dev_ids[(size_t) d]));
+@@ -5526,6 +6088,7 @@ int strata::inkling2::run(int argc, char** argv) {
+             L->ex->q8_kv = q8_kv;
+             L->ex->kv_resident = kv_res;
+             L->ex->decode_first = true;
++            L->ex->dsm = dsp;
+             L->ex->init(m, ctx, kGemmT, ring);
+             E.alloc_session(L->sess);
+             L->ex->S = &L->sess;
+@@ -5669,6 +6232,10 @@ int strata::inkling2::run(int argc, char** argv) {
+         E.process(&nx, 1, [](int64_t) { return true; });
+     }
+     if (ff) std::fclose(ff);
++    if (E.S && E.S->ds && E.S->ds->steps)
++        std::fprintf(stderr, "strata-inkling2: DSpark: %lld of %lld drafted tokens stood (%.0f%%) over %lld steps, %.2f tokens a step\n",
++                     (long long) E.S->ds->accepted, (long long) E.S->ds->drafted, 100.0 * E.S->ds->accepted / std::max<int64_t>(1, E.S->ds->drafted),
++                     (long long) E.S->ds->steps, 1.0 + (double) E.S->ds->accepted / (double) E.S->ds->steps);
+     std::printf("gen:");
+     for (int t : gen) std::printf(" %d", t);
+     std::printf("\n");
+-- 
+2.56.1
+
