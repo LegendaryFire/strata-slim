@@ -31,6 +31,8 @@ engine/tests/core/dma_batch_parity.cu
 engine/tests/cuda/hc_q8_stream_test.cu
 # the CUDA and HIP builds both add this one the same way (v0.2.12)
 engine/tests/core/flag_order_test.cu
+# the CUDA build adds the gated combine test outside the check too (v0.2.17)
+engine/tests/cuda/native_moe_gated_test.cu
 # the quant layer adds its benchmark outside the tests check (v0.2.15)
 engine/tests/quant/quant_bench.cpp
 # the HIP build (Dockerfile.rocm) adds these tests and tuning tools outside the "tests/ present" check too (v0.2.10);

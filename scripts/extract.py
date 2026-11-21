@@ -103,7 +103,7 @@ def extract(tag: str) -> None:
     # the config keys the server reads (cfg.get("key") / cfg["key"] in serve/): launch.py warns about a CONFIG_<KEY>
     # not among them
     keys = set()
-    for py in Path(new, "serve").glob("*.py"):
+    for py in Path(new, "serve").rglob("*.py"):   # serve/server_parts/ too (since v0.2.16)
         keys.update(re.findall(r'cfg(?:\.get\(|\[)"([a-z_][a-z0-9_]*)"', py.read_text(encoding="utf-8")))
     Path(new, ".config-keys").write_text("".join(f"{k}\n" for k in sorted(keys)))
 

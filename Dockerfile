@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1
 # strata-slim: the Strata engine, its API server and model prep (download, pack, MTP), nothing else.
 #
-#   docker build -t strata-slim:0.2.16 .                                     # RTX 30 (sm_86), 4 compile jobs
-#   docker build -t strata-slim:0.2.16 --build-arg CUDA_ARCHITECTURES="86;89" --build-arg BUILD_JOBS=8 .
-#   docker build -t strata-slim:0.2.16-patched --build-arg PATCHES=all .    # with the local fixes (patches/README.md)
+#   docker build -t strata-slim:0.2.17 .                                     # RTX 30 (sm_86), 4 compile jobs
+#   docker build -t strata-slim:0.2.17 --build-arg CUDA_ARCHITECTURES="86;89" --build-arg BUILD_JOBS=8 .
+#   docker build -t strata-slim:0.2.17-patched --build-arg PATCHES=all .    # with the local fixes (patches/README.md)
 #
 # CUDA_ARCHITECTURES: 86 = RTX 30, 89 = RTX 40, 120 = RTX 50 (the last one also gets PTX). BUILD_JOBS: each nvcc job
 # can take several GB of RAM; raise it when the machine has the memory free.
@@ -24,9 +24,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 RUN python3 -m venv /tools
 WORKDIR /src
-# upstream (since v0.2.16) keeps the engine in engine/ beside tools/ and a few sources reach it as ../../../engine/; vendor/
-# is one flat tree, so /engine is /src
-RUN ln -s /src /engine
+# upstream (since v0.2.16) splits engine/ and terminal/, and some sources reach across as ../engine/ or ../terminal/; vendor/
+# is one flat tree, so both are /src
+RUN ln -s /src /engine && ln -s /src /terminal
 COPY vendor/requirements-build.txt /src/requirements-build.txt
 RUN /tools/bin/pip install --no-cache-dir -r requirements-build.txt
 
