@@ -1,6 +1,6 @@
-From 65810e4e53b8b2e948176a3778f118bfd6f5d012 Mon Sep 17 00:00:00 2001
+From 7a73525cb5ffd1fbfed1b5c1a6e2543b007da162 Mon Sep 17 00:00:00 2001
 From: LegendaryFire <tristan.balon@outlook.com>
-Date: Sat, 21 Nov 2026 13:44:50 -0700
+Date: Sat, 21 Nov 2026 14:27:55 -0700
 Subject: [PATCH] Draft Inkling 2 decode with its DSpark block drafter
  (--dspark FILE)
 
@@ -23,8 +23,13 @@ drafts in strata-inkling2:
   or more tokens, else a DSpark draft of the length that gives the
   most tokens a millisecond by its record (each draft position's
   rate, the drafts' and the verify's times; --dspark-n at most, 3)
-- verification is spec_step's: the reply is distributed as without
-  drafting
+- a sampled request's drafts are drawn from the drafter's own
+  distribution under its settings and stand with min(1, p / q), a
+  turned-down one redrawn from (p - q)+; a greedy request's are the
+  drafter's argmax: either way the reply is distributed as without
+  drafting (at temperature 1, 7K: 66% -> 96% of drafts stood, 52.9 ->
+  72.7 tok/s; 60K: 44% -> 56%, 50.3 -> 52.1, over greedy drafts)
+- --temperature F samples the command line's generation (tests)
 - a lane that takes over a state it did not see made (a parked
   conversation, a fork, another lane's checkpoint) starts the drafter
   from there; the drafter's weights, buffers and caches take their
@@ -35,11 +40,11 @@ drafts in strata-inkling2:
 -> 63.8; the server's prose 46 -> 52-57, edits and follow-ups with
 lookup as before or better. Prompt reading unchanged.
 ---
- vendor/src/inkling2/ink_engine.cu | 573 +++++++++++++++++++++++++++++-
- 1 file changed, 570 insertions(+), 3 deletions(-)
+ vendor/src/inkling2/ink_engine.cu | 641 +++++++++++++++++++++++++++++-
+ 1 file changed, 635 insertions(+), 6 deletions(-)
 
 diff --git a/vendor/src/inkling2/ink_engine.cu b/vendor/src/inkling2/ink_engine.cu
-index a359395..8422fd5 100644
+index a359395..e9d5b6d 100644
 --- a/vendor/src/inkling2/ink_engine.cu
 +++ b/vendor/src/inkling2/ink_engine.cu
 @@ -71,6 +71,14 @@ constexpr size_t kSplitFloats = (size_t) 4 << 20;   // the f32 products' split-K
@@ -379,7 +384,7 @@ index a359395..8422fd5 100644
      std::vector<Kv> kv;
      std::vector<char> kv_q8;
      std::vector<float*> conv;
-@@ -2579,6 +2880,14 @@ struct Engine {
+@@ -2579,6 +2880,15 @@ struct Engine {
      bool q8_kv = true;
      Ckpt* ck_out = nullptr;   // a prompt chunk's forward copies each visit's state into it, as the visit ends
      bool kv_split = false;
@@ -391,10 +396,11 @@ index a359395..8422fd5 100644
 +          *ds_u = nullptr;
 +    void* ds_q8 = nullptr;
 +    int32_t *ds_tok = nullptr, *ds_tok_h = nullptr;
++    std::vector<float> ds_lg;   // a sampled draft's logits on the host
      int kv_resident = 0;              // > 0: a full-attention visit keeps its last kv_resident cells in VRAM, all in RAM;
                                        // < 0: the pool sizes each session's window (--kv-resident auto)
      /// A decode's read of a RAM part on CPU threads, one record a (visit, row group): the job the host function runs,
-@@ -2785,6 +3094,7 @@ struct Engine {
+@@ -2785,6 +3095,7 @@ struct Engine {
              CK(cudaStreamCreateWithPriority(&D.hs, cudaStreamNonBlocking, pr));
              CK(cudaEventCreateWithFlags(&D.evq, cudaEventDisableTiming));
              CK(cudaEventCreateWithFlags(&D.evcpu, cudaEventDisableTiming));
@@ -402,7 +408,7 @@ index a359395..8422fd5 100644
              if (kv_split) {
                  CK(cudaStreamCreateWithPriority(&D.ps, cudaStreamNonBlocking, hi_pr));   // ahead of this card's own work: a visit there waits on it
                  CK(cudaEventCreateWithFlags(&D.evh, cudaEventDisableTiming));
-@@ -2930,6 +3240,21 @@ struct Engine {
+@@ -2930,6 +3241,21 @@ struct Engine {
              ss.kv_q8.push_back(q8 ? 1 : 0);
              ss.conv.push_back(dalloc((size_t) conv_c * 3));
          }
@@ -424,7 +430,7 @@ index a359395..8422fd5 100644
      }
  
      /// The smallest VRAM window of a tiered cache: a prompt chunk and the bias range.
-@@ -2937,6 +3262,29 @@ struct Engine {
+@@ -2937,6 +3263,29 @@ struct Engine {
      /// A split window of w positions: each half's ring (its blocks of the window, a block more for a window that does
      /// not start on a block pair).
      static int split_cells(int w) { return (w + 2 * kSplitB - 1) / (2 * kSplitB) * kSplitB + kSplitB; }
@@ -454,7 +460,7 @@ index a359395..8422fd5 100644
      void alloc_halves(Kv& c, int d) const {
          const size_t HKV = (size_t) m->hp.n_kv, n = HKV * (size_t) c.cells;
          CK(cudaSetDevice(m->dev_ids[(size_t) d]));
-@@ -3231,6 +3579,109 @@ struct Engine {
+@@ -3231,6 +3580,125 @@ struct Engine {
          }
      }
  
@@ -481,7 +487,10 @@ index a359395..8422fd5 100644
 +    /// Up to kmax tokens to follow `anchor` (the last token, at position S->pos, not yet in the state): the block
 +    /// [anchor, mask x 7] through the drafter's layers, then its head a token at a time (greedy). Empty when the drafter
 +    /// has no context for this position (a state it did not see being made).
-+    std::vector<int32_t> ds_draft(Session& ss, int32_t anchor, int kmax) {
++    /// `pick` (a sampled request): each step's logits to the host, the token drawn there (the caller keeps its
++    /// distribution for the verify); else the argmax on the card.
++    std::vector<int32_t> ds_draft(Session& ss, int32_t anchor, int kmax,
++                                  const std::function<int32_t(std::vector<float>&, int)>& pick = nullptr) {
 +        std::vector<int32_t> out;
 +        DsState* st = ss.ds;
 +        const int64_t pos0 = ss.pos;
@@ -553,8 +562,21 @@ index a359395..8422fd5 100644
 +            else K::iq_mmvq(m->head.type, m->head.d, D.q8, D.logits, N, m->head.n_out, 1, D.st);
 +            if (dsm->softcap > 0.f)
 +                k_softcap<<<grid1((int64_t) hp.vocab), kThreads, 0, D.st>>>(D.logits, hp.vocab, hp.vocab_pad, 1, dsm->softcap);
++            if (pick) {
++                ds_lg.resize((size_t) hp.vocab);
++                CK(cudaMemcpyAsync(ds_lg.data(), D.logits, (size_t) hp.vocab * 4, cudaMemcpyDeviceToHost, D.st));
++                CK(cudaStreamSynchronize(D.st));
++                ds_tok_h[i + 1] = pick(ds_lg, i);
++                CK(cudaMemcpyAsync(ds_tok + i + 1, ds_tok_h + i + 1, 4, cudaMemcpyHostToDevice, D.st));
++                continue;
++            }
 +            k_argmax<<<kArgBlocks, kThreads, 0, D.st>>>(D.logits, hp.vocab, ds_tok + i + 1, D.amv, D.ami, false);
 +            k_argmax<<<1, kThreads, 0, D.st>>>(D.logits, kArgBlocks, ds_tok + i + 1, D.amv, D.ami, true);
++        }
++        if (pick) {
++            CK(cudaStreamSynchronize(D.st));
++            out.assign(ds_tok_h + 1, ds_tok_h + 1 + kmax);
++            return out;
 +        }
 +        CK(cudaMemcpyAsync(ds_tok_h, ds_tok, (size_t) (kmax + 1) * 4, cudaMemcpyDeviceToHost, D.st));
 +        CK(cudaStreamSynchronize(D.st));
@@ -564,7 +586,7 @@ index a359395..8422fd5 100644
      /// A decode's convs (one or two) in one launch; a verify keeps their inputs for commit() as run_conv does.
      void conv_fused(Dev& D, ConvJob a, ConvJob* b, int T) {
          auto keep = [&](ConvJob& j) {
-@@ -3332,6 +3783,12 @@ struct Engine {
+@@ -3332,6 +3800,12 @@ struct Engine {
                  D = &dev[(size_t) d];
                  CK(cudaSetDevice(D->id));
              }
@@ -577,7 +599,7 @@ index a359395..8422fd5 100644
              if (piped && pipe_other && pipe_chunk > 0) {   // the chunk before finished this visit first
                  while (pipe_other->done[(size_t) il].load(std::memory_order_acquire) < pipe_chunk - 1) std::this_thread::yield();
                  CK(cudaStreamWaitEvent(D->st, pipe_other->ev[(size_t) il], 0));
-@@ -3724,6 +4181,13 @@ struct Engine {
+@@ -3724,6 +4198,13 @@ struct Engine {
              D = &dev[(size_t) d];
              CK(cudaSetDevice(D->id));
          }
@@ -591,13 +613,14 @@ index a359395..8422fd5 100644
          if (logit_rows > 0) {
              mix(*D, d, blocks, cur, m->out_res_q, 1, D->mixo, T);
              const int r0 = T - logit_rows;
-@@ -3946,12 +4410,46 @@ bool spec_step(Engine* ex, Session* S, std::vector<int32_t>& live, Drafter& dr,
+@@ -3946,12 +4427,60 @@ bool spec_step(Engine* ex, Session* S, std::vector<int32_t>& live, Drafter& dr,
      const int kmax = std::min({kGemmT - 1, budget - 1, room - 1});
      std::vector<int32_t> d = dr.draft(live, x, kmax);
      d.resize((size_t) dr.choose((int) d.size()));
 +    // DSpark (when loaded) drafts unless the conversation itself has a longer run to copy
 +    const bool dsk = S->ds && ex->dsm;
 +    bool from_ds = false;
++    std::vector<Dist> qd;   // a sampled DSpark draft's distributions, a row each
 +    // A run of the conversation's own tokens (lookup) goes first; else DSpark drafts the length that gives the most
 +    // tokens a millisecond by its record (the drafts' time and the verify's by rows; 0: none)
 +    if (dsk && d.size() < 2 && g_dspark_n > 0) {
@@ -616,13 +639,26 @@ index a359395..8422fd5 100644
 +        if (best == 0 && ++st.idle % 32 == 0) best = 1;   // keep measuring
 +        if (best > 0) {
 +            const auto td0 = std::chrono::steady_clock::now();
-+            std::vector<int32_t> dd = ex->ds_draft(*S, x, best);
++            // a sampled request: each draft drawn from the drafter's own distribution under the request's settings (its
++            // distribution kept: the verify takes it with min(1, p / q)); greedy: the drafter's argmax
++            const bool sampled = smp.temperature > 0.f;
++            std::vector<int32_t> dh;
++            if (sampled) dh = hist;
++            auto pick = [&](std::vector<float>& lg, int) -> int32_t {
++                Dist q = dist(lg, smp, dh);
++                const int y = draw(q, rng);
++                qd.push_back(std::move(q));
++                dh.push_back(y);
++                return y;
++            };
++            std::vector<int32_t> dd = sampled ? ex->ds_draft(*S, x, best, pick) : ex->ds_draft(*S, x, best);
 +            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - td0).count();
 +            st.t_draft[best] = st.t_draft[best] > 0 ? 0.8 * st.t_draft[best] + 0.2 * ms : ms;
 +            if (dd.size() > d.size()) {
 +                d = std::move(dd);
 +                from_ds = true;
-+            }
++            } else
++                qd.clear();
 +        }
 +    }
      toks.insert(toks.end(), d.begin(), d.end());
@@ -638,7 +674,44 @@ index a359395..8422fd5 100644
      ex->defer_conv = false;
      int emitted = 0, stood = 0;
      bool go = true, turned_down = false;
-@@ -3980,7 +4478,14 @@ bool spec_step(Engine* ex, Session* S, std::vector<int32_t>& live, Drafter& dr,
+@@ -3963,9 +4492,33 @@ bool spec_step(Engine* ex, Session* S, std::vector<int32_t>& live, Drafter& dr,
+         } else {
+             ex->host_logits(buf, i);
+             const Dist dd = dist(buf, smp, hist);
+-            double pd = 0;
+-            for (size_t j = 0; j < dd.idx.size(); ++j) pd += dd.idx[j] == dt ? dd.p[j] : 0.0;
+-            if (dt >= 0 && pd >= 1.0) y = dt;
++            auto prob = [](const Dist& v, int t) {
++                for (size_t j = 0; j < v.idx.size(); ++j)
++                    if (v.idx[j] == t) return v.p[j];
++                return 0.0;
++            };
++            const double pd = dt >= 0 ? prob(dd, dt) : 0.0;
++            if (dt >= 0 && i < (int) qd.size()) {   // a sampled draft: it stands with min(1, p / q); else from (p - q)+
++                const double qv = prob(qd[(size_t) i], dt);
++                if (qv > 0 && std::uniform_real_distribution<double>(0.0, 1.0)(rng) * qv < pd) y = dt;
++                else {
++                    Dist r;
++                    double tot = 0;
++                    for (size_t j = 0; j < dd.idx.size(); ++j) {
++                        const double w = std::max(0.0, dd.p[j] - prob(qd[(size_t) i], dd.idx[j]));
++                        if (w > 0) {
++                            r.idx.push_back(dd.idx[j]);
++                            r.p.push_back(w);
++                            tot += w;
++                        }
++                    }
++                    if (tot > 0) {
++                        for (auto& v : r.p) v /= tot;
++                        y = draw(r, rng);
++                    } else
++                        y = draw(dd, rng, dt);
++                }
++            } else if (dt >= 0 && pd >= 1.0) y = dt;
+             else if (dt >= 0 && pd > 0 && std::uniform_real_distribution<double>(0.0, 1.0)(rng) < pd) y = dt;
+             else y = draw(dd, rng, dt);
+         }
+@@ -3980,7 +4533,14 @@ bool spec_step(Engine* ex, Session* S, std::vector<int32_t>& live, Drafter& dr,
      }
      if (k > 0) {
          ex->commit(emitted);
@@ -654,7 +727,7 @@ index a359395..8422fd5 100644
      }
      live.push_back(x);
      for (int i = 0; i + 1 < emitted; ++i) live.push_back(toks[(size_t) i + 1]);
-@@ -4277,6 +4782,14 @@ struct Prompt {
+@@ -4277,6 +4837,14 @@ struct Prompt {
              b->pipe_other = &side[0];
          }
      }
@@ -669,7 +742,7 @@ index a359395..8422fd5 100644
      /// The chunks of rows [0, n) (all but a tail of at most kGemmT rows when `leave_tail`).
      int64_t read(Session& s, const int32_t* ids, int64_t n, bool leave_tail, Engine*& last,
                   const std::function<bool(int64_t)>& progress, CkPolicy* ckp = nullptr) {
-@@ -4288,6 +4801,7 @@ struct Prompt {
+@@ -4288,6 +4856,7 @@ struct Prompt {
          }
          if (ch.empty()) return 0;
          const int64_t pos0 = s.pos;
@@ -677,7 +750,7 @@ index a359395..8422fd5 100644
          // a long read on whole windows (both cards are busy with its chunks: a split window would have each wait on the
          // other), split again for the decode after it; both take the same VRAM on each card
          struct Layout {
-@@ -4313,8 +4827,10 @@ struct Prompt {
+@@ -4313,8 +4882,10 @@ struct Prompt {
                  {
                      std::shared_lock<std::shared_mutex> lk(pool->mu);
                      ex[0]->S = &s;
@@ -688,7 +761,7 @@ index a359395..8422fd5 100644
                      ex[0]->ck_out = nullptr;
                      ex[0]->sync_all();
                  }
-@@ -4349,8 +4865,10 @@ struct Prompt {
+@@ -4349,8 +4920,10 @@ struct Prompt {
                      e.S = &s;
                      e.pipe_chunk = (int64_t) c;
                      e.pipe_pos = pos0 + o;
@@ -699,7 +772,7 @@ index a359395..8422fd5 100644
                      e.ck_out = nullptr;
                      e.sync_all();
                  }
-@@ -4591,6 +5109,7 @@ struct Serve {
+@@ -4591,6 +5164,7 @@ struct Serve {
          if (r.reuse == 0) {
              park(L);
              L.ex->reset();
@@ -707,7 +780,7 @@ index a359395..8422fd5 100644
              L.live.clear();
              L.ck.clear();
              pool->shrink(L.sess);
-@@ -4618,7 +5137,10 @@ struct Serve {
+@@ -4618,7 +5192,10 @@ struct Serve {
              {
                  std::shared_lock<std::shared_mutex> lk(pool->mu);
                  L.ex->S = &L.sess;
@@ -718,7 +791,7 @@ index a359395..8422fd5 100644
                  L.ex->sync_all();
              }
              r.got += T;
-@@ -4839,6 +5361,7 @@ struct Serve {
+@@ -4839,6 +5416,7 @@ struct Serve {
          }
          for (auto& t : th) t.join();
          D.sess.pos = n;
@@ -726,7 +799,7 @@ index a359395..8422fd5 100644
          if (D.sess.win > 0) big.set_window(D.sess, D.sess.win, true);   // the VRAM window from the RAM cells
          D.live = k.ids;
          D.snap_ids.clear();
-@@ -4989,6 +5512,7 @@ struct Serve {
+@@ -4989,6 +5567,7 @@ struct Serve {
              CK(cudaMemcpy(L.sess.conv[(size_t) il], P.conv[(size_t) il].data(), cb * 4, cudaMemcpyHostToDevice));
          }
          L.sess.pos = n;
@@ -734,7 +807,7 @@ index a359395..8422fd5 100644
          if (L.sess.win > 0) big.set_window(L.sess, L.sess.win, true);
          L.live = P.ids;
          L.snap_ids.clear();
-@@ -5100,6 +5624,7 @@ struct Serve {
+@@ -5100,6 +5679,7 @@ struct Serve {
              CK(cudaMemcpy(D.sess.conv[(size_t) il], B.snap_conv[(size_t) il], cb, cudaMemcpyDeviceToDevice));
          }
          D.sess.pos = n;
@@ -742,7 +815,7 @@ index a359395..8422fd5 100644
          if (D.sess.win > 0) big.set_window(D.sess, D.sess.win, true);   // its VRAM window refilled from the copied cells
          Engine& ex = *D.ex;   // the logits of the prompt's last row, for a request with nothing more to read
          Dev& hd = ex.dev[(size_t) big.m->head_dev];
-@@ -5116,6 +5641,15 @@ struct Serve {
+@@ -5116,6 +5696,15 @@ struct Serve {
                       (long long) n, ms_since(t0));
          return n;
      }
@@ -758,7 +831,7 @@ index a359395..8422fd5 100644
      int pick_token(Engine* ex, const Sampling& smp, const std::vector<int32_t>& hist, std::mt19937_64& rng,
                     std::vector<float>& buf) {
          if (!smp.needs_logits()) return ex->greedy();
-@@ -5177,6 +5711,7 @@ struct Serve {
+@@ -5177,6 +5766,7 @@ struct Serve {
          say("DONE %lld %zu %.1f %.1f %s 0 0 %zu 0 0 0 0 0.0 %lld 0\n", produced, q.ids.size(), r.ms, dms, finish, r.reuse,
              (long long) r.fresh);
          if (pool->on) std::fprintf(stderr, "strata serve: lane %d: pool: %s\n", li, pool->state(L.sess).c_str());
@@ -766,7 +839,7 @@ index a359395..8422fd5 100644
          std::fprintf(stderr, "strata serve: lane %d: prompt %zu tokens = %zu reused + %lld read in %.0f ms (%.1f tok/s), "
                       "%lld generated in %.0f ms (%.1f tok/s) (%s)\n", li, q.ids.size(), r.reuse, (long long) r.fresh, r.ms,
                       r.ms > 0 ? 1000.0 * (double) r.fresh / r.ms : 0.0, produced, dms,
-@@ -5257,6 +5792,7 @@ struct Serve {
+@@ -5257,6 +5847,7 @@ struct Serve {
          info();
          say("BDONE %d %lld %s %.1f\n", sl, produced, fin, ms_since(t0));
          if (pool->on) std::fprintf(stderr, "strata batch: slot %d: pool: %s\n", sl, pool->state(L.sess).c_str());
@@ -774,26 +847,28 @@ index a359395..8422fd5 100644
          std::fprintf(stderr, "strata batch: slot %d: %lld generated in %.0f ms (%.1f tok/s) (%s)\n", sl, produced, ms_since(t0),
                       produced / std::max(1e-9, ms_since(t0) / 1000.0), fin);
          L.used = ++clock;
-@@ -5327,7 +5863,7 @@ struct Serve {
+@@ -5327,7 +5918,8 @@ struct Serve {
  }  // namespace
  
  int strata::inkling2::run(int argc, char** argv) {
 -    std::string model, tokens, force, dump_full;
 +    std::string model, tokens, force, dump_full, dspark_path;
++    float cli_temp = 0.f;
      int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0;
      bool serve_mode = false, ppl = false, q8_kv = true;
      int n_lanes = 1, kv_res = 0, ppl_from = 0;
-@@ -5343,6 +5879,9 @@ int strata::inkling2::run(int argc, char** argv) {
+@@ -5343,6 +5935,10 @@ int strata::inkling2::run(int argc, char** argv) {
          else if (a == "--greedy") {}
          else if (a == "--serve") serve_mode = true;
          else if (a == "--ppl") ppl = true;
 +        else if (a == "--dspark") dspark_path = next();
++        else if (a == "--temperature") cli_temp = (float) std::atof(next().c_str());
 +        else if (a == "--dspark-n") g_dspark_n = std::max(0, std::min(7, std::atoi(next().c_str())));
 +        else if (a == "--dspark-window") g_dspark_window = std::max(4096, std::atoi(next().c_str())) / 64 * 64;
          else if (a == "--lookup-max-t")   // the most tokens a step drafts from the conversation (verified; 0: none)
              g_lookup_max = std::max(0, std::min(kGemmT - 1, std::atoi(next().c_str())));
          else if (a == "--ppl-from") { ppl = true; ppl_from = std::atoi(next().c_str()); }   // read N as a prompt, score the rest
-@@ -5445,6 +5984,26 @@ int strata::inkling2::run(int argc, char** argv) {
+@@ -5445,6 +6041,26 @@ int strata::inkling2::run(int argc, char** argv) {
      Pool pool;
      pool.init(m, E, kv_res < 0);
      if (g_reserve_mib >= 0) pool.reserve = (uint64_t) g_reserve_mib << 20;
@@ -820,7 +895,7 @@ index a359395..8422fd5 100644
      std::unique_ptr<Engine> E2;   // the second prompt executor: chunks on both cards at once
      Prompt pp;
      // after the lanes and the sessions: the second executor only where its buffers leave the cards room to spare
-@@ -5455,7 +6014,9 @@ int strata::inkling2::run(int argc, char** argv) {
+@@ -5455,7 +6071,9 @@ int strata::inkling2::run(int argc, char** argv) {
          // rounds bring the used ones back)
          // (+ a split window's room: the other half's query rows and running result, its partials)
          const uint64_t split_b = m.n_dev == 2 && kv_res != 0 ? 2 * (uint64_t) chunk * m.hp.n_head * kHD * 4 + (32ull << 20) : 0;
@@ -831,7 +906,7 @@ index a359395..8422fd5 100644
          int moved = 0;
          for (int d = 0; d < m.n_dev; ++d) {
              CK(cudaSetDevice(m.dev_ids[(size_t) d]));
-@@ -5491,6 +6052,7 @@ int strata::inkling2::run(int argc, char** argv) {
+@@ -5491,6 +6109,7 @@ int strata::inkling2::run(int argc, char** argv) {
          E2 = std::make_unique<Engine>();
          E2->q8_kv = q8_kv;
          E2->kv_resident = kv_res;
@@ -839,7 +914,7 @@ index a359395..8422fd5 100644
          E2->init(m, ctx, chunk, ring);
          for (int d = 0; d < m.n_dev && pool.on; ++d) {   // what it took, measured: each card back to the pool's reserve
              CK(cudaSetDevice(m.dev_ids[(size_t) d]));
-@@ -5526,6 +6088,7 @@ int strata::inkling2::run(int argc, char** argv) {
+@@ -5526,6 +6145,7 @@ int strata::inkling2::run(int argc, char** argv) {
              L->ex->q8_kv = q8_kv;
              L->ex->kv_resident = kv_res;
              L->ex->decode_first = true;
@@ -847,7 +922,19 @@ index a359395..8422fd5 100644
              L->ex->init(m, ctx, kGemmT, ring);
              E.alloc_session(L->sess);
              L->ex->S = &L->sess;
-@@ -5669,6 +6232,10 @@ int strata::inkling2::run(int argc, char** argv) {
+@@ -5638,6 +6258,11 @@ int strata::inkling2::run(int argc, char** argv) {
+         Drafter dr;
+         dr.max_k = g_lookup_max;
+         Sampling greedy_smp;
++        if (cli_temp > 0.f) {   // --temperature: sampled generation (top-k 0 and top-p 1, as the model card)
++            greedy_smp.temperature = cli_temp;
++            greedy_smp.top_k = 0;
++            greedy_smp.top_p = 1.f;
++        }
+         std::mt19937_64 rng(0);
+         int32_t x = E.greedy();
+         gen.push_back(x);
+@@ -5669,6 +6294,10 @@ int strata::inkling2::run(int argc, char** argv) {
          E.process(&nx, 1, [](int64_t) { return true; });
      }
      if (ff) std::fclose(ff);

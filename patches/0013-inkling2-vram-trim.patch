@@ -1,0 +1,476 @@
+From 5d0df5764a79b6e3358a0e31aeffed474a5d75d5 Mon Sep 17 00:00:00 2001
+From: LegendaryFire <tristan.balon@outlook.com>
+Date: Sat, 21 Nov 2026 15:46:26 -0700
+Subject: [PATCH] Trim Inkling 2's decode VRAM, cheaper and longer DSpark
+ drafts
+
+A decode's attention partials were sized for 256-key pieces of the
+whole context (~200 MiB a lane a card at 512K): a RAM part's staged
+blocks are now read by k_attn_dreg in 2048-key partials (the same
+tokens out as the one-pass kernel at 64K with a 32K window), the
+buffer sized for that, and rows only as many as take that path. The
+drafter's features are FP16 and its context rows a layer at a time.
+2x512K, two lanes, DSpark: 2820 -> 2920 experts in VRAM at start.
+
+DSpark's adaptive length never tried a length it had not measured
+(its prior favoured 1 at long contexts: 86% of drafts stood, 1.9
+tokens a step): every eighth step tries one more, and an unmeasured
+verify row is priced at 12%, not 25%. 180K, greedy: 49.5 -> 56.1
+tok/s; temperature 1: 43.4 (35.6 without drafting).
+
+A draft read the target's 469 MiB head once a drafted token (and, a
+sampled one, copied its 200K logits to the host): the draft rows'
+head logits are now one read for all of them, each row's top 256
+candidates picked on the card (a radix select, 48 blocks a row), and
+each step scores only those (their head rows times the correction),
+softcapped; greedy takes their argmax on the card, a sampled draft
+draws from them on the host. The reply stays exact (the verify);
+greedy output unchanged. 7K: 80.9 -> 84.6 tok/s greedy, 53.6 -> 56.1
+at temperature 1; 60K: 56.4 -> 55.0 greedy, 50.5 -> 55.0.
+---
+ vendor/src/inkling2/ink_engine.cu | 272 ++++++++++++++++++++++++++----
+ 1 file changed, 238 insertions(+), 34 deletions(-)
+
+diff --git a/vendor/src/inkling2/ink_engine.cu b/vendor/src/inkling2/ink_engine.cu
+index e9d5b6d..ddac40e 100644
+--- a/vendor/src/inkling2/ink_engine.cu
++++ b/vendor/src/inkling2/ink_engine.cu
+@@ -70,6 +70,7 @@ constexpr int kAttTileT = 16;     // from this many rows attention is the tiled
+ constexpr size_t kSplitFloats = (size_t) 4 << 20;   // the f32 products' split-K partials
+ constexpr int kMaxLanes = 8;
+ constexpr int kStage = 16384;     // cells of a RAM part staged in VRAM at a time
++constexpr int kHostKeys = 2048;   // keys a decode partial of a staged RAM block (the tensor-core kernel)
+ int g_cc_mib = 8192, g_cc_slots = 4, g_cc_min = 2048;   // --conversation-cache-mib / -slots / -min-tokens
+ int g_dspark_n = 3;              // --dspark-n: the most tokens DSpark drafts a step
+ // Room on card d for `bytes` more (the pool moves its coldest experts to RAM; nothing without the pool): the drafter's
+@@ -1431,15 +1432,21 @@ struct DsMix {
+     float w[4][4];          // softmax of each fuse row: [layer 0..2, head context][feature]
+     const float* norm[4];   // dflare_norm of each layer, dspark_norm
+ };
+-/// out[j][t] = RMS-normed (sum_k w[j][k] feat[t][k]) * norm[j]: the drafter layers' context rows and the head's.
+-__global__ void k_ds_mix(const float* feat, int n, DsMix a, float eps, float* out, int T) {
++/// FP32 rows into FP16 rows `pitch` values apart (a feature slot of [row][4][N]).
++__global__ void k_f2h_rows(const float* x, __half* y, int n, size_t pitch) {
++    const int t = blockIdx.y;
++    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
++        y[(size_t) t * pitch + i] = __float2half(x[(size_t) t * n + i]);
++}
++/// out[t] = RMS-normed (sum_k w[j][k] feat[t][k]) * norm[j]: drafter layer j's context rows (j = 3: the head's).
++__global__ void k_ds_mix(const __half* feat, int n, DsMix a, int j, float eps, float* out) {
+     __shared__ float sh[kThreads];
+-    const int t = blockIdx.x, j = blockIdx.y;
+-    float* o = out + ((size_t) j * T + t) * n;
++    const int t = blockIdx.x;
++    float* o = out + (size_t) t * n;
+     float ss = 0.f;
+     for (int i = threadIdx.x; i < n; i += blockDim.x) {
+         float x = 0.f;
+-        for (int k = 0; k < 4; ++k) x += a.w[j][k] * feat[((size_t) t * 4 + k) * n + i];
++        for (int k = 0; k < 4; ++k) x += a.w[j][k] * __half2float(feat[((size_t) t * 4 + k) * n + i]);
+         o[i] = x;
+         ss += x * x;
+     }
+@@ -1532,6 +1539,121 @@ __global__ void k_ds_state(const float* j, const float* jb, float* state, float*
+     state[i] = c + g * (state[i] - c);
+     latent[i] = tanhf(j[2 * rank + i] + jb[2 * rank + i]);
+ }
++constexpr int kDsCand = 256;   // a draft row's candidates: the top of the target head's logits of the row
++/// Each row's kDsCand largest values (index, value; in no order): a radix select on the float's ordered bits, 11, 11
++/// and 10 bits a pass, each pass's histogram built by many blocks (k_tk_hist) and read by one (k_tk_pick), then the
++/// ones above the threshold and enough of the ones equal to it gathered (k_tk_take). st: [row] {prefix, mask, need, gt, eq}.
++__device__ __forceinline__ unsigned tk_key(float f) {
++    const unsigned u = __float_as_uint(f);
++    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
++}
++constexpr int kTkBins = 2048, kTkBlocks = 48;
++__global__ void k_tk_hist(const float* x, int n, int ld, const unsigned* st, unsigned* hist, int shift, int bits) {
++    __shared__ unsigned h[kTkBins];
++    const int row = blockIdx.y;
++    for (int i = threadIdx.x; i < (1 << bits); i += blockDim.x) h[i] = 0;
++    __syncthreads();
++    const unsigned prefix = st[row * 5], mask = st[row * 5 + 1], dm = (1u << bits) - 1;
++    const float* r = x + (size_t) row * ld;
++    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
++        const unsigned k = tk_key(r[i]);
++        if ((k & mask) == prefix) atomicAdd(&h[(k >> shift) & dm], 1u);
++    }
++    __syncthreads();
++    for (int i = threadIdx.x; i < (1 << bits); i += blockDim.x)
++        if (h[i]) atomicAdd(&hist[(size_t) row * kTkBins + i], h[i]);
++}
++__global__ void k_tk_pick(unsigned* st, unsigned* hist, int shift, int bits) {
++    const int row = blockIdx.x;
++    unsigned* hr = hist + (size_t) row * kTkBins;
++    if (threadIdx.x == 0) {
++        unsigned need = st[row * 5 + 2], cum = 0;
++        int b = (1 << bits) - 1;
++        for (; b > 0; --b) {
++            if (cum + hr[b] >= need) break;
++            cum += hr[b];
++        }
++        st[row * 5] |= (unsigned) b << shift;
++        st[row * 5 + 1] |= ((1u << bits) - 1) << shift;
++        st[row * 5 + 2] = need - cum;
++    }
++    __syncthreads();
++    for (int i = threadIdx.x; i < kTkBins; i += blockDim.x) hr[i] = 0;   // the next pass's
++}
++__global__ void k_tk_init(unsigned* st, int rows) {
++    const int r = threadIdx.x;
++    if (r < rows) {
++        st[r * 5] = 0;
++        st[r * 5 + 1] = 0;
++        st[r * 5 + 2] = kDsCand;
++        st[r * 5 + 3] = 0;
++        st[r * 5 + 4] = 0;
++    }
++}
++__global__ void k_tk_take(const float* x, int n, int ld, unsigned* st, int32_t* oi, float* ov) {
++    const int row = blockIdx.y;
++    const unsigned thr = st[row * 5], need_eq = st[row * 5 + 2];
++    const unsigned n_gt = kDsCand - need_eq;
++    const float* r = x + (size_t) row * ld;
++    int32_t* o = oi + (size_t) row * kDsCand;
++    float* v = ov + (size_t) row * kDsCand;
++    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
++        const unsigned k = tk_key(r[i]);
++        if (k > thr) {
++            const unsigned p = atomicAdd(&st[row * 5 + 3], 1u);
++            if (p < n_gt) {
++                o[p] = i;
++                v[p] = r[i];
++            }
++        } else if (k == thr) {
++            const unsigned p = atomicAdd(&st[row * 5 + 4], 1u);
++            if (p < need_eq) {
++                o[n_gt + p] = i;
++                v[n_gt + p] = r[i];
++            }
++        }
++    }
++}
++/// A draft step's candidates' logits: the row's head logit plus the head row (Q8_0) times the step's correction, softcapped.
++__global__ void k_ds_cand(const int32_t* ci, const float* cv, const uint8_t* head, size_t row_bytes, const float* corr, int n,
++                          float cap, float* out) {
++    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, c = blockIdx.x * (blockDim.x / 32) + warp;
++    if (c >= kDsCand) return;
++    const uint8_t* row = head + (size_t) ci[c] * row_bytes;
++    float s = 0.f;
++    for (int b = lane; b < n / 32; b += 32) {
++        const uint8_t* blk = row + (size_t) b * 34;
++        const float d = __half2float(*reinterpret_cast<const __half*>(blk));
++        const int8_t* q = reinterpret_cast<const int8_t*>(blk + 2);
++        const float* x = corr + (size_t) b * 32;
++        float a = 0.f;
++#pragma unroll 8
++        for (int j = 0; j < 32; ++j) a += (float) q[j] * x[j];
++        s += d * a;
++    }
++    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
++    if (lane == 0) {
++        const float l = cv[c] + s;
++        out[c] = cap > 0.f ? cap * tanhf(l / cap) : l;
++    }
++}
++/// The largest of the candidates' logits (the lowest token id of a tie), as a token.
++__global__ void k_cand_argmax(const int32_t* ci, const float* l, int32_t* tok) {
++    __shared__ float bv[kDsCand];
++    __shared__ int bi[kDsCand];
++    const int t = threadIdx.x;
++    bv[t] = l[t];
++    bi[t] = ci[t];
++    __syncthreads();
++    for (int s2 = kDsCand / 2; s2 > 0; s2 >>= 1) {
++        if (t < s2 && (bv[t + s2] > bv[t] || (bv[t + s2] == bv[t] && bi[t + s2] < bi[t]))) {
++            bv[t] = bv[t + s2];
++            bi[t] = bi[t + s2];
++        }
++        __syncthreads();
++    }
++    if (t == 0) tok[0] = bi[0];
++}
+ __global__ void k_ds_u(const float* row, const float* corr, const float* b, float* u, int n) {
+     const int i = blockIdx.x * blockDim.x + threadIdx.x;
+     if (i < n) u[i] = row[i] + corr[i] + b[i];   // the head of (row + correction): one read of it for both terms
+@@ -2883,12 +3005,17 @@ struct Engine {
+     // DSpark: a forward's features ([row][4][N] on the drafter's card), the injection's context rows, the draft's buffers
+     const DsModel* dsm = nullptr;
+     int ds_mode = 0, ds_from = 0;   // 1: features from row ds_from on injected at the end; 2: features only (a verify)
+-    float *ds_feat = nullptr, *ds_ctxb = nullptr, *dsx = nullptr, *dsh = nullptr, *ds_g = nullptr, *ds_up = nullptr,
++    __half* ds_feat = nullptr;   // FP16: a draft's input only (the verify keeps the reply exact)
++    float *ds_ctxb = nullptr, *dsx = nullptr, *dsh = nullptr, *ds_g = nullptr, *ds_up = nullptr,
+           *ds_hid = nullptr, *ds_state = nullptr, *ds_lat = nullptr, *ds_j = nullptr, *ds_x = nullptr, *ds_corr = nullptr,
+           *ds_u = nullptr;
+     void* ds_q8 = nullptr;
+     int32_t *ds_tok = nullptr, *ds_tok_h = nullptr;
+-    std::vector<float> ds_lg;   // a sampled draft's logits on the host
++    float *ds_base = nullptr, *ds_cv = nullptr, *ds_cl = nullptr;   // the rows' head logits, their candidates' values, a step's
++    int32_t* ds_ci = nullptr;                                       // the rows' candidates
++    unsigned *ds_tk = nullptr, *ds_tkh = nullptr;                   // their select's state and histograms
++    float* ds_cl_h = nullptr;                                       // pinned: a step's candidates' logits (a sampled draft)
++    int32_t* ds_ci_h = nullptr;
+     int kv_resident = 0;              // > 0: a full-attention visit keeps its last kv_resident cells in VRAM, all in RAM;
+                                       // < 0: the pool sizes each session's window (--kv-resident auto)
+     /// A decode's read of a RAM part on CPU threads, one record a (visit, row group): the job the host function runs,
+@@ -2995,7 +3122,12 @@ struct Engine {
+         const HP& hp = m->hp;
+         const size_t T = (size_t) tmax, N = (size_t) hp.n_embd, Kp = (size_t) hp.top_k, FF = (size_t) hp.n_ff;
+         const size_t H = (size_t) hp.n_head, HKV = (size_t) hp.n_kv, QD = H * kHD, KD = HKV * kHD;
+-        n_chunk_max = (ctx + kChunkKeys - 1) / kChunkKeys + 1 + (kv_resident != 0 ? kCpuSegs + 2 : 0);
++        // a decode's partials a row: the VRAM part's blocks (65 at most), the other card's, the RAM part's staged blocks
++        // (kHostKeys keys a partial) and the CPU's segments; the old one-pass kernel (more query heads a KV head than
++        // the tensor-core one takes) reads kChunkKeys a partial
++        const bool dm_ok = hp.n_head / hp.n_kv <= 3 && hp.n_rel <= 16;
++        n_chunk_max = dm_ok ? 66 + 1 + (ctx + kHostKeys - 1) / kHostKeys + 1 + (kv_resident != 0 ? kCpuSegs + 2 : 0)
++                            : (ctx + kChunkKeys - 1) / kChunkKeys + 1 + (kv_resident != 0 ? kCpuSegs + 2 : 0);
+         att_q = (int) std::max<size_t>(1, std::min<size_t>(64, ((size_t) 32 << 20) / (H * (size_t) n_chunk_max * kHD)));
+         conv_c = (int) (2 * KD + 2 * N);
+         experts_in_ram = kv_resident < 0;   // the pool may move experts to RAM at any time
+@@ -3058,7 +3190,7 @@ struct Engine {
+             D.ewts = dalloc(T * Kp);
+             D.rlog = dalloc(T * hp.n_expert);
+             if (prompt) D.sk_part = dalloc(kSplitFloats);
+-            const size_t rows = (size_t) std::min(att_q, tmax) * H;
++            const size_t rows = (size_t) std::min({att_q, tmax, kAttTileT - 1}) * H;   // (more rows: the prompt kernel)
+             D.pacc = dalloc(rows * n_chunk_max * kHD);
+             D.pm = dalloc(rows * n_chunk_max);
+             D.pl = dalloc(rows * n_chunk_max);
+@@ -3267,10 +3399,10 @@ struct Engine {
+     void ds_alloc() {
+         const size_t T = (size_t) tmax, N = (size_t) m->hp.n_embd, FF = (size_t) dsm->n_ff, B = (size_t) dsm->block,
+                      R = (size_t) dsm->rank;
+-        make_room(dsm->dev, 8 * T * N * 4 + 3 * B * FF * 4 + (8ull << 20));
++        make_room(dsm->dev, 3 * T * N * 4 + 3 * B * FF * 4 + (8ull << 20));
+         CK(cudaSetDevice(m->dev_ids[(size_t) dsm->dev]));
+-        ds_feat = dalloc(T * 4 * N);
+-        ds_ctxb = dalloc(4 * T * N);
++        ds_feat = dalloc_t<__half>(T * 4 * N);
++        ds_ctxb = dalloc(T * N);   // a layer's context rows at a time
+         dsx = dalloc(B * N);
+         dsh = dalloc(B * N);
+         ds_g = dalloc(B * FF);
+@@ -3284,6 +3416,15 @@ struct Engine {
+         ds_corr = dalloc(N);
+         ds_u = dalloc(N);
+         ds_tok = dalloc_t<int32_t>(B + 1);
++        ds_base = dalloc(B * (size_t) m->hp.vocab_pad);
++        ds_cv = dalloc(B * kDsCand);
++        ds_cl = dalloc(kDsCand);
++        ds_ci = dalloc_t<int32_t>(B * kDsCand);
++        ds_tk = dalloc_t<unsigned>(B * 5);
++        ds_tkh = dalloc_t<unsigned>(B * kTkBins);
++        CK(cudaMemset(ds_tkh, 0, B * kTkBins * 4));
++        CK(cudaHostAlloc((void**) &ds_cl_h, kDsCand * 4, cudaHostAllocPortable));
++        CK(cudaHostAlloc((void**) &ds_ci_h, B * kDsCand * 4, cudaHostAllocPortable));
+         CK(cudaHostAlloc((void**) &ds_tok_h, (B + 1) * 4, cudaHostAllocPortable));
+     }
+     void alloc_halves(Kv& c, int d) const {
+@@ -3584,18 +3725,21 @@ struct Engine {
+     /// context row (the fused features, RMS-normed) to K and V, and the head's context rows of the last positions.
+     void ds_inject(Dev& D, DsState& st, int r0, int n, int64_t pos) {
+         const int N = m->hp.n_embd, HKV = m->hp.n_kv;
+-        k_ds_mix<<<dim3((unsigned) n, 4), kThreads, 0, D.st>>>(ds_feat + (size_t) r0 * 4 * N, N, dsm->mix, dsm->eps, ds_ctxb, n);
++        const __half* f = ds_feat + (size_t) r0 * 4 * N;
+         for (int l = 0; l < dsm->n_layer; ++l) {
+             const DsLayer& y = dsm->L[(size_t) l];
+-            prep(D, ds_ctxb + (size_t) l * n * N, N, n);
++            k_ds_mix<<<(unsigned) n, kThreads, 0, D.st>>>(f, N, dsm->mix, l, dsm->eps, ds_ctxb);
++            prep(D, ds_ctxb, N, n);
+             apply(D, y.kc, D.k, n);
+             apply(D, y.vc, D.v, n);
+             k_ds_kput<<<dim3((unsigned) n, (unsigned) HKV), kHD, 0, D.st>>>(D.k, D.v, (int) pos, y.kc_norm, dsm->ring(y), st.k[(size_t) l],
+                                                                             st.v[(size_t) l], dsm->eps, dsm->base, HKV);
+         }
+-        for (int t = std::max(0, n - DsState::kCtx); t < n; ++t) {
++        const int t0 = std::max(0, n - DsState::kCtx);   // the head's context rows: the last positions only
++        k_ds_mix<<<(unsigned) (n - t0), kThreads, 0, D.st>>>(f + (size_t) t0 * 4 * N, N, dsm->mix, 3, dsm->eps, ds_ctxb);
++        for (int t = t0; t < n; ++t) {
+             const int64_t p = pos + t;
+-            CK(cudaMemcpyAsync(st.ctx + (size_t) (p % DsState::kCtx) * N, ds_ctxb + ((size_t) 3 * n + t) * N, (size_t) N * 4,
++            CK(cudaMemcpyAsync(st.ctx + (size_t) (p % DsState::kCtx) * N, ds_ctxb + (size_t) (t - t0) * N, (size_t) N * 4,
+                                cudaMemcpyDeviceToDevice, D.st));
+             st.ctx_pos[p % DsState::kCtx] = p;
+         }
+@@ -3605,8 +3749,10 @@ struct Engine {
+     /// has no context for this position (a state it did not see being made).
+     /// `pick` (a sampled request): each step's logits to the host, the token drawn there (the caller keeps its
+     /// distribution for the verify); else the argmax on the card.
+-    std::vector<int32_t> ds_draft(Session& ss, int32_t anchor, int kmax,
+-                                  const std::function<int32_t(std::vector<float>&, int)>& pick = nullptr) {
++    using DsPick = std::function<int32_t(const int32_t*, const float*, int, int)>;   // (tokens, logits, n, step) -> token
++    static int32_t pick_cand(const DsPick& pick, const int32_t* ids, const float* lg, int step) { return pick(ids, lg, kDsCand, step); }
++    std::vector<float> ds_lgv;
++    std::vector<int32_t> ds_draft(Session& ss, int32_t anchor, int kmax, const DsPick& pick = nullptr) {
+         std::vector<int32_t> out;
+         DsState* st = ss.ds;
+         const int64_t pos0 = ss.pos;
+@@ -3661,28 +3807,58 @@ struct Engine {
+             k_add<<<grid1((int64_t) B * N), kThreads, 0, D.st>>>(dsx, dsx, D.o, (int64_t) B * N);
+         }
+         k_rms<<<B, kThreads, 0, D.st>>>(dsx, dsm->out_norm, dsh, N, dsm->eps);
+-        // the head: a token at a time, each the argmax of the target's head over (row + correction), softcapped
++        // the head: one read of the target's head for all the draft rows (their logits, each row's top candidates); then
++        // a token at a time, each candidate's logit plus its head row times the step's correction, softcapped
++        const bool q80 = m->head.type == 8;
++        if (q80) {
++            K::native_quantize_q8_1(dsh + N, D.q8, N * kmax, 1, D.st);
++            K::native_mmvq(m->head.type, m->head.d, D.q8, ds_base, N, m->head.n_out, kmax, D.st);
++            k_tk_init<<<1, 32, 0, D.st>>>(ds_tk, kmax);
++            const int shifts[3] = {21, 10, 0}, bits[3] = {11, 11, 10};
++            for (int ps = 0; ps < 3; ++ps) {
++                k_tk_hist<<<dim3(kTkBlocks, (unsigned) kmax), 512, 0, D.st>>>(ds_base, hp.vocab, hp.vocab_pad, ds_tk, ds_tkh, shifts[ps], bits[ps]);
++                k_tk_pick<<<(unsigned) kmax, 256, 0, D.st>>>(ds_tk, ds_tkh, shifts[ps], bits[ps]);
++            }
++            k_tk_take<<<dim3(kTkBlocks, (unsigned) kmax), 512, 0, D.st>>>(ds_base, hp.vocab, hp.vocab_pad, ds_tk, ds_ci, ds_cv);
++            if (pick) CK(cudaMemcpyAsync(ds_ci_h, ds_ci, (size_t) kmax * kDsCand * 4, cudaMemcpyDeviceToHost, D.st));
++        }
+         ds_tok_h[0] = anchor;
+         CK(cudaMemcpyAsync(ds_tok, ds_tok_h, 4, cudaMemcpyHostToDevice, D.st));
+         CK(cudaMemsetAsync(ds_state, 0, (size_t) R * 4, D.st));
+         const float* ctx = st->ctx + (size_t) ((pos0 - 1) % DsState::kCtx) * N;
++        const size_t hrow = (size_t) (N / 32) * 34;
+         for (int i = 0; i < kmax; ++i) {
+             const float* row = dsh + (size_t) (i + 1) * N;
+             k_ds_head_in<<<grid1(2 * R + 2 * N), kThreads, 0, D.st>>>(dsm->markov, ds_tok + i, ds_state, row, ctx, ds_x, R, N);
+             k_gemv_f32<<<dim3((unsigned) ((3 * R + 7) / 8), 1), kThreads, 0, D.st>>>(dsm->joint, ds_x, ds_j, 2 * R + 2 * N, 3 * R);
+             k_ds_state<<<grid1(R), kThreads, 0, D.st>>>(ds_j, dsm->joint_b, ds_state, ds_lat, R);
+             k_gemv_f32<<<dim3((unsigned) ((N + 7) / 8), 1), kThreads, 0, D.st>>>(dsm->hidden, ds_lat, ds_corr, R, N);
++            if (q80) {   // (the correction's bias with it: one vector)
++                k_add<<<grid1(N), kThreads, 0, D.st>>>(ds_u, ds_corr, dsm->hidden_b, (int64_t) N);
++                k_ds_cand<<<kDsCand / 8, 256, 0, D.st>>>(ds_ci + (size_t) i * kDsCand, ds_cv + (size_t) i * kDsCand, m->head.d, hrow,
++                                                         ds_u, N, dsm->softcap, ds_cl);
++                if (pick) {
++                    CK(cudaMemcpyAsync(ds_cl_h, ds_cl, kDsCand * 4, cudaMemcpyDeviceToHost, D.st));
++                    CK(cudaStreamSynchronize(D.st));
++                    ds_tok_h[i + 1] = pick_cand(pick, ds_ci_h + (size_t) i * kDsCand, ds_cl_h, i);
++                    CK(cudaMemcpyAsync(ds_tok + i + 1, ds_tok_h + i + 1, 4, cudaMemcpyHostToDevice, D.st));
++                } else
++                    k_cand_argmax<<<1, kDsCand, 0, D.st>>>(ds_ci + (size_t) i * kDsCand, ds_cl, ds_tok + i + 1);
++                continue;
++            }
+             k_ds_u<<<grid1(N), kThreads, 0, D.st>>>(row, ds_corr, dsm->hidden_b, ds_u, N);
+             K::native_quantize_q8_1(ds_u, D.q8, N, 1, D.st);
+             if (K::native_mmvq_supported(m->head.type)) K::native_mmvq(m->head.type, m->head.d, D.q8, D.logits, N, m->head.n_out, 1, D.st);
+             else K::iq_mmvq(m->head.type, m->head.d, D.q8, D.logits, N, m->head.n_out, 1, D.st);
+             if (dsm->softcap > 0.f)
+                 k_softcap<<<grid1((int64_t) hp.vocab), kThreads, 0, D.st>>>(D.logits, hp.vocab, hp.vocab_pad, 1, dsm->softcap);
+-            if (pick) {
+-                ds_lg.resize((size_t) hp.vocab);
+-                CK(cudaMemcpyAsync(ds_lg.data(), D.logits, (size_t) hp.vocab * 4, cudaMemcpyDeviceToHost, D.st));
++            if (pick) {   // (a head the candidates' kernel does not read: the full logits to the host)
++                ds_lgv.resize((size_t) hp.vocab);
++                std::vector<int32_t> all((size_t) hp.vocab);
++                for (int j = 0; j < hp.vocab; ++j) all[(size_t) j] = j;
++                CK(cudaMemcpyAsync(ds_lgv.data(), D.logits, (size_t) hp.vocab * 4, cudaMemcpyDeviceToHost, D.st));
+                 CK(cudaStreamSynchronize(D.st));
+-                ds_tok_h[i + 1] = pick(ds_lg, i);
++                ds_tok_h[i + 1] = pick(all.data(), ds_lgv.data(), hp.vocab, i);
+                 CK(cudaMemcpyAsync(ds_tok + i + 1, ds_tok_h + i + 1, 4, cudaMemcpyHostToDevice, D.st));
+                 continue;
+             }
+@@ -3802,9 +3978,8 @@ struct Engine {
+             }
+             if (ds_mode && dsm) {   // a DSpark feature: this visit's input rows
+                 const int sl = dsm->tap_slot(il);
+-                if (sl >= 0)
+-                    CK(cudaMemcpy2DAsync(ds_feat + (size_t) sl * N, (size_t) 4 * N * 4, at(cur, d), (size_t) N * 4, (size_t) N * 4,
+-                                         (size_t) T, cudaMemcpyDefault, D->st));
++                if (sl >= 0)   // (the buffer on the drafter's card: peer stores from this one)
++                    k_f2h_rows<<<dim3(4, (unsigned) T), kThreads, 0, D->st>>>(at(cur, d), ds_feat + (size_t) sl * N, N, (size_t) 4 * N);
+             }
+             if (piped && pipe_other && pipe_chunk > 0) {   // the chunk before finished this visit first
+                 while (pipe_other->done[(size_t) il].load(std::memory_order_acquire) < pipe_chunk - 1) std::this_thread::yield();
+@@ -3995,7 +4170,8 @@ struct Engine {
+                     }
+                     g_end = (int) ((double) res_lo * (1.0 - cpu_frac)) / kChunkKeys * kChunkKeys;
+                 }
+-                const int nc_h = g_end > 0 ? (g_end - 1) / kChunkKeys + 1 : 0;
++                const int hk = dm ? kHostKeys : kChunkKeys;   // keys a staged block's partial
++                const int nc_h = g_end > 0 ? (g_end - 1) / hk + 1 : 0;
+                 const bool two = cv.split && dm;   // the other card reads its half, its result one more partial
+                 const int nseg = on_cpu ? kCpuSegs : 0, h_slot = nc_r + nc_h, c_cpu = h_slot + (two ? 1 : 0);
+                 const int nc = c_cpu + nseg;
+@@ -4070,7 +4246,13 @@ struct Engine {
+                 } else
+                     dec(vram, res_lo, INT32_MAX, base, 0, nc_r);
+                 each_host_block(*D, cv, g_end, [&](const KvSrc& src, int k0, int k1) {
+-                    dec(src, k0, k1, k0, nc_r + k0 / kChunkKeys, (k1 - k0) / kChunkKeys + 1);
++                    if (dm) {
++                        const dim3 hg((unsigned) ((nq * G + 15) / 16), (unsigned) HKV, (unsigned) ((k1 - k0) / kHostKeys + 1));
++                        k_attn_dreg<true><<<hg, 128, kDrSmem, D->st>>>(D->qb, D->rb, src, L.rel_bias, hp.n_rel, L.extent, pos0, t0, nq, H, G,
++                                                                      win, k0, k1, k0, kHostKeys, nc_r + k0 / kHostKeys, nc, scale,
++                                                                      D->pacc, D->pm, D->pl);
++                    } else
++                        dec(src, k0, k1, k0, nc_r + k0 / kChunkKeys, (k1 - k0) / kChunkKeys + 1);
+                 });
+                 if (on_cpu) {
+                     CK(cudaEventRecord(cr->g1, D->st));
+@@ -4201,8 +4383,7 @@ struct Engine {
+         if (ds_mode && dsm) {   // the last feature: the normed hidden rows the head reads; then (a prompt) into the drafter
+             mix(*D, d, blocks, cur, m->out_res_q, 1, D->mixo, T);
+             k_rms<<<T, kThreads, 0, D->st>>>(D->mixo, m->out_norm, D->xn[1], N, hp.eps);
+-            CK(cudaMemcpy2DAsync(ds_feat + 3 * (size_t) N, (size_t) 4 * N * 4, D->xn[1], (size_t) N * 4, (size_t) N * 4, (size_t) T,
+-                                 cudaMemcpyDeviceToDevice, D->st));
++            k_f2h_rows<<<dim3(4, (unsigned) T), kThreads, 0, D->st>>>(D->xn[1], ds_feat + 3 * (size_t) N, N, (size_t) 4 * N);
+             if (ds_mode == 1 && ds_from < T) ds_inject(*D, *S->ds, ds_from, T - ds_from, pos0 + ds_from);
+         }
+         if (logit_rows > 0) {
+@@ -4442,11 +4623,12 @@ bool spec_step(Engine* ex, Session* S, std::vector<int32_t>& live, Drafter& dr,
+         for (int kk = 1; kk <= km; ++kk) {
+             p *= st.rate(kk);
+             e += p;
+-            const double tv = dr.t_ms[kk + 1] > 0 ? dr.t_ms[kk + 1] : t1 * (1.0 + 0.25 * kk);
++            const double tv = dr.t_ms[kk + 1] > 0 ? dr.t_ms[kk + 1] : t1 * (1.0 + 0.12 * kk);   // (a row more: ~12% measured)
+             const double td = st.t_draft[kk] > 0 ? st.t_draft[kk] : 2.0 + 1.5 * kk;
+             if (e / (tv + td) > best_rate) { best_rate = e / (tv + td); best = kk; }
+         }
+         if (best == 0 && ++st.idle % 32 == 0) best = 1;   // keep measuring
++        else if (best > 0 && best < km && ++st.idle % 8 == 0) ++best;   // and the next length up (else it is never measured)
+         if (best > 0) {
+             const auto td0 = std::chrono::steady_clock::now();
+             // a sampled request: each draft drawn from the drafter's own distribution under the request's settings (its
+@@ -4454,8 +4636,30 @@ bool spec_step(Engine* ex, Session* S, std::vector<int32_t>& live, Drafter& dr,
+             const bool sampled = smp.temperature > 0.f;
+             std::vector<int32_t> dh;
+             if (sampled) dh = hist;
+-            auto pick = [&](std::vector<float>& lg, int) -> int32_t {
+-                Dist q = dist(lg, smp, dh);
++            auto pick = [&](const int32_t* ids, const float* lg, int n, int) -> int32_t {
++                // the drafter's distribution over its candidates under the request's temperature, top-p and min-p
++                std::vector<int> ord((size_t) n);
++                for (int j = 0; j < n; ++j) ord[(size_t) j] = j;
++                const int kk = std::min(n, smp.top_k > 0 ? smp.top_k : 64);
++                std::partial_sort(ord.begin(), ord.begin() + kk, ord.end(), [&](int a, int b) { return lg[a] > lg[b]; });
++                Dist q;
++                double sum = 0;
++                std::vector<double> p((size_t) kk);
++                for (int j = 0; j < kk; ++j) sum += (p[(size_t) j] = std::exp((lg[ord[(size_t) j]] - lg[ord[0]]) / smp.temperature));
++                int keep = kk;
++                double cum = 0;
++                for (int j = 0; j < kk; ++j) {
++                    if (p[(size_t) j] < smp.min_p * p[0]) { keep = j; break; }
++                    cum += p[(size_t) j] / sum;
++                    if (cum >= smp.top_p) { keep = j + 1; break; }
++                }
++                keep = std::max(1, keep);
++                double tot = 0;
++                for (int j = 0; j < keep; ++j) tot += p[(size_t) j];
++                for (int j = 0; j < keep; ++j) {
++                    q.idx.push_back(ids[ord[(size_t) j]]);
++                    q.p.push_back(p[(size_t) j] / tot);
++                }
+                 const int y = draw(q, rng);
+                 qd.push_back(std::move(q));
+                 dh.push_back(y);
+@@ -6072,7 +6276,7 @@ int strata::inkling2::run(int argc, char** argv) {
+         // (+ a split window's room: the other half's query rows and running result, its partials)
+         const uint64_t split_b = m.n_dev == 2 && kv_res != 0 ? 2 * (uint64_t) chunk * m.hp.n_head * kHD * 4 + (32ull << 20) : 0;
+         // (+ the drafter's features and context rows for its chunks)
+-        const uint64_t ds_b = dsp ? 8 * (uint64_t) chunk * m.hp.n_embd * 4 + (16ull << 20) : 0;
++        const uint64_t ds_b = dsp ? 3 * (uint64_t) chunk * m.hp.n_embd * 4 + (16ull << 20) : 0;
+         const uint64_t want = 2 * (uint64_t) chunk * row_bytes_est(m.hp) + split_b + ds_b + pool.reserve;
+         int moved = 0;
+         for (int d = 0; d < m.n_dev; ++d) {
+-- 
+2.56.1
+
