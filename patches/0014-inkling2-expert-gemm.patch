@@ -1,0 +1,548 @@
+From 8519c7571ea9509ad43dd8d932425f9f692a4d02 Mon Sep 17 00:00:00 2001
+From: LegendaryFire <tristan.balon@outlook.com>
+Date: Sat, 21 Nov 2026 18:48:48 -0700
+Subject: [PATCH] Read Inkling 2's prompts faster: a warp-specialized NVFP4
+ expert GEMM
+
+The prompt's expert GEMM ran each expert's routed rows in 64 x 128
+tiles, every warp copying, converting and multiplying in turn, a hot
+expert's row tiles (up to ~2000 rows of a 1024-token chunk, the mean
+64) one after another in a single block. Now:
+
+- the row tiles of every expert are a list the grid walks
+  (k_tiles), so a hot expert's rows spread over many blocks;
+- NVFP4 runs k_expert_ws: 8 warps copy the rows and convert a step's
+  weights to FP16 while 8 others multiply the step before (64 x 128
+  tiles, 32 x 32 a warp), handing the buffers over with named
+  barriers (rows three steps deep, converted weights two); the raw
+  weights are copied four steps at a time in 16-byte pieces (8 for
+  the 648-byte down rows), and the block scale is decoded without
+  branches;
+- the codes go through a byte-to-half2 table, the rows' K permuted
+  within each 16 (a byte's two nibbles side by side), shared memory
+  swizzled instead of padded.
+
+Q8_0 experts keep k_expert_mma2 (now with the tile list). The K
+order within 16 changes the tensor cores' rounding: the 20K text's
+ppl 3.941 -> 3.875 (this model's rounding noise; every kernel here
+gives the same output as the others).
+
+Two cards, both executors, the DSpark drafter (expert GEMM time on
+the busier card -10%): 7K 1679 -> 1818 tok/s, 60K 1739 -> 1865, 180K
+1428 -> 1508. Decode unchanged.
+---
+ vendor/src/inkling2/ink_engine.cu | 394 +++++++++++++++++++++++++-----
+ 1 file changed, 333 insertions(+), 61 deletions(-)
+
+diff --git a/vendor/src/inkling2/ink_engine.cu b/vendor/src/inkling2/ink_engine.cu
+index ddac40e..330db7b 100644
+--- a/vendor/src/inkling2/ink_engine.cu
++++ b/vendor/src/inkling2/ink_engine.cu
+@@ -709,6 +709,17 @@ __device__ __forceinline__ float ue4m3_f(uint32_t x) {
+     if (x == 0 || x == 0x7F) return 0.f;
+     return e == 0 ? (float) mn * (1.0f / 1024.0f) : __uint_as_float(((e + 119) << 23) | (mn << 20));
+ }
++/// NVFP4's K order in the prompt's expert GEMM: within each 16-value sub-block, value j and j + 8 (a byte's low and
++/// high nibble) next to each other, so a weight byte is a half2 (a dot product's terms in any order: the same sums).
++__host__ __device__ __forceinline__ int nv4_perm(int k) {
++    const int w = k & 15;
++    return (k & ~15) | (w < 8 ? 2 * w : 2 * (w - 8) + 1);
++}
++/// ue4m3_f as FP16, without branches: its bits shifted into FP16's are the value / 2^7, subnormals too (0x7F: 0).
++__device__ __forceinline__ __half2 ue4m3_h2(uint32_t x) {
++    const uint32_t b = x == 0x7Fu ? 0u : x << 7;
++    return __hmul2(__halves2half2(__ushort_as_half((unsigned short) b), __ushort_as_half((unsigned short) b)), __float2half2_rn(128.f));
++}
+ __device__ __forceinline__ uint32_t fp4_lut(uint32_t q) {
+     const uint32_t idx = q & 0x07070707u, sp = idx | (idx >> 4);
+     const uint32_t sel = (sp & 0xFFu) | ((sp >> 8) & 0xFF00u);
+@@ -1659,50 +1670,78 @@ __global__ void k_ds_u(const float* row, const float* corr, const float* b, floa
+     if (i < n) u[i] = row[i] + corr[i] + b[i];   // the head of (row + correction): one read of it for both terms
+ }
+ 
+-/// The prompt's expert GEMM on mma.sync: a block a 64 x 128 tile (rows = the group's routed entries, columns =
+-/// output channels; gate/up: 64 gate + 64 up), 8 warps of 32 x 32; A from the gathered FP16 rows, B the GGUF blocks
++/// The prompt's expert GEMM on mma.sync: a block an MR x 8192 / MR tile (rows = the group's routed entries, columns =
++/// output channels; gate/up: half gate, half up), 8 warps of 32 x 32; A from the gathered FP16 rows, B the GGUF blocks
+ /// copied a step ahead and converted to FP16 in shared memory; SITU in the gate/up epilogue, s_down in the down one.
+-constexpr int kXM = 64, kXLd = kEK + 8;   // 64 rows: two blocks an SM (one converts while the other multiplies)
+-template <int TY> constexpr size_t expert2_smem() {
+-    constexpr size_t body = (size_t) 2 * kXM * kXLd * 2 + (size_t) 2 * kEN * seg_bytes<TY>() + (size_t) kEN * kXLd * 2;
+-    constexpr size_t cs = (size_t) kXM * (kEN + 4) * 4;
++constexpr int kXLd = kEK + 8;
++template <int MR> __host__ __device__ constexpr int x_cols() { return 8192 / MR; }   // a block's columns: MR rows x this, 8 warps of 32 x 32
++template <int TY, int MR> constexpr size_t expert2_smem() {
++    constexpr int NC = x_cols<MR>();
++    constexpr size_t body = (size_t) 2 * MR * kEK * 2 + (size_t) 2 * NC * seg_bytes<TY>() + (size_t) NC * kXLd * 2;
++    constexpr size_t cs = (size_t) MR * (NC + 4) * 4;
+     return body > cs ? body : cs;
+ }
+-template <int TY, bool GU>
++/// A row's 16-byte chunk c of a step's rows in shared memory: swizzled (no padding), ldmatrix without conflicts.
++__device__ __forceinline__ int a_sw(int r, int c) { return r * kEK + ((c ^ (r & 7)) << 3); }
++template <int TY, bool GU, int MR>
+ __global__ void __launch_bounds__(256) k_expert_mma2(const __half* X, const unsigned long long* grp_ptr,
+                                                      const int32_t* grp_start, const int32_t* n_groups, size_t w_off,
+                                                      size_t row_bytes, int K, int n_ff, size_t tail_off, float beta, float lb,
+-                                                     float* Y, __half* H, int ld_y) {
++                                                     float* Y, __half* H, int ld_y, int h_perm, const int2* tiles,
++                                                     const int32_t* n_tiles) {
++    // NVFP4: a byte's two codes as a half2 (the rows' K in nv4_perm order); the table once a block
++    __shared__ __half2 lut[TY == 40 ? 256 : 1];
++    if constexpr (TY == 40) {
++        for (int i = threadIdx.x; i < 256; i += blockDim.x) {
++            const uint32_t c = fp4_lut((uint32_t) (i & 15) | ((uint32_t) (i >> 4) << 8));
++            lut[i] = __halves2half2(__int2half_rn((int) (int8_t) (c & 0xFF)), __int2half_rn((int) (int8_t) ((c >> 8) & 0xFF)));
++        }
++        __syncthreads();
++    }
+     constexpr int SEG = seg_bytes<TY>(), QK = TY == 40 ? 64 : 32, BB = TY == 40 ? 36 : 34;
+-    const int g = blockIdx.y;
+-    if (g >= *n_groups) return;
++    if ((int) blockIdx.y >= *n_tiles) return;
++    const int2 tl = tiles[blockIdx.y];   // (group, first row): a hot expert's rows over many blocks
++    const int g = tl.x;
+     const int s0 = grp_start[g], n = grp_start[g + 1] - s0;
+-    const int c0 = blockIdx.x * (GU ? kEN / 2 : kEN), tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
+-    const int wm = warp % 2, wn = warp / 2, gq = lane / 4, tq = lane % 4;   // a warp: 32 rows x 32 columns
++    constexpr int NC = x_cols<MR>(), WM = MR / 32;
++    const int c0 = blockIdx.x * (GU ? NC / 2 : NC), tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
++    const int wm = warp % WM, wn = warp / WM, gq = lane / 4, tq = lane % 4;   // a warp: 32 rows x 32 columns
+     const uint8_t* W = (const uint8_t*) grp_ptr[g] + w_off;
+     const float* tail = tail_off ? (const float*) (grp_ptr[g] + tail_off) : nullptr;
+     extern __shared__ __align__(128) unsigned char esm[];
+-    __half* As = reinterpret_cast<__half*>(esm);                               // [2][kXM * kXLd]
+-    uint8_t* raw = esm + (size_t) 2 * kXM * kXLd * 2;                          // [2][kEN * SEG]
+-    __half* Bs = reinterpret_cast<__half*>(raw + (size_t) 2 * kEN * SEG);      // [kEN * kXLd], column major
+-    float* Cs = reinterpret_cast<float*>(esm);                                 // [kXM][kEN + 4], after the K loop
++    __half* As = reinterpret_cast<__half*>(esm);                               // [2][MR * kEK], swizzled
++    uint8_t* raw = esm + (size_t) 2 * MR * kEK * 2;                            // [2][NC * SEG]
++    __half* Bs = reinterpret_cast<__half*>(raw + (size_t) 2 * NC * SEG);       // [NC * kXLd], column major
++    float* Cs = reinterpret_cast<float*>(esm);                                 // [MR][NC + 4], after the K loop
+     const int steps = K / kEK;
+-    for (int r0 = 0; r0 < n; r0 += kXM) {
+-        const int nr = min(kXM, n - r0);
++    // this thread's copies, their addresses once: TPC threads a weight column (its words part, part + TPC, ..), and
++    // A_PT 16-byte pieces of the rows
++    constexpr int TPC = 256 / NC, WPC = SEG / 4, WPT = (WPC + TPC - 1) / TPC, A_PT = MR * (kEK / 8) / 256;
++    constexpr int STEP_B = kEK / QK * BB;   // a step's bytes along a weight row
++    const int wj = tid / TPC, wpart = tid % TPC;
++    const int wrow = GU ? (wj < NC / 2 ? c0 + wj : n_ff + c0 + wj - NC / 2) : c0 + wj;
++    const uint8_t* wsrc = W + (size_t) wrow * row_bytes + 4 * wpart;
++    const int wdst = wj * SEG + 4 * wpart;
++    for (int r0 = tl.y; r0 == tl.y; r0 += MR) {
++        const int nr = min(MR, n - r0);
++        const __half* asrc[A_PT];
++        int adst[A_PT], asz[A_PT];
++#pragma unroll
++        for (int q = 0; q < A_PT; ++q) {
++            const int i = tid + 256 * q, r = i / (kEK / 8), c = i % (kEK / 8);
++            asrc[q] = X + (size_t) (s0 + r0 + (r < nr ? r : 0)) * K + c * 8;
++            adst[q] = a_sw(r, c);
++            asz[q] = r < nr ? 16 : 0;
++        }
+         auto issue = [&](int st, int buf) {
+-            const int k0 = st * kEK;
+-            uint8_t* rd = raw + (size_t) buf * kEN * SEG;
+-            for (int i = tid; i < kEN * (SEG / 4); i += 256) {
+-                const int j = i / (SEG / 4), w = i % (SEG / 4);
+-                const int row = GU ? (j < kEN / 2 ? c0 + j : n_ff + c0 + j - kEN / 2) : c0 + j;
+-                cp_async4(rd + j * SEG + 4 * w, W + (size_t) row * row_bytes + (size_t) (k0 / QK) * BB + 4 * w);
+-            }
+-            __half* ad = As + (size_t) buf * kXM * kXLd;
+-            for (int i = tid; i < kXM * (kEK / 8); i += 256) {
+-                const int r = i / (kEK / 8), c8 = (i % (kEK / 8)) * 8;
+-                const int rr = r < nr ? r : 0;
+-                cp_async16(ad + r * kXLd + c8, X + (size_t) (s0 + r0 + rr) * K + k0 + c8, r < nr ? 16 : 0);
+-            }
++            uint8_t* rd = raw + (size_t) buf * NC * SEG + wdst;
++            const uint8_t* ws = wsrc + (size_t) st * STEP_B;
++#pragma unroll
++            for (int q = 0; q < WPT; ++q)
++                if (wpart + TPC * q < WPC) cp_async4(rd + 4 * TPC * q, ws + 4 * TPC * q);
++            __half* ad = As + (size_t) buf * MR * kEK;
++#pragma unroll
++            for (int q = 0; q < A_PT; ++q) cp_async16(ad + adst[q], asrc[q] + st * kEK, asz[q]);
+             cp_commit();
+         };
+         float acc[2][4][4];
+@@ -1722,22 +1761,21 @@ __global__ void __launch_bounds__(256) k_expert_mma2(const __half* X, const unsi
+                 cp_wait<0>();
+             }
+             __syncthreads();
+-            const uint8_t* rs = raw + (size_t) (st & 1) * kEN * SEG;
++            const uint8_t* rs = raw + (size_t) (st & 1) * NC * SEG;
+ #pragma unroll
+-            for (int it = 0; it < kEN * 8 / 256; ++it) {   // the step's weight blocks to FP16 (as k_expert_mma)
++            for (int it = 0; it < NC * 8 / 256; ++it) {   // the step's weight blocks to FP16 (as k_expert_mma)
+                 const int idx = it * 256 + tid;
+                 const int col = (idx % 8) + 8 * (idx / 64), ch = (idx / 8) % 8;
+                 const uint8_t* sg = rs + col * SEG;
+                 __half2 v[4];
+-                if constexpr (TY == 40) {
+-                    const int sb = ch / 2, sh = (ch & 1) * 4;
++                if constexpr (TY == 40) {   // K positions ch * 8 .. + 7 in nv4_perm order: 4 bytes of sub-block ch / 2
++                    const int sb = ch / 2;
+                     const __half2 d = __float2half2_rn(ue4m3_f(sg[sb]));
+-                    const uint32_t q0 = fp4_lut((*reinterpret_cast<const uint32_t*>(sg + 4 + sb * 8) >> sh) & 0x0F0F0F0Fu);
+-                    const uint32_t q1 = fp4_lut((*reinterpret_cast<const uint32_t*>(sg + 8 + sb * 8) >> sh) & 0x0F0F0F0Fu);
+-                    v[0] = i8x2_half2(q0, 0x9180, d);
+-                    v[1] = i8x2_half2(q0, 0xB3A2, d);
+-                    v[2] = i8x2_half2(q1, 0x9180, d);
+-                    v[3] = i8x2_half2(q1, 0xB3A2, d);
++                    const uint32_t w = *reinterpret_cast<const uint32_t*>(sg + 4 + sb * 8 + (ch & 1) * 4);
++                    v[0] = __hmul2(lut[w & 0xFF], d);
++                    v[1] = __hmul2(lut[(w >> 8) & 0xFF], d);
++                    v[2] = __hmul2(lut[(w >> 16) & 0xFF], d);
++                    v[3] = __hmul2(lut[w >> 24], d);
+                 } else {
+                     const int bl = ch / 4, off = (ch % 4) * 8;
+                     const uint8_t* bp = sg + bl * 34;
+@@ -1749,12 +1787,12 @@ __global__ void __launch_bounds__(256) k_expert_mma2(const __half* X, const unsi
+                 *reinterpret_cast<uint4*>(Bs + col * kXLd + ch * 8) = *reinterpret_cast<const uint4*>(v);
+             }
+             __syncthreads();
+-            const __half* ac = As + (size_t) (st & 1) * kXM * kXLd;
++            const __half* ac = As + (size_t) (st & 1) * MR * kEK;
+ #pragma unroll
+             for (int kk = 0; kk < kEK; kk += 16) {
+                 uint32_t af[2][4];
+-                if (live0) ldsm_x4(af[0], ac + (wm * 32 + (lane % 8) + ((lane / 8) % 2) * 8) * kXLd + kk + (lane / 16) * 8);
+-                if (live1) ldsm_x4(af[1], ac + (wm * 32 + 16 + (lane % 8) + ((lane / 8) % 2) * 8) * kXLd + kk + (lane / 16) * 8);
++                if (live0) ldsm_x4(af[0], ac + a_sw(wm * 32 + (lane % 8) + ((lane / 8) % 2) * 8, kk / 8 + lane / 16));
++                if (live1) ldsm_x4(af[1], ac + a_sw(wm * 32 + 16 + (lane % 8) + ((lane / 8) % 2) * 8, kk / 8 + lane / 16));
+ #pragma unroll
+                 for (int nj = 0; nj < 4; nj += 2) {
+                     uint32_t bf[4];
+@@ -1778,28 +1816,245 @@ __global__ void __launch_bounds__(256) k_expert_mma2(const __half* X, const unsi
+ #pragma unroll
+                 for (int i = 0; i < 4; ++i) {
+                     const int r = wm * 32 + mi * 16 + gq + (i / 2) * 8, c = wn * 32 + nj * 8 + 2 * tq + (i % 2);
+-                    Cs[r * (kEN + 4) + c] = acc[mi][nj][i];
++                    Cs[r * (NC + 4) + c] = acc[mi][nj][i];
+                 }
+         __syncthreads();
+         if constexpr (GU) {
+             const float sg = tail ? tail[0] : 1.f, su = tail ? tail[1] : 1.f;
+-            for (int i = tid; i < nr * (kEN / 2); i += 256) {
+-                const int r = i / (kEN / 2), j = i % (kEN / 2);
+-                const float gv = Cs[r * (kEN + 4) + j] * sg, u0 = Cs[r * (kEN + 4) + kEN / 2 + j] * su;
++            for (int i = tid; i < nr * (NC / 2); i += 256) {
++                const int r = i / (NC / 2), j = i % (NC / 2);
++                const float gv = Cs[r * (NC + 4) + j] * sg, u0 = Cs[r * (NC + 4) + NC / 2 + j] * su;
+                 const float u = lb > 0.f ? lb * tanhf(u0 / lb) : u0;
+-                H[(size_t) (s0 + r0 + r) * n_ff + c0 + j] = __float2half(beta * tanhf(gv / beta) / (1.0f + expf(-gv)) * u);
++                const int hc = h_perm ? nv4_perm(c0 + j) : c0 + j;   // (the down GEMM's K order)
++                H[(size_t) (s0 + r0 + r) * n_ff + hc] = __float2half(beta * tanhf(gv / beta) / (1.0f + expf(-gv)) * u);
+             }
+         } else {
+             const float sd = tail ? tail[2] : 1.f;
+-            for (int i = tid; i < nr * kEN; i += 256) {
+-                const int r = i / kEN, c = i % kEN;
+-                Y[(size_t) (s0 + r0 + r) * ld_y + c0 + c] = Cs[r * (kEN + 4) + c] * sd;
++            for (int i = tid; i < nr * NC; i += 256) {
++                const int r = i / NC, c = i % NC;
++                Y[(size_t) (s0 + r0 + r) * ld_y + c0 + c] = Cs[r * (NC + 4) + c] * sd;
++            }
++        }
++        __syncthreads();
++    }
++}
++
++/// The prompt's expert GEMM, warp-specialized: half the warps copy the rows and convert a step's weights to FP16 while
++/// the other half multiply the step before (a consumer warp 32 or 64 rows x 32 columns), handing the buffers over with
++/// named barriers: the rows three steps deep, the converted weights two, the raw weights copied 4 steps at a time
++/// (8- or 16-byte pieces: NVFP4's 36-byte blocks align only 4 at a time). Products as k_expert_mma2's.
++constexpr int kWsRaw = 4;   // steps a raw weight copy
++template <int MR, int NC, int WC> __host__ __device__ constexpr int ws_threads() { return 32 * (MR / (MR == 128 ? 64 : 32)) * (NC / WC) + 256; }
++template <int TY, int MR, int NC> constexpr size_t expert_ws_smem() {
++    constexpr size_t body = (size_t) 3 * MR * kEK * 2 + (size_t) 2 * NC * kWsRaw * seg_bytes<TY>() + (size_t) 2 * NC * kEK * 2;
++    constexpr size_t cs = (size_t) MR * (NC + 4) * 4;
++    return body > cs ? body : cs;
++}
++__device__ __forceinline__ void cp_async8(void* dst, const void* src, int bytes) {
++    asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;\n" ::"r"((uint32_t) __cvta_generic_to_shared(dst)), "l"(src), "r"(bytes));
++}
++__device__ __forceinline__ void bar_sync(int id, int n) { asm volatile("bar.sync %0, %1;\n" ::"r"(id), "r"(n) : "memory"); }
++__device__ __forceinline__ void bar_arrive(int id, int n) { asm volatile("bar.arrive %0, %1;\n" ::"r"(id), "r"(n) : "memory"); }
++template <int TY, bool GU, int MR, int NC, int WC>
++__global__ void __launch_bounds__(ws_threads<MR, NC, WC>(), 1) k_expert_ws(const __half* X, const unsigned long long* grp_ptr,
++                                                     const int32_t* grp_start, const int32_t* n_groups, size_t w_off,
++                                                     size_t row_bytes, int K, int n_ff, size_t tail_off, float beta, float lb,
++                                                     float* Y, __half* H, int ld_y, int h_perm, const int2* tiles,
++                                                     const int32_t* n_tiles) {
++    // a consumer warp: WR rows (MI tiles of 16) x WC columns (NJ tiles of 8); then 8 producer warps
++    constexpr int WR = MR == 128 ? 64 : 32, MI = WR / 16, NJ = WC / 8, WMN = MR / WR, NT = ws_threads<MR, NC, WC>(), PT = 256;
++    constexpr int CT = NT - PT;
++    constexpr int kFull = 1, kEmpty = 3, kProd = 5;   // named barriers: full[2], empty[2], the producers' own
++    __shared__ __half2 lut[TY == 40 ? 256 : 1];
++    if constexpr (TY == 40) {
++        for (int i = threadIdx.x; i < 256; i += blockDim.x) {
++            const uint32_t c = fp4_lut((uint32_t) (i & 15) | ((uint32_t) (i >> 4) << 8));
++            lut[i] = __halves2half2(__int2half_rn((int) (int8_t) (c & 0xFF)), __int2half_rn((int) (int8_t) ((c >> 8) & 0xFF)));
++        }
++    }
++    __syncthreads();
++    constexpr int SEG = seg_bytes<TY>(), QK = TY == 40 ? 64 : 32, BB = TY == 40 ? 36 : 34;
++    if ((int) blockIdx.y >= *n_tiles) return;
++    const int2 tl = tiles[blockIdx.y];   // (group, first row): a hot expert's rows over many blocks
++    const int g = tl.x;
++    const int s0 = grp_start[g], n = grp_start[g + 1] - s0;
++    const int c0 = blockIdx.x * (GU ? NC / 2 : NC), tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
++    const bool producer = tid >= CT;
++    const uint8_t* W = (const uint8_t*) grp_ptr[g] + w_off;
++    const float* tail = tail_off ? (const float*) (grp_ptr[g] + tail_off) : nullptr;
++    extern __shared__ __align__(128) unsigned char esm[];
++    __half* As = reinterpret_cast<__half*>(esm);                               // [3][MR * kEK], swizzled
++    constexpr int RSEG = kWsRaw * SEG;                                         // a column's raw bytes of a copy
++    uint8_t* raw = esm + (size_t) 3 * MR * kEK * 2;                            // [2][NC * RSEG]
++    __half* Bs = reinterpret_cast<__half*>(raw + (size_t) 2 * NC * RSEG);      // [2][NC * kEK], column major, swizzled
++    float* Cs = reinterpret_cast<float*>(esm);                                 // [MR][NC + 4], after the K loop
++    const int steps = K / kEK;
++    // a producer's copies (TPC threads a weight column: pieces part, part + TPC, ..; A_PT pieces of the rows) and
++    // conversions; 16-byte pieces where the rows allow (the down rows: 648 bytes, 8)
++    constexpr int TPC = PT / NC, A_PT = MR * (kEK / 8) / PT;
++    constexpr int STEP_B = kEK / QK * BB;
++    static_assert(STEP_B == SEG, "a step's bytes are a segment");
++    const bool p16 = ((row_bytes | (size_t) W) & 15) == 0;
++    const int pb = p16 ? 16 : 8, n_pc = RSEG / pb;
++    const int pt = tid - CT;
++    const int wj = (producer ? pt : 0) / TPC, wpart = (producer ? pt : 0) % TPC;
++    const int wrow = GU ? (wj < NC / 2 ? c0 + wj : n_ff + c0 + wj - NC / 2) : c0 + wj;
++    const uint8_t* wsrc = W + (size_t) wrow * row_bytes;
++    uint8_t* const wdst = raw + wj * RSEG;
++    const int wm = warp % WMN, wn = warp / WMN, gq = lane / 4, tq = lane % 4;   // a consumer: rows wm * WR, columns wn * WC
++    for (int r0 = tl.y; r0 == tl.y; r0 += MR) {
++        const int nr = min(MR, n - r0);
++        float acc[MI][NJ][4];
++        if (producer) {
++            const __half* asrc[A_PT];
++            int adst[A_PT], asz[A_PT];
++#pragma unroll
++            for (int q = 0; q < A_PT; ++q) {
++                const int i = pt + PT * q, r = i / (kEK / 8), c = i % (kEK / 8);
++                asrc[q] = X + (size_t) (s0 + r0 + (r < nr ? r : 0)) * K + c * 8;
++                adst[q] = a_sw(r, c);
++                asz[q] = r < nr ? 16 : 0;
++            }
++            auto issue = [&](int st) {
++                const int buf = st % 3;
++                if (st % kWsRaw == 0) {   // steps st .. st + 3's raw weights (the last copy: what is left of the row)
++                    uint8_t* rd = wdst + (size_t) ((st / kWsRaw) & 1) * NC * RSEG;
++                    const uint8_t* ws = wsrc + (size_t) st * STEP_B;
++                    const int valid = min(kWsRaw, steps - st) * SEG;
++                    for (int c = wpart; c < n_pc; c += TPC) {
++                        const int bytes = max(0, min(pb, valid - c * pb));
++                        if (p16) cp_async16(rd + c * 16, ws + c * 16, bytes);
++                        else cp_async8(rd + c * 8, ws + c * 8, bytes);
++                    }
++                }
++                __half* ad = As + (size_t) buf * MR * kEK;
++#pragma unroll
++                for (int q = 0; q < A_PT; ++q) cp_async16(ad + adst[q], asrc[q] + st * kEK, asz[q]);
++                cp_commit();
++            };
++            // step st: its copies in, converted into Bs[st & 1] (free: the consumers' step st - 2 is done), handed
++            // over; then step st + 2's copies into the stage the consumers' step st - 1 used, once it is done
++            issue(0);
++            if (steps > 1) issue(1);
++            for (int st = 0; st < steps; ++st) {
++                if (st + 1 < steps) cp_wait<1>();
++                else cp_wait<0>();
++                bar_sync(kProd, PT);   // every producer's copies of step st are in
++                const uint8_t* rs = raw + (size_t) ((st / kWsRaw) & 1) * NC * RSEG + (st % kWsRaw) * SEG;
++                __half* bd = Bs + (size_t) (st & 1) * NC * kEK;
++#pragma unroll
++                for (int it = 0; it < NC * 8 / PT; ++it) {
++                    const int idx = it * PT + pt;
++                    const int col = (idx % 8) + 8 * (idx / 64), ch = (idx / 8) % 8;
++                    const uint8_t* sg = rs + col * RSEG;
++                    __half2 v[4];
++                    if constexpr (TY == 40) {
++                        const int sb = ch / 2;
++                        const __half2 d = ue4m3_h2(sg[sb]);
++                        const uint32_t w = *reinterpret_cast<const uint32_t*>(sg + 4 + sb * 8 + (ch & 1) * 4);
++                        v[0] = __hmul2(lut[w & 0xFF], d);
++                        v[1] = __hmul2(lut[(w >> 8) & 0xFF], d);
++                        v[2] = __hmul2(lut[(w >> 16) & 0xFF], d);
++                        v[3] = __hmul2(lut[w >> 24], d);
++                    } else {
++                        const int bl = ch / 4, off = (ch % 4) * 8;
++                        const uint8_t* bp = sg + bl * 34;
++                        const float d = __half2float(__ushort_as_half((uint16_t) (bp[0] | (bp[1] << 8))));
++#pragma unroll
++                        for (int q = 0; q < 4; ++q)
++                            v[q] = __floats2half2_rn(d * (float) (int8_t) bp[2 + off + 2 * q], d * (float) (int8_t) bp[3 + off + 2 * q]);
++                    }
++                    *reinterpret_cast<uint4*>(bd + a_sw(col, ch)) = *reinterpret_cast<const uint4*>(v);
++                }
++                bar_arrive(kFull + (st & 1), NT);
++                if (st >= 1) bar_sync(kEmpty + ((st - 1) & 1), NT);
++                if (st + 2 < steps) issue(st + 2);
++                else cp_commit();   // (an empty group: the waits above count groups)
++            }
++            bar_sync(kEmpty + ((steps - 1) & 1), NT);
++        } else {
++#pragma unroll
++            for (int mi = 0; mi < MI; ++mi)
++#pragma unroll
++                for (int nj = 0; nj < NJ; ++nj)
++#pragma unroll
++                    for (int i = 0; i < 4; ++i) acc[mi][nj][i] = 0.f;
++            bool live[MI];
++#pragma unroll
++            for (int mi = 0; mi < MI; ++mi) live[mi] = wm * WR + mi * 16 < nr;
++            for (int st = 0; st < steps; ++st) {
++                bar_sync(kFull + (st & 1), NT);
++                const __half* ac = As + (size_t) (st % 3) * MR * kEK;
++                const __half* Bc = Bs + (size_t) (st & 1) * NC * kEK;
++#pragma unroll
++                for (int kk = 0; kk < kEK; kk += 16) {
++                    uint32_t af[MI][4], bf[NJ / 2][4];
++#pragma unroll
++                    for (int mi = 0; mi < MI; ++mi)
++                        if (live[mi]) ldsm_x4(af[mi], ac + a_sw(wm * WR + mi * 16 + (lane % 8) + ((lane / 8) % 2) * 8, kk / 8 + lane / 16));
++#pragma unroll
++                    for (int np = 0; np < NJ / 2; ++np)
++                        ldsm_x4(bf[np], Bc + a_sw(wn * WC + np * 16 + (lane % 8) + (lane / 16) * 8, kk / 8 + (lane / 8) % 2));
++#pragma unroll
++                    for (int mi = 0; mi < MI; ++mi) {
++                        if (!live[mi]) continue;
++#pragma unroll
++                        for (int np = 0; np < NJ / 2; ++np) {
++                            mma16816(acc[mi][2 * np], af[mi], bf[np]);
++                            mma16816(acc[mi][2 * np + 1], af[mi], bf[np] + 2);
++                        }
++                    }
++                }
++                bar_arrive(kEmpty + (st & 1), NT);
++            }
++        }
++        __syncthreads();   // (the K loop's buffers become the result tile)
++        if (!producer) {
++#pragma unroll
++            for (int mi = 0; mi < MI; ++mi)
++#pragma unroll
++                for (int nj = 0; nj < NJ; ++nj)
++#pragma unroll
++                    for (int i = 0; i < 4; ++i) {
++                        const int r = wm * WR + mi * 16 + gq + (i / 2) * 8, c = wn * WC + nj * 8 + 2 * tq + (i % 2);
++                        Cs[r * (NC + 4) + c] = acc[mi][nj][i];
++                    }
++        }
++        __syncthreads();
++        if constexpr (GU) {
++            const float sg = tail ? tail[0] : 1.f, su = tail ? tail[1] : 1.f;
++            for (int i = tid; i < nr * (NC / 2); i += NT) {
++                const int r = i / (NC / 2), j = i % (NC / 2);
++                const float gv = Cs[r * (NC + 4) + j] * sg, u0 = Cs[r * (NC + 4) + NC / 2 + j] * su;
++                const float u = lb > 0.f ? lb * tanhf(u0 / lb) : u0;
++                const int hc = h_perm ? nv4_perm(c0 + j) : c0 + j;
++                H[(size_t) (s0 + r0 + r) * n_ff + hc] = __float2half(beta * tanhf(gv / beta) / (1.0f + expf(-gv)) * u);
++            }
++        } else {
++            const float sd = tail ? tail[2] : 1.f;
++            for (int i = tid; i < nr * NC; i += NT) {
++                const int r = i / NC, c = i % NC;
++                Y[(size_t) (s0 + r0 + r) * ld_y + c0 + c] = Cs[r * (NC + 4) + c] * sd;
+             }
+         }
+         __syncthreads();
+     }
+ }
+ 
++/// The (group, first row) tiles of MR rows of every group, in group order.
++__global__ void k_tiles(const int32_t* grp_start, const int32_t* n_groups, int mr, int2* tiles, int32_t* n_tiles) {
++    if (threadIdx.x != 0) return;
++    int t = 0;
++    for (int g = 0; g < *n_groups; ++g)
++        for (int r = 0; r < grp_start[g + 1] - grp_start[g]; r += mr) tiles[t++] = make_int2(g, r);
++    *n_tiles = t;
++}
++__global__ void k_gather_f16p(const float* x, const int32_t* tok, __half* Xg, int n_ent, int n) {
++    const int p = blockIdx.x;
++    if (p >= n_ent) return;
++    const float* xr = x + (size_t) tok[p] * n;
++    for (int i = threadIdx.x; i < n; i += blockDim.x) Xg[(size_t) p * n + nv4_perm(i)] = __float2half(xr[i]);
++}
+ __global__ void k_gather_f16(const float* x, const int32_t* tok, __half* Xg, int n_ent, int n) {
+     const int p = blockIdx.x;
+     if (p >= n_ent) return;
+@@ -2967,6 +3222,9 @@ struct Dev {
+     float *logits = nullptr, *amv = nullptr;
+     void *q8 = nullptr, *xq = nullptr, *escr = nullptr;
+     __half* x16 = nullptr;
++    int2* tiles = nullptr;
++    int32_t* n_tiles = nullptr;
++    int ent_cap = 0;
+     int32_t *ids = nullptr, *grp_start = nullptr, *n_groups = nullptr, *ent_dst = nullptr, *ent_tok = nullptr,
+             *tok = nullptr, *pick = nullptr, *ami = nullptr;
+     unsigned long long* grp_ptr = nullptr;
+@@ -3206,6 +3464,9 @@ struct Engine {
+             D.ids = dalloc_t<int32_t>(T * Kp);
+             D.grp_ptr = dalloc_t<unsigned long long>((size_t) hp.n_expert + 1);
+             D.grp_start = dalloc_t<int32_t>((size_t) hp.n_expert + 2);
++            D.tiles = dalloc_t<int2>(T * Kp / 64 + (size_t) hp.n_expert + 1);   // the expert GEMM's row tiles
++            D.n_tiles = dalloc_t<int32_t>(1);
++            D.ent_cap = (int) (T * Kp);
+             D.n_groups = dalloc_t<int32_t>(1);
+             D.ent_dst = dalloc_t<int32_t>(T * Kp);
+             D.ent_tok = dalloc_t<int32_t>(T * Kp);
+@@ -3292,10 +3553,10 @@ struct Engine {
+             CK(cudaFuncSetAttribute(k_expert_mma<40, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) expert_smem<40>()));
+             CK(cudaFuncSetAttribute(k_expert_mma<8, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) expert_smem<8>()));
+             CK(cudaFuncSetAttribute(k_expert_mma<8, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) expert_smem<8>()));
+-            CK(cudaFuncSetAttribute(k_expert_mma2<40, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) expert2_smem<40>()));
+-            CK(cudaFuncSetAttribute(k_expert_mma2<40, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) expert2_smem<40>()));
+-            CK(cudaFuncSetAttribute(k_expert_mma2<8, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) expert2_smem<8>()));
+-            CK(cudaFuncSetAttribute(k_expert_mma2<8, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) expert2_smem<8>()));
++            CK(cudaFuncSetAttribute(k_expert_ws<40, true, 64, 128, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) expert_ws_smem<40, 64, 128>()));
++            CK(cudaFuncSetAttribute(k_expert_ws<40, false, 64, 128, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) expert_ws_smem<40, 64, 128>()));
++            CK(cudaFuncSetAttribute(k_expert_mma2<8, true, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) expert2_smem<8, 64>()));
++            CK(cudaFuncSetAttribute(k_expert_mma2<8, false, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) expert2_smem<8, 64>()));
+             CK(cudaFuncSetAttribute(k_attn_fa2<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kFaSmem));
+             CK(cudaFuncSetAttribute(k_attn_fa2<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kFaSmem));
+             CK(cudaFuncSetAttribute(k_attn_dreg<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kDrSmem));
+@@ -3630,15 +3891,25 @@ struct Engine {
+     void expert_mma(Dev& D, const Layer& L, const __half* X, size_t w_off, size_t row_bytes, int n_cols, int K, int g0 = 0,
+                     const int32_t* ng = nullptr, int grid_g = 0) {
+         const HP& hp = m->hp;
+-        k_expert_mma2<TY, GU><<<dim3((unsigned) (n_cols / (GU ? kEN / 2 : kEN)), (unsigned) (grid_g > 0 ? grid_g : hp.n_expert)), 256,
+-                                expert2_smem<TY>(), D.st>>>(X, D.grp_ptr + g0, D.grp_start + g0, ng ? ng : D.n_groups, w_off, row_bytes, K, hp.n_ff,
+-                                                         L.L.tail_off, hp.situ_beta, hp.situ_lb, D.dg, D.hg, hp.n_embd);
++        // NVFP4: the warp-specialized kernel (64 x 128 tiles); Q8_0 (its raw stages do not fit there): 64 x 128 as well
++        constexpr int MR = 64;
++        const unsigned gy = (unsigned) (D.ent_cap / MR + (grid_g > 0 ? grid_g : hp.n_expert) + 1);   // the most tiles
++        const int hpm = L.L.d_type == 40 ? 1 : 0;
++        const int32_t* ngp = ng ? ng : D.n_groups;
++        k_tiles<<<1, 32, 0, D.st>>>(D.grp_start + g0, ngp, MR, D.tiles, D.n_tiles);
++        if constexpr (TY == 40)
++            k_expert_ws<TY, GU, MR, 128, 32><<<dim3((unsigned) (n_cols / (GU ? 64 : 128)), gy), ws_threads<MR, 128, 32>(), expert_ws_smem<TY, MR, 128>(), D.st>>>(
++                X, D.grp_ptr + g0, D.grp_start + g0, ngp, w_off, row_bytes, K, hp.n_ff, L.L.tail_off, hp.situ_beta, hp.situ_lb, D.dg, D.hg, hp.n_embd, hpm, D.tiles, D.n_tiles);
++        else
++            k_expert_mma2<TY, GU, MR><<<dim3((unsigned) (n_cols / (GU ? x_cols<MR>() / 2 : x_cols<MR>())), gy), 256, expert2_smem<TY, MR>(), D.st>>>(
++                X, D.grp_ptr + g0, D.grp_start + g0, ngp, w_off, row_bytes, K, hp.n_ff, L.L.tail_off, hp.situ_beta, hp.situ_lb, D.dg, D.hg, hp.n_embd, hpm, D.tiles, D.n_tiles);
+     }
+     void experts_gemm(Dev& D, const Layer& L, const float* xn, int n_ent, int g0 = 0, const int32_t* ng = nullptr,
+                       int grid_g = 0, bool gather = true) {
+         const HP& hp = m->hp;
+         const int N = hp.n_embd, FF = hp.n_ff;
+-        if (gather) k_gather_f16<<<n_ent, kThreads, 0, D.st>>>(xn, D.ent_tok, D.xg, n_ent, N);
++        if (gather && L.L.gu_type == 40) k_gather_f16p<<<n_ent, kThreads, 0, D.st>>>(xn, D.ent_tok, D.xg, n_ent, N);
++        else if (gather) k_gather_f16<<<n_ent, kThreads, 0, D.st>>>(xn, D.ent_tok, D.xg, n_ent, N);
+         if (L.L.gu_type == 40) expert_mma<40, true>(D, L, D.xg, 0, L.L.gu_row, FF, N, g0, ng, grid_g);
+         else expert_mma<8, true>(D, L, D.xg, 0, L.L.gu_row, FF, N, g0, ng, grid_g);
+         if (L.L.d_type == 40) expert_mma<40, false>(D, L, D.hg, L.L.down_off, L.L.d_row, N, FF, g0, ng, grid_g);
+@@ -3682,7 +3953,8 @@ struct Engine {
+                 K::native_expert_grouped(L.L, D.grp_ptr + g0, D.grp_start + g0, D.rng_d + k, D.ent_dst, D.ent_tok, n, n_ent,
+                                          D.xq, D.escr, D.eparts, D.st);
+         };
+-        if (mma) k_gather_f16<<<n_ent, kThreads, 0, D.st>>>(xn, D.ent_tok, D.xg, n_ent, N);
++        if (mma && L.L.gu_type == 40) k_gather_f16p<<<n_ent, kThreads, 0, D.st>>>(xn, D.ent_tok, D.xg, n_ent, N);
++        else if (mma) k_gather_f16<<<n_ent, kThreads, 0, D.st>>>(xn, D.ent_tok, D.xg, n_ent, N);
+         run(0, 0);
+         for (int b = 0; b < nb; ++b) {
+             const int half = b % 2;
+-- 
+2.56.1
+
