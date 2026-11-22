@@ -1,0 +1,159 @@
+From c5f6944d21626fd86ff80da689b6a61ec477d7d1 Mon Sep 17 00:00:00 2001
+From: LegendaryFire <tristan.balon@outlook.com>
+Date: Sun, 22 Nov 2026 01:36:05 -0700
+Subject: [PATCH] Put Inkling 2's prompt relative bias on the tensor cores
+
+The prompt attention (k_attn_fa2) added each score's relative bias as
+a 16-term dot product of the row's relative query and the bias table's
+row for its distance: 16 loads and 16 FMAs a score, every score in the
+sliding-window layers (their window is within the bias range), 65% of
+those layers' attention time (2.31 ms a launch, 0.81 without it).
+
+Now each warp's half tile (16 rows x 32 keys) takes its bias from one
+product on the tensor cores: the rows' relative queries (16 x n_rel)
+times the table's rows for the 48 distances the half tile spans, each
+operand split into FP16 high and low parts (three products, FP32
+accuracy: within ~5e-6 of the old sums on biases up to ~15), the
+result in a per-warp table in shared memory (Rr's room, after the
+queries' fragments are made) and read by distance.
+
+Sliding-window launches 2.31 -> 1.07 ms. Two cards, both executors,
+the drafter: prompt 7K 2038 -> 2117 tok/s, 60K 2208 -> 2383, 180K
+1780 -> 1900.
+---
+ vendor/src/inkling2/ink_engine.cu | 83 ++++++++++++++++++++++++-------
+ 1 file changed, 66 insertions(+), 17 deletions(-)
+
+diff --git a/vendor/src/inkling2/ink_engine.cu b/vendor/src/inkling2/ink_engine.cu
+index b0adb27..2acce6d 100644
+--- a/vendor/src/inkling2/ink_engine.cu
++++ b/vendor/src/inkling2/ink_engine.cu
+@@ -944,7 +944,11 @@ constexpr size_t kFaQKV = (size_t) kFaRows * kFaLd * 2 > (size_t) 2 * kFaKeys *
+ constexpr size_t kFaRaw = (size_t) 2 * kFaKeys * kHD + (size_t) 2 * kFaKeys * 4;   // an int8 tile as it is: K, V, scales
+ constexpr size_t kFaRawH = (size_t) 2 * kFaKeys * kFaLd * 2;   // an FP16 tile (K, V) in ldmatrix layout: its second buffer
+                                                                   // (the first is Q's room, free once Q is in registers)
+-constexpr size_t kFaSmem = kFaQKV + (size_t) kFaRows * 16 * 4 + (2 * kFaRaw > kFaRawH ? 2 * kFaRaw : kFaRawH);
++// the rows' relative queries (FP32, 16 a row), then each warp's bias table for half a key tile: 16 rows x 48 distances
++constexpr int kFaBiasW = 48;
++constexpr size_t kFaRel = (size_t) kFaRows * 16 * 4 > (size_t) kFaWarps * 16 * kFaBiasW * 4 ? (size_t) kFaRows * 16 * 4
++                                                                                            : (size_t) kFaWarps * 16 * kFaBiasW * 4;
++constexpr size_t kFaSmem = kFaQKV + kFaRel + (2 * kFaRaw > kFaRawH ? 2 * kFaRaw : kFaRawH);
+ 
+ __device__ __forceinline__ void cp_async(void* s, const void* g, int bytes, bool ok) {
+     const uint32_t sa = (uint32_t) __cvta_generic_to_shared(s);
+@@ -972,6 +976,12 @@ __device__ __forceinline__ uint32_t pack_h2(float a, float b) {
+     const __half2 h = __floats2half2_rn(a, b);
+     return *reinterpret_cast<const uint32_t*>(&h);
+ }
++/// x as FP16 high and low parts (x = hi + lo to ~22 bits): three FP16 products give an FP32-accurate one
++__device__ __forceinline__ void split_h2(float a, float b, uint32_t& hi, uint32_t& lo) {
++    const __half ha = __float2half_rn(a), hb = __float2half_rn(b);
++    hi = pack_h2(__half2float(ha), __half2float(hb));
++    lo = pack_h2(a - __half2float(ha), b - __half2float(hb));
++}
+ 
+ /// Attention of a prompt chunk's rows (row = token x the KV head's query heads) over the keys [kmin, kmax] of one store: the running (O, m, l) carried between calls (first: from the sink; last: the sink and the
+ /// gate applied, the result written). A block: 64 rows of one KV head, 4 warps of 16; K and V in 64-key tiles converted
+@@ -987,7 +997,7 @@ __global__ void __launch_bounds__(kFaWarps * 32) k_attn_fa2(const float* q, cons
+     __half* Ks = Qs;                     // after Q is in registers
+     __half* Vs = Ks + kFaKeys * kFaLd;
+     float* Rr = reinterpret_cast<float*>(fa_sm + kFaQKV);
+-    uint8_t* raw = fa_sm + kFaQKV + (size_t) kFaRows * 16 * 4;   // [2][K 64x128 | V 64x128 | K scales | V scales]
++    uint8_t* raw = fa_sm + kFaQKV + kFaRel;   // [2][K 64x128 | V 64x128 | K scales | V scales]
+     const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, g = lane / 4, tq = lane % 4;
+     const int kvh = blockIdx.y, R = T * G, r0 = blockIdx.x * kFaRows;
+     for (int i = tid; i < kFaRows * (kHD / 4); i += kFaWarps * 32) {   // the rows' queries in FP16
+@@ -1007,6 +1017,19 @@ __global__ void __launch_bounds__(kFaWarps * 32) k_attn_fa2(const float* q, cons
+ #pragma unroll
+     for (int ks = 0; ks < kHD / 16; ++ks)
+         ldsm_x4(qf[ks], Qs + (warp * 16 + (lane % 8) + ((lane / 8) % 2) * 8) * kFaLd + ks * 16 + (lane / 16) * 8);
++    // the relative bias on the tensor cores: its rows' relative queries (16 x n_rel) as A fragments, high and low
++    // parts; Rr's room becomes the warps' bias tables once every warp has them (the first tile's barrier)
++    uint32_t rah[4], ral[4];
++    {
++        const float* rw = Rr + (size_t) warp * 16 * 16;
++#pragma unroll
++        for (int i = 0; i < 4; ++i) {
++            const int r = g + 8 * (i & 1), k = 2 * tq + 8 * (i >> 1);
++            split_h2(rw[r * 16 + k], rw[r * 16 + k + 1], rah[i], ral[i]);
++        }
++    }
++    float* Bw = Rr + (size_t) warp * 16 * kFaBiasW;
++    const int rpw = pos0 + min(r0 + warp * 16, R - 1) / G;   // the warp's first row's position
+     // the two rows this thread holds (g and g + 8 of its warp's 16)
+     int rp[2], rlo[2], rhi[2];
+     bool rok[2];
+@@ -1130,29 +1153,55 @@ __global__ void __launch_bounds__(kFaWarps * 32) k_attn_fa2(const float* q, cons
+                 mma16816(sc[j + 1], qf[ks], b + 2);
+             }
+         const bool near = p_lo - (kb + kFaKeys - 1) < extent;   // some key of the tile within the bias range
+-        float mx[2] = {-INFINITY, -INFINITY};
+ #pragma unroll
+         for (int j = 0; j < kFaKeys / 8; ++j)
+ #pragma unroll
+             for (int i = 0; i < 4; ++i) {
+                 const int h = i / 2, kp = kb + j * 8 + 2 * tq + (i % 2);
+-                float v = -INFINITY;
+-                if (rok[h] && kp >= rlo[h] && kp <= rhi[h]) {
+-                    v = sc[j][i] * sl2;
+-                    if (near) {
+-                        const int d = rp[h] - kp;
+-                        if (d < extent) {
+-                            const float* br = rel_bias + (size_t) d * n_rel;
+-                            const float* qr = Rr + (warp * 16 + g + 8 * h) * 16;
+-                            float b = 0.f;
+-                            for (int x = 0; x < n_rel; ++x) b += br[x] * qr[x];
+-                            v += b * 1.4426950408889634f;
+-                        }
++                sc[j][i] = rok[h] && kp >= rlo[h] && kp <= rhi[h] ? sc[j][i] * sl2 : -INFINITY;
++            }
++        if (near) {   // each half tile: B(16 rows x 48 distances) = R (16 x n_rel) . bias table^T, then by distance
++#pragma unroll
++            for (int hb = 0; hb < 2; ++hb) {
++                const int dbase = rpw - (kb + hb * 32 + 31);   // the table's column 0: the farthest key from the first row
++#pragma unroll
++                for (int nt = 0; nt < kFaBiasW / 8; ++nt) {
++                    const int d = dbase + nt * 8 + g;
++                    float2 b0 = make_float2(0.f, 0.f), b1 = make_float2(0.f, 0.f);
++                    if (d >= 0 && d < extent) {
++                        const float* br = rel_bias + (size_t) d * n_rel;
++                        if (2 * tq + 1 < n_rel) b0 = *reinterpret_cast<const float2*>(br + 2 * tq);
++                        if (2 * tq + 9 < n_rel) b1 = *reinterpret_cast<const float2*>(br + 2 * tq + 8);
+                     }
++                    uint32_t bh[2], bl[2];
++                    split_h2(b0.x, b0.y, bh[0], bl[0]);
++                    split_h2(b1.x, b1.y, bh[1], bl[1]);
++                    float c[4] = {0.f, 0.f, 0.f, 0.f};
++                    mma16816(c, rah, bh);
++                    mma16816(c, rah, bl);
++                    mma16816(c, ral, bh);
++                    Bw[g * kFaBiasW + nt * 8 + 2 * tq] = c[0];
++                    Bw[g * kFaBiasW + nt * 8 + 2 * tq + 1] = c[1];
++                    Bw[(g + 8) * kFaBiasW + nt * 8 + 2 * tq] = c[2];
++                    Bw[(g + 8) * kFaBiasW + nt * 8 + 2 * tq + 1] = c[3];
+                 }
+-                sc[j][i] = v;
+-                mx[h] = fmaxf(mx[h], v);
++                __syncwarp();
++#pragma unroll
++                for (int j = hb * 4; j < hb * 4 + 4; ++j)
++#pragma unroll
++                    for (int i = 0; i < 4; ++i) {
++                        const int h = i / 2, kp = kb + j * 8 + 2 * tq + (i % 2), d = rp[h] - kp;
++                        if (sc[j][i] != -INFINITY && d < extent)
++                            sc[j][i] += Bw[(g + 8 * h) * kFaBiasW + (d - dbase)] * 1.4426950408889634f;
++                    }
++                __syncwarp();
+             }
++        }
++        float mx[2] = {-INFINITY, -INFINITY};
++#pragma unroll
++        for (int j = 0; j < kFaKeys / 8; ++j)
++#pragma unroll
++            for (int i = 0; i < 4; ++i) mx[i / 2] = fmaxf(mx[i / 2], sc[j][i]);
+         float corr[2];
+ #pragma unroll
+         for (int h = 0; h < 2; ++h) {
+-- 
+2.56.1
+
