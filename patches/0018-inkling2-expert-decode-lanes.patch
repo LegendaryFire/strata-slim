@@ -1,0 +1,303 @@
+From 50d7558b63f66f99c627db6c016fa1709459b345 Mon Sep 17 00:00:00 2001
+From: LegendaryFire <tristan.balon@outlook.com>
+Date: Sun, 22 Nov 2026 02:21:33 -0700
+Subject: [PATCH] Read Inkling 2's NVFP4 expert rows with every lane busy in
+ decode
+
+The decode expert kernels left lanes idle at Inkling's shapes: the
+gate/up rows (n_embd 2304: 72 halves of NVFP4 blocks) took the
+generic multi kernel's warp a row, its last pass with 8 of 32 lanes;
+the down rows (n_ff 1152: 18 blocks) took 8 lanes a row with 6 busy.
+Now each lane takes halves (32 values: one q8_1 block, two UE4M3
+sub-blocks):
+
+- gate/up, native_gu_nv4_kernel: 8 lanes a row, 9 halves each, 4 rows
+  a warp; the group's entries' q8_1 rows staged in shared memory, a
+  lane's weights loaded before its dots (all in flight), 3 blocks an
+  SM (80 registers): 85.0 -> 75.8 us at one row;
+- down, native_down_nv4_kernel: 4 lanes a row, 9 halves each, 8 rows a
+  warp: 44.4 -> 42.8 us.
+
+vec_dot_nvfp4_q8_1's sums in another lane order (within ~1e-7 of the
+reference kernels; a down input's q8_1 rounding now and then one step
+apart). Two cards, decode without drafting: 1K 51.6 -> 52.6 tok/s,
+60K 44.0 -> 45.0, 180K 31.3 -> 31.5.
+---
+ vendor/src/kernels/cuda/iq_kernels.cu | 243 ++++++++++++++++++--------
+ 1 file changed, 171 insertions(+), 72 deletions(-)
+
+diff --git a/vendor/src/kernels/cuda/iq_kernels.cu b/vendor/src/kernels/cuda/iq_kernels.cu
+index b3e29ce..e90cd6b 100644
+--- a/vendor/src/kernels/cuda/iq_kernels.cu
++++ b/vendor/src/kernels/cuda/iq_kernels.cu
+@@ -4243,6 +4243,166 @@ bool expdec_down(const NativeExpertLayout& L, int64_t gy, int64_t cap_groups, cu
+     return true;
+ }
+ 
++// NVFP4 down rows whose n_ff is a multiple of 128 (Inkling 2: 1152, 18 blocks = 36 halves a row; native_down_multi_kernel's
++// fast rows take n_ff 640 only): 4 lanes a row, each n_ff / 128 halves (32 values: one q8_1 block, two UE4M3 sub-blocks),
++// 8 rows a warp, every lane busy; the group's entries' q8_1 rows staged in shared memory once a block, each lane's
++// weights read once for all of them. The sums are vec_dot_nvfp4_q8_1's (an int dot a sub-block, its UE4M3 scale and the
++// activation block's d in FP32).
++constexpr int kDn4Ent = 8;   // entries of a group taken at a time
++/// Half a NVFP4 block (part 0: sub-blocks 0, 1; part 1: 2, 3) against a q8_1 block, the entries' sums in acc.
++__device__ __forceinline__ void nv4_half_dot(const block_nvfp4* bq4, int part, const block_q8_1* x, int x_stride, int ne,
++                                             float (&acc)[kDn4Ent]) {
++    int2 v[4];
++#pragma unroll
++    for (int w = 0; w < 4; ++w) v[w] = get_int_from_table_16(get_int_b4(bq4->qs, 4 * part + w), kvalues_fp4);
++    const float sc0 = ue4m3_to_f32_half(bq4->d[2 * part]), sc1 = ue4m3_to_f32_half(bq4->d[2 * part + 1]);
++#pragma unroll
++    for (int k = 0; k < kDn4Ent; ++k) {
++        if (k >= ne) break;
++        const block_q8_1* bq8 = x + (size_t) k * x_stride;
++        const float d8 = __low2float(bq8->ds);
++        int s0 = ggml_cuda_dp4a(v[0].x, get_int_b4(bq8->qs, 0), 0);
++        s0 = ggml_cuda_dp4a(v[0].y, get_int_b4(bq8->qs, 2), s0);
++        s0 = ggml_cuda_dp4a(v[1].x, get_int_b4(bq8->qs, 1), s0);
++        s0 = ggml_cuda_dp4a(v[1].y, get_int_b4(bq8->qs, 3), s0);
++        int s1 = ggml_cuda_dp4a(v[2].x, get_int_b4(bq8->qs, 4), 0);
++        s1 = ggml_cuda_dp4a(v[2].y, get_int_b4(bq8->qs, 6), s1);
++        s1 = ggml_cuda_dp4a(v[3].x, get_int_b4(bq8->qs, 5), s1);
++        s1 = ggml_cuda_dp4a(v[3].y, get_int_b4(bq8->qs, 7), s1);
++        acc[k] += sc0 * d8 * (float) s0;
++        acc[k] += sc1 * d8 * (float) s1;
++    }
++}
++/// A lane's PER halves h0, h0 + step, ...: every weight word loaded first (all of them in flight), then the dots.
++template <int PER>
++__device__ __forceinline__ void nv4_halves(const block_nvfp4* row, int h0, int step, const block_q8_1* x, int x_stride, int ne,
++                                           float (&acc)[kDn4Ent]) {
++    int qw[PER][4];
++    uint16_t dw[PER];
++#pragma unroll
++    for (int i = 0; i < PER; ++i) {
++        const int h = h0 + step * i;
++        const block_nvfp4* b = row + h / 2;
++#pragma unroll
++        for (int w = 0; w < 4; ++w) qw[i][w] = get_int_b4(b->qs, 4 * (h & 1) + w);
++        dw[i] = *reinterpret_cast<const uint16_t*>(b->d + 2 * (h & 1));
++    }
++#pragma unroll
++    for (int i = 0; i < PER; ++i) {
++        const int h = h0 + step * i;
++        int2 v[4];
++#pragma unroll
++        for (int w = 0; w < 4; ++w) v[w] = get_int_from_table_16(qw[i][w], kvalues_fp4);
++        const float sc0 = ue4m3_to_f32_half((uint8_t) (dw[i] & 0xFF)), sc1 = ue4m3_to_f32_half((uint8_t) (dw[i] >> 8));
++#pragma unroll
++        for (int k = 0; k < kDn4Ent; ++k) {
++            if (k >= ne) break;
++            const block_q8_1* bq8 = x + (size_t) k * x_stride + h;
++            const float d8 = __low2float(bq8->ds);
++            int s0 = ggml_cuda_dp4a(v[0].x, get_int_b4(bq8->qs, 0), 0);
++            s0 = ggml_cuda_dp4a(v[0].y, get_int_b4(bq8->qs, 2), s0);
++            s0 = ggml_cuda_dp4a(v[1].x, get_int_b4(bq8->qs, 1), s0);
++            s0 = ggml_cuda_dp4a(v[1].y, get_int_b4(bq8->qs, 3), s0);
++            int s1 = ggml_cuda_dp4a(v[2].x, get_int_b4(bq8->qs, 4), 0);
++            s1 = ggml_cuda_dp4a(v[2].y, get_int_b4(bq8->qs, 6), s1);
++            s1 = ggml_cuda_dp4a(v[3].x, get_int_b4(bq8->qs, 5), s1);
++            s1 = ggml_cuda_dp4a(v[3].y, get_int_b4(bq8->qs, 7), s1);
++            acc[k] += sc0 * d8 * (float) s0;
++            acc[k] += sc1 * d8 * (float) s1;
++        }
++    }
++}
++__global__ void __launch_bounds__(256) native_down_nv4_kernel(const unsigned long long* __restrict__ grp_ptr,
++                                                             const int32_t* __restrict__ grp_start,
++                                                             const int32_t* __restrict__ n_groups,
++                                                             const int32_t* __restrict__ ent_dst,
++                                                             const block_q8_1* __restrict__ hq, NativeExpertLayout L,
++                                                             float* __restrict__ out) {
++    extern __shared__ __align__(16) unsigned char dn4_sm[];
++    const int g = blockIdx.y;
++    if (g >= *n_groups) return;
++    const int hb = (int) (L.n_ff / 32), per = hb / 4;   // q8_1 blocks (= halves) a row, a lane's
++    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, sub = lane & 3;
++    const int r = blockIdx.x * 64 + warp * 8 + (lane >> 2);
++    const unsigned char* blob = (const unsigned char*) grp_ptr[g];
++    const float sd = L.tail_off ? ((const float*) (blob + L.tail_off))[2] : 1.0f;
++    const int e0 = grp_start[g], e1 = grp_start[g + 1];
++    block_q8_1* xs = reinterpret_cast<block_q8_1*>(dn4_sm);
++    const block_nvfp4* row = reinterpret_cast<const block_nvfp4*>(blob + L.down_off + (size_t) (r < L.n_embd ? r : 0) * L.d_row);
++    for (int e = e0; e < e1; e += kDn4Ent) {
++        const int ne = min(kDn4Ent, e1 - e);
++        __syncthreads();
++        const int words = ne * hb * (int) (sizeof(block_q8_1) / 4);
++        const uint32_t* src = reinterpret_cast<const uint32_t*>(hq + (size_t) e * hb);
++        for (int i = threadIdx.x; i < words; i += blockDim.x) reinterpret_cast<uint32_t*>(dn4_sm)[i] = src[i];
++        __syncthreads();
++        float acc[kDn4Ent];
++#pragma unroll
++        for (int k = 0; k < kDn4Ent; ++k) acc[k] = 0.f;
++        if (r < L.n_embd)
++            for (int i = 0; i < per; ++i) {
++                const int h = sub + 4 * i;   // this lane's halves: the row's 4 lanes read it in order
++                nv4_half_dot(row + h / 2, h & 1, xs + h, hb, ne, acc);
++            }
++#pragma unroll
++        for (int k = 0; k < kDn4Ent; ++k) {
++            if (k >= ne) break;
++            float a = acc[k];
++            a += __shfl_xor_sync(0xffffffffu, a, 1, 4);
++            a += __shfl_xor_sync(0xffffffffu, a, 2, 4);
++            if (sub == 0 && r < L.n_embd) out[(size_t) ent_dst[e + k] * L.n_embd + r] = a * sd;
++        }
++    }
++}
++/// NVFP4 gate / up rows of n_embd 2304 (Inkling 2: 36 blocks = 72 halves): 8 lanes a row, 9 halves each, 4 rows a warp
++/// (32 a block, every lane busy; the generic multi kernel's warp a row left 3/4 of the lanes idle on its last pass);
++/// the group's entries' q8_1 rows staged in shared memory, the weights read once for all of them. vec_dot_nvfp4_q8_1's
++/// sums, s_gate / s_up applied on the FP32 output as native_gu_multi_kernel.
++// (3 blocks an SM: 80 registers, more loads in flight)
++__global__ void __launch_bounds__(256, 3) native_gu_nv4_kernel(const unsigned long long* __restrict__ grp_ptr,
++                                                           const int32_t* __restrict__ grp_start,
++                                                           const int32_t* __restrict__ n_groups,
++                                                           const int32_t* __restrict__ ent_tok,
++                                                           const block_q8_1* __restrict__ xq, NativeExpertLayout L,
++                                                           float* __restrict__ gate, float* __restrict__ up) {
++    extern __shared__ __align__(16) unsigned char gu4_sm[];
++    const int g = blockIdx.y;
++    if (g >= *n_groups) return;
++    const int xb = (int) (L.n_embd / 32), per = xb / 8;
++    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, sub = lane & 7;
++    const int row = blockIdx.x * 32 + warp * 4 + (lane >> 3);   // 0 .. 2 n_ff
++    const bool live = row < 2 * (int) L.n_ff, is_up = live && row >= (int) L.n_ff;
++    const int r = is_up ? row - (int) L.n_ff : row;
++    const unsigned char* blob = (const unsigned char*) grp_ptr[g];
++    const float sc = L.tail_off ? ((const float*) (blob + L.tail_off))[is_up ? 1 : 0] : 1.0f;
++    const block_nvfp4* wr = reinterpret_cast<const block_nvfp4*>(blob + (is_up ? L.up_off : 0) + (size_t) (live ? r : 0) * L.gu_row);
++    float* dst = is_up ? up : gate;
++    const int e0 = grp_start[g], e1 = grp_start[g + 1];
++    block_q8_1* xs = reinterpret_cast<block_q8_1*>(gu4_sm);
++    for (int e = e0; e < e1; e += kDn4Ent) {
++        const int ne = min(kDn4Ent, e1 - e);
++        __syncthreads();
++        for (int k = 0; k < ne; ++k) {
++            const uint32_t* src = reinterpret_cast<const uint32_t*>(xq + (size_t) ent_tok[e + k] * xb);
++            for (int i = threadIdx.x; i < xb * (int) (sizeof(block_q8_1) / 4); i += blockDim.x)
++                reinterpret_cast<uint32_t*>(xs + (size_t) k * xb)[i] = src[i];
++        }
++        __syncthreads();
++        float acc[kDn4Ent];
++#pragma unroll
++        for (int k = 0; k < kDn4Ent; ++k) acc[k] = 0.f;
++        if (live) nv4_halves<9>(wr, sub, 8, xs, xb, ne, acc);   // (n_embd 2304: 9 halves a lane)
++#pragma unroll
++        for (int k = 0; k < kDn4Ent; ++k) {
++            if (k >= ne) break;
++            float a = acc[k];
++            a += __shfl_xor_sync(0xffffffffu, a, 1, 8);
++            a += __shfl_xor_sync(0xffffffffu, a, 2, 8);
++            a += __shfl_xor_sync(0xffffffffu, a, 4, 8);
++            if (sub == 0 && live) dst[(size_t) (e + k) * L.n_ff + r] = a * sc;
++        }
++    }
++}
+ template<int TG>
+ void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X, const NativeExpertLayout& L,
+@@ -4250,6 +4410,15 @@ void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, con
+     // the sub-16 rows (row_dot_80_sub16) assume 80 dots per row: (n_embd / qk) * ipb == 80. The APR trellis types
+     // (qk 128, ipb 8: 160 dots at n_embd 2560) take the full-warp multi kernel, as before the sub-16 kernels.
+     const bool g_no_sub16_gu = ::strata::kernels::g_no_sub16_gu || (L.n_embd / Fmt<TG>::qk) * Fmt<TG>::ipb != 80;
++    if constexpr (TG == 40) {   // NVFP4 rows of 72 halves (Inkling 2): 8 lanes a row (native_gu_nv4_kernel)
++        if (!g_old_kernels && L.n_embd == 2304) {
++            dim3 g4 = grid;
++            g4.x = (unsigned) ((2 * L.n_ff + 31) / 32);
++            native_gu_nv4_kernel<<<g4, 256, (size_t) kDn4Ent * (L.n_embd / 32) * sizeof(block_q8_1), s>>>(grp_ptr, grp_start, n_groups,
++                                                                                                      ent_tok, X, L, gate, up);
++            return;
++        }
++    }
+     if constexpr (!kSplit<TG>) native_gu_kernel<TG><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+     else if (g_old_kernels || split_off<TG>()) native_gu_kernel<TG><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+     else if constexpr (kStageIqGrid<TG>) {
+@@ -4324,82 +4493,12 @@ bool launch_gu_swiglu(const NativeExpertLayout& L, int64_t gy, cudaStream_t s, c
+     }
+ }
+ 
+-// NVFP4 down rows whose n_ff is a multiple of 384 (Inkling 2: 1152, 18 blocks a row; native_down_multi_kernel's fast
+-// rows take n_ff 640 only): 8 lanes a row, 6 of them 3 blocks each (n_ff / 384 groups of 3), 4 rows a warp; the group's
+-// entries' q8_1 rows staged in shared memory once a block, each lane's weights read once for all of them. The sums are
+-// vec_dot_nvfp4_q8_1's (an int dot a sub-block, its UE4M3 scale and the activation block's d in FP32).
+-constexpr int kDn4Ent = 8;   // entries of a group taken at a time
+-__global__ void __launch_bounds__(256) native_down_nv4_kernel(const unsigned long long* __restrict__ grp_ptr,
+-                                                             const int32_t* __restrict__ grp_start,
+-                                                             const int32_t* __restrict__ n_groups,
+-                                                             const int32_t* __restrict__ ent_dst,
+-                                                             const block_q8_1* __restrict__ hq, NativeExpertLayout L,
+-                                                             float* __restrict__ out) {
+-    extern __shared__ __align__(16) unsigned char dn4_sm[];
+-    const int g = blockIdx.y;
+-    if (g >= *n_groups) return;
+-    const int hb = (int) (L.n_ff / 32), nbl = (int) (L.n_ff / 64), per = nbl / 6;
+-    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, sub = lane & 7;
+-    const int r = blockIdx.x * 32 + warp * 4 + (lane >> 3);
+-    const unsigned char* blob = (const unsigned char*) grp_ptr[g];
+-    const float sd = L.tail_off ? ((const float*) (blob + L.tail_off))[2] : 1.0f;
+-    const int e0 = grp_start[g], e1 = grp_start[g + 1];
+-    block_q8_1* xs = reinterpret_cast<block_q8_1*>(dn4_sm);
+-    for (int e = e0; e < e1; e += kDn4Ent) {
+-        const int ne = min(kDn4Ent, e1 - e);
+-        __syncthreads();
+-        const int words = ne * hb * (int) (sizeof(block_q8_1) / 4);
+-        const uint32_t* src = reinterpret_cast<const uint32_t*>(hq + (size_t) e * hb);
+-        for (int i = threadIdx.x; i < words; i += blockDim.x) reinterpret_cast<uint32_t*>(dn4_sm)[i] = src[i];
+-        __syncthreads();
+-        const bool act = r < L.n_embd && sub < 6;   // the others add zeros to the row's sum
+-        const block_nvfp4* row = reinterpret_cast<const block_nvfp4*>(blob + L.down_off + (size_t) (r < L.n_embd ? r : 0) * L.d_row);
+-        float acc[kDn4Ent];
+-#pragma unroll
+-        for (int k = 0; k < kDn4Ent; ++k) acc[k] = 0.f;
+-        for (int bi = 0; act && bi < per; ++bi) {
+-            const int b = sub * per + bi;
+-            const block_nvfp4* bq4 = row + b;
+-            int2 v[8];
+-#pragma unroll
+-            for (int w = 0; w < 8; ++w) v[w] = get_int_from_table_16(get_int_b4(bq4->qs, w), kvalues_fp4);
+-            float sc[4];
+-#pragma unroll
+-            for (int is = 0; is < 4; ++is) sc[is] = ue4m3_to_f32_half(bq4->d[is]);
+-#pragma unroll
+-            for (int k = 0; k < kDn4Ent; ++k) {
+-                if (k >= ne) break;
+-                const block_q8_1* x = xs + (size_t) k * hb + 2 * b;
+-#pragma unroll
+-                for (int is = 0; is < 4; ++is) {
+-                    const block_q8_1* bq8 = x + (is >> 1);
+-                    const int i8 = (is & 1) << 2;
+-                    const int2 a = v[2 * is], c = v[2 * is + 1];
+-                    int sumi = ggml_cuda_dp4a(a.x, get_int_b4(bq8->qs, i8 + 0), 0);
+-                    sumi = ggml_cuda_dp4a(a.y, get_int_b4(bq8->qs, i8 + 2), sumi);
+-                    sumi = ggml_cuda_dp4a(c.x, get_int_b4(bq8->qs, i8 + 1), sumi);
+-                    sumi = ggml_cuda_dp4a(c.y, get_int_b4(bq8->qs, i8 + 3), sumi);
+-                    acc[k] += sc[is] * __low2float(bq8->ds) * (float) sumi;
+-                }
+-            }
+-        }
+-#pragma unroll
+-        for (int k = 0; k < kDn4Ent; ++k) {
+-            if (k >= ne) break;
+-            float a = acc[k];
+-            a += __shfl_xor_sync(0xffffffffu, a, 1, 8);
+-            a += __shfl_xor_sync(0xffffffffu, a, 2, 8);
+-            a += __shfl_xor_sync(0xffffffffu, a, 4, 8);
+-            if (sub == 0 && r < L.n_embd) out[(size_t) ent_dst[e + k] * L.n_embd + r] = a * sd;
+-        }
+-    }
+-}
+ bool launch_down_nv4(cudaStream_t s, int64_t groups, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                      const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq, const NativeExpertLayout& L,
+                      float* out) {
+-    if (L.d_type != 40 || L.n_ff % 384 != 0 || L.n_ff / 32 == 20 || g_old_kernels) return false;
++    if (L.d_type != 40 || L.n_ff % 128 != 0 || L.n_ff / 32 == 20 || g_old_kernels) return false;
+     const size_t sm = (size_t) kDn4Ent * (L.n_ff / 32) * sizeof(block_q8_1);
+-    native_down_nv4_kernel<<<dim3((unsigned) ((L.n_embd + 31) / 32), (unsigned) groups), 256, sm, s>>>(grp_ptr, grp_start, n_groups,
++    native_down_nv4_kernel<<<dim3((unsigned) ((L.n_embd + 63) / 64), (unsigned) groups), 256, sm, s>>>(grp_ptr, grp_start, n_groups,
+                                                                                                    ent_dst, hq, L, out);
+     return true;
+ }
+-- 
+2.56.1
+
