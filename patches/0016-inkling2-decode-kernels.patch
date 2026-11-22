@@ -1,0 +1,301 @@
+From 61d727bb6aa7a5b7148518eaf0accf08a2bdb436 Mon Sep 17 00:00:00 2001
+From: LegendaryFire <tristan.balon@outlook.com>
+Date: Sun, 22 Nov 2026 00:39:04 -0700
+Subject: [PATCH] Speed up Inkling 2's decode: one launch for a visit's
+ projections, split controls
+
+A decode step's small kernels left the cards underfilled (ideas from
+peaster/inkling-2-mini-vllm-2x3090's sm86-tune.diff, which credits
+snailbrainx/inkling-2-mini-sm80):
+
+- a visit's q, rel, gate, k and v projections (Q8_0) run in one
+  launch, k_q8_seg: a warp a row over all five matrices, each with its
+  own q8_1 input (k's and v's quantized into their own buffers), up to
+  8 rows (verify) reading the weights once. The small ones (k, v: 1024
+  rows, rel: 384) no longer run alone: 73.8 -> 62.0 us a visit at one
+  row, 2-5 rows 63-76 us against ~92;
+- a looped layer's control down projections (4608 -> 64, 3 at once)
+  split K eight ways (24 blocks a step were 192), the RMS scales taken
+  after (rx * sum(w x) = sum(w rx x)): k_ctl_down 18.9 -> 9.0 us,
+  k_ctl_up 9.0 -> 9.5.
+
+Rounding-level changes (the projections within ~1e-6 of the old
+kernels, the controls of a double-precision reference).
+
+Two cards, decode without drafting: 1K 48.9 -> 51.6 tok/s, 60K 41.8
+-> 44.1, 180K 30.3 -> 31.3; a drafted step's 3-4 rows 8-11% less at 7K.
+---
+ vendor/src/inkling2/ink_engine.cu | 186 ++++++++++++++++++++++++------
+ 1 file changed, 149 insertions(+), 37 deletions(-)
+
+diff --git a/vendor/src/inkling2/ink_engine.cu b/vendor/src/inkling2/ink_engine.cu
+index 869632e..b0adb27 100644
+--- a/vendor/src/inkling2/ink_engine.cu
++++ b/vendor/src/inkling2/ink_engine.cu
+@@ -140,46 +140,116 @@ __global__ void k_rms2cat(const float* cur, const float* msg, float* out, int n,
+     }
+ }
+ 
+-/// A looped layer's controls for a decode's rows, up to 3 at once (blockIdx.z): (1) each (row, control) block takes
+-/// both inputs' RMS scales and 8 rows of the down projection of [x, msg] (a warp a row); (2) a warp two outputs of the
+-/// gain and forget projections (R inputs) and the mix (1 - tanh f) x + tanh g msg.
++/// A decode's Q8_0 projections of up to 5 matrices in one launch (each its own q8_1 input and output; their rows
++/// one after the other in the grid): a warp a row, 4 lanes a 32-value block, 8 blocks a step, so a small matrix
++/// (k, v, rel) fills the card as well as a large one. Up to 8 rows (verify): the weights read once for all.
++struct QSeg {
++    const uint8_t* w;   // [n_out][n_in / 32] Q8_0 blocks (34 bytes)
++    const uint8_t* x;   // [T][n_in / 32] q8_1 blocks (36 bytes)
++    float* y;           // [T][n_out]
++    int n_out, blk0;    // its first grid block
++};
++struct QSegs {
++    QSeg s[5];
++    int n;
++};
++__device__ __forceinline__ int ld_i32_b2(const uint8_t* p) {   // 4 bytes at a 2-byte aligned address
++    const uint16_t* q = reinterpret_cast<const uint16_t*>(p);
++    return (int) ((uint32_t) q[0] | ((uint32_t) q[1] << 16));
++}
++template <int T>
++__global__ void __launch_bounds__(256) k_q8_seg(QSegs a, int n_in) {
++    int k = 0;
++    while (k + 1 < a.n && (int) blockIdx.x >= a.s[k + 1].blk0) ++k;
++    const QSeg sg = a.s[k];
++    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
++    const int row = ((int) blockIdx.x - sg.blk0) * 8 + warp;
++    if (row >= sg.n_out) return;
++    const int nb = n_in / 32, kq = lane % 4, b0 = lane / 4;
++    const uint8_t* wr = sg.w + (size_t) row * nb * 34;
++    float acc[T];
++#pragma unroll
++    for (int c = 0; c < T; ++c) acc[c] = 0.f;
++    for (int kb = b0; kb < nb; kb += 8) {
++        const uint8_t* wb = wr + (size_t) kb * 34;
++        const float dw = __half2float(__ushort_as_half(*reinterpret_cast<const uint16_t*>(wb)));
++        const int w0 = ld_i32_b2(wb + 2 + kq * 8), w1 = ld_i32_b2(wb + 6 + kq * 8);
++#pragma unroll
++        for (int c = 0; c < T; ++c) {
++            const uint8_t* xb = sg.x + ((size_t) c * nb + kb) * 36;
++            const float dx = __low2float(*reinterpret_cast<const __half2*>(xb));
++            const int* xi = reinterpret_cast<const int*>(xb + 4 + kq * 8);
++            const int si = __dp4a(w1, xi[1], __dp4a(w0, xi[0], 0));
++            acc[c] += dw * dx * (float) si;
++        }
++    }
++#pragma unroll
++    for (int c = 0; c < T; ++c) {
++        float v = acc[c];
++        for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
++        if (lane == 0) sg.y[(size_t) c * sg.n_out + row] = v;
++    }
++}
++
++/// A looped layer's controls for a decode's rows, up to 3 at once (blockIdx.z): (1) the down projection of
++/// [x, msg] split over K (kCtlSplits slices, half over x, half over msg) so a decode has blocks for every SM: each
++/// (row group, slice) block a warp a row's unscaled partial, and the slice's sum of squares (the RMS scales apply
++/// after: rx * sum(w x) = sum(w rx x)); (2) a warp two outputs of the gain and forget projections (R inputs) from the
++/// summed, scaled partials, and the mix (1 - tanh f) x + tanh g msg.
++constexpr int kCtlSplits = 8;
+ struct CtlArgs {
+     const float *x[3], *msg[3], *wd[3], *wg[3], *wf[3];
+     float* out[3];
+ };
+ __global__ void __launch_bounds__(256) k_ctl_down(CtlArgs a, float* h, int n, int R, float eps) {
+     __shared__ float sh[kThreads];
+-    const int t = blockIdx.y, j = blockIdx.z, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+-    const float* xr = a.x[j] + (size_t) t * n;
+-    const float* mr = a.msg[j] + (size_t) t * n;
+-    float sx = 0.f, sm = 0.f;
+-    for (int i = threadIdx.x; i < n; i += blockDim.x) sx += xr[i] * xr[i];
+-    sx = block_sum(sx, sh);
+-    for (int i = threadIdx.x; i < n; i += blockDim.x) sm += mr[i] * mr[i];
+-    sm = block_sum(sm, sh);
+-    const float rx = rsqrtf(sx / (float) n + eps), rm = rsqrtf(sm / (float) n + eps);
+-    const int o = blockIdx.x * 8 + warp;
++    const int t = blockIdx.y, j = blockIdx.z, T = gridDim.y, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
++    const int rg = blockIdx.x / kCtlSplits, sl = blockIdx.x % kCtlSplits;
++    const int L = 2 * n / kCtlSplits, e0 = sl * L;   // this slice: [e0, e0 + L) of [x, msg] (inside one of them)
++    const float* src = e0 < n ? a.x[j] + (size_t) t * n + e0 : a.msg[j] + (size_t) t * n + (e0 - n);
++    float* part = h + ((size_t) j * T + t) * (kCtlSplits * R + kCtlSplits);   // [slice][R] partials, then [slice] squares
++    if (rg == 0) {
++        float sq = 0.f;
++        for (int i = threadIdx.x; i < L; i += blockDim.x) sq += src[i] * src[i];
++        sq = block_sum(sq, sh);
++        if (threadIdx.x == 0) part[kCtlSplits * R + sl] = sq;
++    }
++    const int o = rg * 8 + warp;
+     if (o >= R) return;
+-    const float4* w4 = reinterpret_cast<const float4*>(a.wd[j] + (size_t) o * 2 * n);
++    const float4* w4 = reinterpret_cast<const float4*>(a.wd[j] + (size_t) o * 2 * n + e0);
++    const float4* v4 = reinterpret_cast<const float4*>(src);
+     float acc = 0.f;
+-    for (int i = lane; i < 2 * n / 4; i += 32) {
+-        const float4 w = w4[i];
+-        const int e = i * 4;
+-        const float4 v = e < n ? *reinterpret_cast<const float4*>(xr + e) : *reinterpret_cast<const float4*>(mr + e - n);
+-        const float r = e < n ? rx : rm;
+-        acc += w.x * (v.x * r) + w.y * (v.y * r) + w.z * (v.z * r) + w.w * (v.w * r);
++    for (int i = lane; i < L / 4; i += 32) {
++        const float4 w = w4[i], v = v4[i];
++        acc += w.x * v.x + w.y * v.y + w.z * v.z + w.w * v.w;
+     }
+     for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
+-    if (lane == 0) h[((size_t) j * gridDim.y + t) * R + o] = acc;
++    if (lane == 0) part[(size_t) sl * R + o] = acc;
+ }
+-__global__ void __launch_bounds__(256) k_ctl_up(CtlArgs a, const float* h, int n, int R) {
+-    const int t = blockIdx.y, j = blockIdx.z, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
++__global__ void __launch_bounds__(256) k_ctl_up(CtlArgs a, const float* h, int n, int R, float eps) {
++    const int t = blockIdx.y, j = blockIdx.z, T = gridDim.y, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+     const int half = lane / 16, l16 = lane % 16;          // a half-warp a row: R / 4 float4 (R <= 64)
+     const int i = (blockIdx.x * 8 + warp) * 2 + half;
+-    const float* hr = h + ((size_t) j * gridDim.y + t) * R;
++    const float* part = h + ((size_t) j * T + t) * (kCtlSplits * R + kCtlSplits);
++    float sx = 0.f, sm = 0.f;
++#pragma unroll
++    for (int k = 0; k < kCtlSplits / 2; ++k) {
++        sx += part[kCtlSplits * R + k];
++        sm += part[kCtlSplits * R + kCtlSplits / 2 + k];
++    }
++    const float rx = rsqrtf(sx / (float) n + eps), rm = rsqrtf(sm / (float) n + eps);
+     float g = 0.f, f = 0.f;
+     if (i < n && l16 < R / 4) {
+-        const float4 hv = reinterpret_cast<const float4*>(hr)[l16];
++        float4 hv = make_float4(0.f, 0.f, 0.f, 0.f);
++#pragma unroll
++        for (int k = 0; k < kCtlSplits; ++k) {
++            const float4 p = reinterpret_cast<const float4*>(part + (size_t) k * R)[l16];
++            const float r = k < kCtlSplits / 2 ? rx : rm;
++            hv.x += p.x * r;
++            hv.y += p.y * r;
++            hv.z += p.z * r;
++            hv.w += p.w * r;
++        }
+         const float4 wg = reinterpret_cast<const float4*>(a.wg[j] + (size_t) i * R)[l16];
+         const float4 wf = reinterpret_cast<const float4*>(a.wf[j] + (size_t) i * R)[l16];
+         g = wg.x * hv.x + wg.y * hv.y + wg.z * hv.z + wg.w * hv.w;
+@@ -3307,6 +3377,7 @@ struct Dev {
+     strata::prefill::Gemm gemm;
+     std::vector<float*> slots;
+     std::vector<int> free_slots;
++    float* hctl = nullptr;   // the controls' split down partials (k_ctl_down)
+     float *xn[3] = {}, *msg[4] = {}, *mixo = nullptr, *ctl = nullptr, *cat2 = nullptr, *h64 = nullptr, *gb = nullptr,
+           *fb = nullptr;
+     float *q = nullptr, *k = nullptr, *v = nullptr, *kc = nullptr, *vc = nullptr, *r = nullptr, *sink = nullptr,
+@@ -3315,6 +3386,7 @@ struct Dev {
+     float *pacc = nullptr, *pm = nullptr, *pl = nullptr;
+     float *logits = nullptr, *amv = nullptr;
+     void *q8 = nullptr, *xq = nullptr, *escr = nullptr;
++    void *q8b = nullptr, *q8c = nullptr;
+     __half* x16 = nullptr;
+     int2* tiles = nullptr;
+     int32_t* n_tiles = nullptr;
+@@ -3521,6 +3593,7 @@ struct Engine {
+             D.ctl = dalloc(T * N);
+             D.cat2 = dalloc(2 * T * N);
+             D.h64 = dalloc(3 * T * (size_t) std::max(64, hp.gate_rank));   // up to 3 controls at once (decode)
++            D.hctl = dalloc(3 * (size_t) std::min(T, (size_t) kGemmT) * (kCtlSplits * (size_t) std::max(64, hp.gate_rank) + kCtlSplits));
+             D.gb = dalloc(T * N);
+             D.fb = dalloc(T * N);
+             D.q = dalloc(T * QD);
+@@ -3552,6 +3625,7 @@ struct Engine {
+             D.pick = dalloc_t<int32_t>(1);
+             const int max_in = (int) std::max<size_t>(QD, 2 * N);
+             CK(cudaMalloc(&D.q8, K::native_q8_1_bytes(max_in, 1) * T));
++            for (void** p : {&D.q8b, &D.q8c}) CK(cudaMalloc(p, K::native_q8_1_bytes((int) N, 1) * std::min(T, (size_t) 8)));   // (k_q8_seg's k, v inputs)
+             CK(cudaMalloc(&D.xq, K::native_q8_1_bytes((int) N, 1) * T));
+             D.x16 = dalloc_t<__half>(T * (size_t) max_in);
+             CK(cudaMalloc(&D.escr, K::native_expert_scratch_bytes((int64_t) (TG * Kp), (int64_t) FF)));
+@@ -3925,6 +3999,23 @@ struct Engine {
+         if (T > kGemmT) k_to_f16<<<grid1((int64_t) n * T), kThreads, 0, D.st>>>(x, D.x16, (int64_t) n * T);
+         else K::native_quantize_q8_1(x, D.q8, n * T, 1, D.st);
+     }
++    /// Q8_0 projections of one input each (q8_1), one launch (k_q8_seg); T <= 8.
++    void apply_q8_seg(Dev& D, const Mat* const* w, const void* const* x, float* const* out, int n, int T) {
++        QSegs a{};
++        int blk = 0;
++        for (int i = 0; i < n; ++i) {
++            a.s[i] = QSeg{(const uint8_t*) w[i]->d, (const uint8_t*) x[i], out[i], w[i]->n_out, blk};
++            blk += (w[i]->n_out + 7) / 8;
++        }
++        a.n = n;
++        const int n_in = w[0]->n_in;
++        switch (T) {
++#define STRATA_INK_Q8SEG(TT) case TT: k_q8_seg<TT><<<(unsigned) blk, 256, 0, D.st>>>(a, n_in); break;
++            STRATA_INK_Q8SEG(1) STRATA_INK_Q8SEG(2) STRATA_INK_Q8SEG(3) STRATA_INK_Q8SEG(4)
++            STRATA_INK_Q8SEG(5) STRATA_INK_Q8SEG(6) STRATA_INK_Q8SEG(7) STRATA_INK_Q8SEG(8)
++#undef STRATA_INK_Q8SEG
++        }
++    }
+     void apply(Dev& D, const Mat& w, float* out, int T) {
+         if (T > kGemmT) {
+             D.gemm.native((const uint16_t*) D.x16, w.type, w.d, out, T, w.n_out, w.n_in);
+@@ -3969,8 +4060,8 @@ struct Engine {
+             a.wf[j] = L.loop_forget[k0 + j];
+             a.out[j] = out[j];
+         }
+-        k_ctl_down<<<dim3((unsigned) ((R + 7) / 8), (unsigned) T, (unsigned) nk), 256, 0, D.st>>>(a, D.h64, N, R, 1e-6f);
+-        k_ctl_up<<<dim3((unsigned) ((N + 15) / 16), (unsigned) T, (unsigned) nk), 256, 0, D.st>>>(a, D.h64, N, R);
++        k_ctl_down<<<dim3((unsigned) ((R + 7) / 8 * kCtlSplits), (unsigned) T, (unsigned) nk), 256, 0, D.st>>>(a, D.hctl, N, R, 1e-6f);
++        k_ctl_up<<<dim3((unsigned) ((N + 15) / 16), (unsigned) T, (unsigned) nk), 256, 0, D.st>>>(a, D.hctl, N, R, 1e-6f);
+     }
+     void control(Dev& D, const Layer& L, int k, const float* x, const float* msg, float* out, int T) {
+         const int N = m->hp.n_embd, R = m->hp.gate_rank;
+@@ -4378,7 +4469,7 @@ struct Engine {
+             } else {
+                 in[0] = in[1] = in[2] = curp;
+             }
+-            const bool fused_ctl = T <= kGemmT && hp.gate_rank <= 64 && hp.gate_rank % 4 == 0;
++            const bool fused_ctl = T <= kGemmT && hp.gate_rank <= 64 && hp.gate_rank % 4 == 0 && hp.n_embd % (kCtlSplits * 2) == 0;
+             if (msg[0] && fused_ctl) {
+                 float* const o3[3] = {D->xn[0], D->xn[1], D->xn[2]};
+                 controls(*D, L, 0, 3, in, msg, o3, T);
+@@ -4405,15 +4496,36 @@ struct Engine {
+                     xn[j] = D->xn[j];
+                 }
+             }
+-            prep(*D, xn[0], N, T);
+-            apply(*D, L.wq, D->q, T);
+-            apply(*D, L.wrel, D->r, T);
+-            apply(*D, L.wg, D->g, T);
+-            f32mm(*D, L.sink_proj, xn[0], D->sink, N, H, T);
+-            if (xn[1] != xn[0]) prep(*D, xn[1], N, T);
+-            apply(*D, L.wk, D->k, T);
+-            if (xn[2] != xn[1]) prep(*D, xn[2], N, T);
+-            apply(*D, L.wv, D->v, T);
++            bool seg = T <= 8;   // a decode's q, rel, gate, k and v in one launch (k_q8_seg)
++            for (const Mat* w : {&L.wq, &L.wrel, &L.wg, &L.wk, &L.wv}) seg = seg && w->type == 8 && w->n_in == N && w->n_out % 8 == 0;
++            if (seg) {
++                K::native_quantize_q8_1(xn[0], D->q8, N * T, 1, D->st);
++                const void* xk = D->q8;
++                if (xn[1] != xn[0]) {
++                    K::native_quantize_q8_1(xn[1], D->q8b, N * T, 1, D->st);
++                    xk = D->q8b;
++                }
++                const void* xv = xk;
++                if (xn[2] != xn[1]) {
++                    K::native_quantize_q8_1(xn[2], D->q8c, N * T, 1, D->st);
++                    xv = D->q8c;
++                }
++                const Mat* ws[5] = {&L.wq, &L.wrel, &L.wg, &L.wk, &L.wv};
++                const void* xs[5] = {D->q8, D->q8, D->q8, xk, xv};
++                float* os[5] = {D->q, D->r, D->g, D->k, D->v};
++                apply_q8_seg(*D, ws, xs, os, 5, T);
++                f32mm(*D, L.sink_proj, xn[0], D->sink, N, H, T);
++            } else {
++                prep(*D, xn[0], N, T);
++                apply(*D, L.wq, D->q, T);
++                apply(*D, L.wrel, D->r, T);
++                apply(*D, L.wg, D->g, T);
++                f32mm(*D, L.sink_proj, xn[0], D->sink, N, H, T);
++                if (xn[1] != xn[0]) prep(*D, xn[1], N, T);
++                apply(*D, L.wk, D->k, T);
++                if (xn[2] != xn[1]) prep(*D, xn[2], N, T);
++                apply(*D, L.wv, D->v, T);
++            }
+             if (!L.swa) {
+                 f32mm(*D, L.kc_proj, xn[1], D->dk, N, 4 * HKV, T);
+                 f32mm(*D, L.vc_proj, xn[2], D->dv, N, 4 * HKV, T);
+-- 
+2.56.1
+
