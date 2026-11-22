@@ -1,0 +1,235 @@
+From 1c48164446ce10e55a1bb87cc6dea0f530b89d91 Mon Sep 17 00:00:00 2001
+From: LegendaryFire <tristan.balon@outlook.com>
+Date: Sat, 21 Nov 2026 20:02:00 -0700
+Subject: [PATCH] Split Inkling 2's layers over two cards by its prompt
+ pipeline
+
+The split by bytes put layers 0-13 on one card and 14-23 on the
+other: with the core (6-17) visited three times, 30 of the 48 visits
+ran on the first card, busy 11.7 s of a 13 s prompt read while the
+second waited 40% of it. Now:
+
+- with two cards, card 0 takes layers [0, x) and [y, z) (the last
+  layer on card 1): of the splits whose two-executor prompt pipeline
+  (chunk c's visit waits for chunk c - 1's) is within 5% of the
+  fastest, the one leaving both cards the closest free VRAM. For
+  Inkling-2-Mini: 0-5 and 12-18 on GPU 0, 6-11 and 19-23 on GPU 1,
+  every hand-off about as long;
+- the head (and the DSpark drafter beside it, its file size counted)
+  goes on either card, wherever it evens the free VRAM;
+- each card's layers start with the experts that fit on that card;
+- a prompt read of 4096+ tokens (and 1/16 of what the window holds:
+  the flip copies the window from RAM twice) reads whole windows, not
+  ones split across the cards;
+- the load line lists each card's layer runs and the head's card.
+
+The same products (the 20K text's ppl unchanged). Both executors,
+the drafter: 7K 1825 -> 1971 tok/s, 60K 1867 -> 2222, 180K 1509 ->
+1782; free VRAM after start 953/167 -> 529/559 MiB, so no experts go
+to RAM for the second executor at 32K-512K; a 4-row verify at 7K 80
+-> 35 ms, decode otherwise unchanged.
+---
+ vendor/src/inkling2/ink_engine.cu | 127 ++++++++++++++++++++++++++----
+ 1 file changed, 113 insertions(+), 14 deletions(-)
+
+diff --git a/vendor/src/inkling2/ink_engine.cu b/vendor/src/inkling2/ink_engine.cu
+index 330db7b..869632e 100644
+--- a/vendor/src/inkling2/ink_engine.cu
++++ b/vendor/src/inkling2/ink_engine.cu
+@@ -1,3 +1,4 @@
++#include <filesystem>
+ // src/inkling2/ink_engine.cu - the engine path for Inkling 2 (GGUF architecture inkling2), llama.cpp PR #32695's graph
+ #include "strata/artifact/gguf_reader.hpp"
+ #include "strata/inkling2/engine.hpp"
+@@ -73,6 +74,7 @@ constexpr int kStage = 16384;     // cells of a RAM part staged in VRAM at a tim
+ constexpr int kHostKeys = 2048;   // keys a decode partial of a staged RAM block (the tensor-core kernel)
+ int g_cc_mib = 8192, g_cc_slots = 4, g_cc_min = 2048;   // --conversation-cache-mib / -slots / -min-tokens
+ int g_dspark_n = 3;              // --dspark-n: the most tokens DSpark drafts a step
++uint64_t g_head_extra = 0;       // bytes beside the head on its card (the DSpark drafter: its file)
+ // Room on card d for `bytes` more (the pool moves its coldest experts to RAM; nothing without the pool): the drafter's
+ // weights and buffers come after the experts filled the cards.
+ std::function<void(int, size_t)> g_make_room;
+@@ -2666,6 +2668,42 @@ uint64_t layer_bytes(const strata::GgufModel& gm, const HP& hp, int l, size_t& s
+     return b + stride * (size_t) res + kMmqTail;
+ }
+ 
++/// A prompt's time a chunk on two cards with two executors (chunk c's visit waits for chunk c - 1's), each visit a unit:
++/// the runs of visits on one card, scheduled earliest first.
++double pipe_time(const HP& hp, const std::vector<int>& dev) {
++    std::vector<std::pair<int, int>> seg;   // (card, visits)
++    for (int il = 0; il < hp.n_vis; ++il) {
++        const int d = dev[(size_t) hp.phys(il)];
++        if (!seg.empty() && seg.back().first == d) ++seg.back().second;
++        else seg.push_back({d, 1});
++    }
++    const int n_ch = 24, S = (int) seg.size();
++    std::vector<double> done((size_t) n_ch * S, 1e30);   // (not yet: the next chunk waits)
++    double free_at[2] = {0, 0}, at[2] = {0, 0};
++    int c_of[2] = {0, 1}, s_of[2] = {0, 0};
++    double end = 0;
++    for (;;) {
++        int w = -1;
++        double st_w = 1e30;
++        for (int e = 0; e < 2; ++e) {
++            if (c_of[e] >= n_ch) continue;
++            const int c = c_of[e], k = s_of[e];
++            double st = std::max(at[e], free_at[seg[(size_t) k].first]);
++            if (c > 0) st = std::max(st, done[(size_t) (c - 1) * S + k]);
++            if (st < st_w) { w = e; st_w = st; }
++        }
++        if (w < 0) break;
++        const int c = c_of[w], k = s_of[w], d = seg[(size_t) k].first;
++        const double en = st_w + seg[(size_t) k].second;
++        free_at[d] = at[w] = done[(size_t) c * S + k] = en;
++        end = std::max(end, en);
++        if (++s_of[w] == S) {
++            s_of[w] = 0;
++            c_of[w] += 2;
++        }
++    }
++    return end / n_ch;
++}
+ bool place(Model& m, const std::vector<uint64_t>& lb, const std::vector<uint64_t>& kv, uint64_t head_bytes,
+            uint64_t reserve, std::string& err, bool all_cards = false) {
+     int n = 0;
+@@ -2718,7 +2756,40 @@ bool place(Model& m, const std::vector<uint64_t>& lb, const std::vector<uint64_t
+         m.layers[(size_t) l].dev = d;
+         used += need;
+     }
+-    m.head_dev = m.layers.back().dev;
++    int head_card = -1;
++    if (use == 2) {   // two cards: the split whose two-chunk prompt pipeline keeps both busiest, where both fit
++        const HP& hp = m.hp;
++        // card 0 takes [0, x) and [y, z): with a looped core, its halves on the two cards make every hand-off as long
++        // (then, of those within 5% of the fastest, the one leaving both cards the closest free VRAM: the pool's experts)
++        struct Cand { int x, y, z, hd; double t, gap; };
++        std::vector<Cand> cands;
++        std::vector<int> dev((size_t) L);
++        double best_t = 1e30;
++        for (int x = 1; x < L; ++x)
++            for (int y = x; y < L; ++y)
++                for (int z = y; z <= L; ++z) {
++                    if (z == L && y < L) continue;   // the last layer on card 1
++                    uint64_t b[2] = {0, 0};
++                    for (int l = 0; l < L; ++l) {
++                        dev[(size_t) l] = l < x || (l >= y && l < z) ? 0 : 1;
++                        b[dev[(size_t) l]] += lb[(size_t) l] + kv[(size_t) l];
++                    }
++                    const double t = pipe_time(hp, dev);
++                    for (int hd = 0; hd < 2; ++hd) {   // the head (and a drafter) on either card: a row's hand-off
++                        const uint64_t b0 = b[0] + (hd == 0 ? head_bytes : 0), b1 = b[1] + (hd == 1 ? head_bytes : 0);
++                        if (b0 > room[0] || b1 > room[1]) continue;
++                        cands.push_back({x, y, z, hd, t, std::fabs((double) room[0] - (double) b0 - ((double) room[1] - (double) b1))});
++                        best_t = std::min(best_t, t);
++                    }
++                }
++        int bx = -1, by = -1, bz = -1;
++        double best_gap = 1e30;
++        for (const Cand& c : cands)
++            if (c.t <= best_t * 1.05 && c.gap < best_gap) { best_gap = c.gap; bx = c.x; by = c.y; bz = c.z; head_card = c.hd; }
++        if (bx > 0)
++            for (int l = 0; l < L; ++l) m.layers[(size_t) l].dev = l < bx || (l >= by && l < bz) ? 0 : 1;
++    }
++    m.head_dev = head_card >= 0 ? head_card : m.layers.back().dev;
+     std::vector<uint64_t> on((size_t) use, 0);
+     for (int l = 0; l < L; ++l) on[(size_t) m.layers[(size_t) l].dev] += lb[(size_t) l] + kv[(size_t) l];
+     on[(size_t) m.head_dev] += head_bytes;
+@@ -2966,7 +3037,29 @@ bool load(const std::string& path, Model& m, int ctx, int tmax, bool q8, int n_s
+             for (int l = 0; l < hp.n_phys; ++l) lb[(size_t) l] = layer_bytes(gm, hp, l, strides[(size_t) l], err);
+         }
+     }
+-    if (!place(m, lb, kv, head_bytes, reserve, err, pool)) return false;
++    if (!place(m, lb, kv, head_bytes + g_head_extra, reserve, err, pool)) return false;
++    // the pool: each card's layers start with the experts that fit beside its own weights and caches (the split is by
++    // work, so one card may hold more)
++    std::vector<int> slots_on((size_t) m.n_dev, g_experts_vram < 0 ? hp.n_expert : std::min(g_experts_vram, hp.n_expert));
++    if (pool && g_experts_vram < 0)
++        for (int d = 0; d < m.n_dev; ++d) {
++            CK(cudaSetDevice(m.dev_ids[(size_t) d]));
++            size_t fr = 0, tot = 0;
++            CK(cudaMemGetInfo(&fr, &tot));
++            const uint64_t margin = reserve + (1792ull << 20);   // (the engine's buffers and the CUDA context: ~2 GiB a card measured)
++            const uint64_t room = fr > margin ? fr - margin : 0;
++            uint64_t dense = d == m.head_dev ? head_bytes + g_head_extra : 0, experts = 0;
++            for (int l = 0; l < hp.n_phys; ++l)
++                if (m.layers[(size_t) l].dev == d) {
++                    const uint64_t ex = strides[(size_t) l] * (uint64_t) hp.n_expert;
++                    experts += ex;
++                    dense += lb[(size_t) l] - std::min(lb[(size_t) l], ex) + kv[(size_t) l];
++                }
++            if (experts > 0 && dense + experts > room) {
++                const double fit = room > dense ? (double) (room - dense) / (double) experts : 0.0;
++                slots_on[(size_t) d] = std::max(0, std::min(hp.n_expert, (int) (fit * hp.n_expert)));
++            }
++        }
+     Loader ld(m);
+     for (int l = 0; l < hp.n_phys; ++l) {
+         Layer& y = m.layers[(size_t) l];
+@@ -3075,7 +3168,7 @@ bool load(const std::string& path, Model& m, int ctx, int tmax, bool q8, int n_s
+                 std::memcpy(dst + y.L.tail_off, tail, sizeof tail);
+             }
+         }
+-        y.n_slots = g_experts_vram < 0 ? hp.n_expert : std::min(g_experts_vram, hp.n_expert);
++        y.n_slots = slots_on[(size_t) y.dev];
+         y.n_res = 0;
+         y.eptr_h.assign((size_t) hp.n_expert, 0);
+         y.on_gpu.assign((size_t) hp.n_expert, 0);
+@@ -3124,15 +3217,16 @@ bool load(const std::string& path, Model& m, int ctx, int tmax, bool q8, int n_s
+     }
+     std::string where;
+     for (int dv = 0; dv < m.n_dev; ++dv) {
+-        int lo = -1, hi = -1;
+-        for (int l = 0; l < hp.n_phys; ++l)
+-            if (m.layers[(size_t) l].dev == dv) {
+-                if (lo < 0) lo = l;
+-                hi = l;
+-            }
+-        char b[160];
+-        std::snprintf(b, sizeof b, "%sGPU %d: layers %d-%d, %.2f GiB", dv ? "; " : "", m.dev_ids[(size_t) dv], lo, hi,
+-                      (double) ld.bytes[dv] / (1 << 30));
++        std::string runs;   // its runs of layers, "0-5, 12-17"
++        for (int l = 0; l < hp.n_phys; ++l) {
++            if (m.layers[(size_t) l].dev != dv || (l > 0 && m.layers[(size_t) l - 1].dev == dv)) continue;
++            int e = l;
++            while (e + 1 < hp.n_phys && m.layers[(size_t) e + 1].dev == dv) ++e;
++            runs += (runs.empty() ? "" : ", ") + std::to_string(l) + "-" + std::to_string(e);
++        }
++        char b[200];
++        std::snprintf(b, sizeof b, "%sGPU %d: layers %s%s, %.2f GiB", dv ? "; " : "", m.dev_ids[(size_t) dv], runs.c_str(),
++                      m.head_dev == dv ? " and the head" : "", (double) ld.bytes[dv] / (1 << 30));
+         where += b;
+     }
+     std::fprintf(stderr, "strata-inkling2: %s: %d layers (%d visits: core %d-%d x %d), %s, the embedding read from the file, "
+@@ -5295,7 +5389,7 @@ struct CkPolicy {
+     std::function<CkptP()> make;
+     std::vector<CkptP> got;
+ };
+-constexpr int64_t kWholeRead = 16384;   // a prompt read this long goes back to whole windows for its chunks
++constexpr int64_t kWholeRead = 4096;   // a prompt read this long goes back to whole windows for its chunks
+ struct Prompt {
+     Engine* ex[2] = {};
+     Pool* pool = nullptr;
+@@ -5349,7 +5443,7 @@ struct Prompt {
+                 std::unique_lock<std::shared_mutex> lk(p.pool->mu);
+                 p.ex[0]->set_window(s, s.win, true, l);
+             }
+-        } layout(*this, s, s.split && n >= kWholeRead);
++        } layout(*this, s, s.split && n >= kWholeRead && n * 16 >= s.pos);   // (the flip copies the window from RAM twice)
+         if (!ex[1]) {   // one executor: a chunk at a time
+             int64_t got = 0;
+             for (const auto& [o, T] : ch) {
+@@ -6475,6 +6569,11 @@ int strata::inkling2::run(int argc, char** argv) {
+     Model m;
+     std::string err;
+     try {
++        if (!dspark_path.empty()) {   // the drafter goes beside the head: the split leaves it room
++            std::error_code ec;
++            const auto fsz = std::filesystem::file_size(dspark_path, ec);
++            if (!ec) g_head_extra = (uint64_t) fsz;
++        }
+         if (!load(model, m, ctx, chunk, q8_kv, n_lanes, kv_res, err)) { std::fprintf(stderr, "strata-inkling2: %s\n", err.c_str()); return 1; }
+         for (const char* k : {"tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id"})
+             if (const strata::MetaValue* v = m.file->meta().get(k))
+-- 
+2.56.1
+
