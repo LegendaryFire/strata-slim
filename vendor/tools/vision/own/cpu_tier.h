@@ -44,6 +44,8 @@ struct CpuOps {
     // row[kstride ..); pair j of a head turns by (c1, s1)[j] for j < hd/4, else by (c2, s2)[j - hd/4]), and the position table's bilinear add of one row.
     void (*rope_row)(float* row, size_t kstride, int heads, int hd, const float* c1, const float* s1, const float* c2, const float* s2);
     void (*pos_add)(float* xr, const float* a, const float* b, const float* c, const float* d, float dx, float dy, int D);
+    // x = gelu_erf(x) = x / 2 (1 + erf(x / sqrt 2)) on rows x n, as gelu (erf: Abramowitz-Stegun 7.1.26, within 1.5e-7)
+    void (*gelu_erf)(float* x, size_t ldx, int rows, int n);
 };
 
 const CpuOps& cpu_ops_scalar();

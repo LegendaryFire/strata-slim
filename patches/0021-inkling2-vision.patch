@@ -1,0 +1,881 @@
+From 0938ad544ca0d509067cdf5e8975e9046597db1b Mon Sep 17 00:00:00 2001
+From: LegendaryFire <tristan.balon@outlook.com>
+Date: Sun, 22 Nov 2026 13:28:22 -0700
+Subject: [PATCH] Read pictures with Inkling 2: its mmproj on the CPU, GENI in
+ its engine
+
+Inkling 2's engine took text only (GEN / BGEN), and strata-vision
+read Qwen's towers only. Now:
+
+- the CPU tower (VitCpu) reads Inkling 2's (projector inkling2v, the
+  type under clip.vision): a class token, the position table at its
+  32 x 32 grid or bilinear (ggml's half-pixel centres), a pre-norm,
+  separate q / k / v, the 2D rotary on pairs (a head's first half by
+  the column + 1, its second by the row + 1, the class token at 0),
+  layer scales, an erf GELU (a tier kernel: Abramowitz-Stegun, within
+  1.5e-7), the patches merged 2 x 2 into mm.1, erf GELU, mm.2. The
+  picture padded to a multiple of 40 (with -1 before the
+  normalisation), resized only past 4,096 tokens, as mtmd. Against
+  llama.cpp's mtmd at 640 x 640, 1000 x 700, 333 x 251 (padded) and
+  4000 x 3000 (resized): every token's cosine >= 0.99994. The GPU
+  tower stays Qwen's: a GPU reader refuses the file before READY and
+  the server starts the CPU one;
+- the engine takes GENI / BGENI (<max_new> [keys] <file> <ids>, the
+  file strata-vision's records): each picture's rows its run of
+  <|unused_200054|>, not RMS-normed (llama.cpp's inkling2 norms token
+  rows only). Each row's id becomes one past the vocabulary, made
+  from the picture's key (img_keys, else its rows' hash) and the row,
+  so lanes, checkpoints and parked conversations, all matched by
+  ids, tell pictures apart; lookup drafts and penalties skip them;
+A follow-up turn on the same picture reuses its state (270 of 282
+tokens); another picture with the same grid reuses none.
+---
+ vendor/src/inkling2/ink_engine.cu          | 161 ++++++++++++--
+ vendor/tools/vision/own/cpu_kernels_impl.h |  30 ++-
+ vendor/tools/vision/own/cpu_tier.h         |   2 +
+ vendor/tools/vision/own/image_prep.cpp     |  38 ++++
+ vendor/tools/vision/own/own_reader.cpp     |   3 +-
+ vendor/tools/vision/own/vit_cpu.cpp        | 234 ++++++++++++++++++++-
+ vendor/tools/vision/own/vit_geometry.cpp   |  48 ++++-
+ vendor/tools/vision/own/vit_geometry.h     |  15 +-
+ 8 files changed, 509 insertions(+), 22 deletions(-)
+
+diff --git a/vendor/src/inkling2/ink_engine.cu b/vendor/src/inkling2/ink_engine.cu
+index 601f118..c7f5e35 100644
+--- a/vendor/src/inkling2/ink_engine.cu
++++ b/vendor/src/inkling2/ink_engine.cu
+@@ -65,7 +65,18 @@ constexpr int kChunkKeys = 256;   // attention split-K chunk
+ constexpr int kMaxDev = 8;
+ constexpr int kMaxStates = 8;     // depth-mix inputs (the blocks and the current state)
+ constexpr int kMaxG = 4;          // query heads per KV head the attention kernels take
+-constexpr int kGemmT = 8;         // above this many rows a matrix product is a GEMM, else the native MMVQ
++constexpr int kGemmT = 8;
++// GENI: a picture's rows take its run of <|unused_200054|> tokens (the chat template's image placeholder). In the engine
++// each row's id is one past the vocabulary, made from the picture's key and the row, so every match by ids (lanes,
++// checkpoints, parked conversations) tells pictures apart; a forward reads those rows' values from the request's.
++constexpr int32_t kImagePad = 200054;
++constexpr int32_t kImgId0 = 1 << 30;
++inline bool is_img_id(int32_t t) { return t >= kImgId0; }
++struct ImgRows {
++    int n_embd = 0;
++    std::vector<float> rows;                           // the request's pictures' rows, in prompt order
++    std::unordered_map<int32_t, size_t> at;            // a row's id -> its row
++};         // above this many rows a matrix product is a GEMM, else the native MMVQ
+ constexpr int kExpertGemmT = 32;  // from this many rows the experts are grouped GEMMs, else the native grouped kernels
+ constexpr int kAttTileT = 16;     // from this many rows attention is the tiled kernel, else split-K
+ constexpr size_t kSplitFloats = (size_t) 4 << 20;   // the f32 products' split-K partials
+@@ -3632,6 +3643,9 @@ struct Engine {
+     int T_now = 0;                    // rows of the forward in flight (the values' copies)
+     int32_t* hpin = nullptr;
+     uint8_t* hemb = nullptr;   // pinned: a forward's embedding rows
++    const ImgRows* img = nullptr;   // GENI: the request's pictures (a forward's rows with their ids get their values)
++    float* himg = nullptr;          // pinned: a forward's picture rows
++    int himg_rows = 0;
+ 
+     V newv(int d) {
+         Dev& D = dev[(size_t) d];
+@@ -4581,12 +4595,36 @@ struct Engine {
+         Dev* D = &dev[(size_t) d];
+         CK(cudaSetDevice(D->id));
+         CK(cudaStreamSynchronize(D->st));
+-        for (int t = 0; t < T; ++t)
+-            std::memcpy(hemb + (size_t) t * m->embd_row, m->embd + (size_t) toks[t] * m->embd_row, m->embd_row);
++        bool pics = false;
++        for (int t = 0; t < T; ++t) {
++            const bool pic = is_img_id(toks[t]);
++            pics = pics || pic;
++            std::memcpy(hemb + (size_t) t * m->embd_row, m->embd + (size_t) (pic ? 0 : toks[t]) * m->embd_row, m->embd_row);
++        }
+         CK(cudaMemcpyAsync(D->erows, hemb, (size_t) T * m->embd_row, cudaMemcpyHostToDevice, D->st));
+         K::iq_embed_rows(m->embd_type, D->erows, m->embd_row, D->iota, T, N, D->o, D->st);
+         V cur = newv(d);
+         k_rms<<<T, kThreads, 0, D->st>>>(D->o, m->tok_norm, at(cur, d), N, hp.eps);
++        if (pics) {   // a picture's rows as they are (not RMS-normed: llama.cpp's inkling2 norms token rows only), a run a copy
++            if (!img || img->n_embd != N) throw std::runtime_error("inkling2: a picture's row without the request's pictures");
++            if (himg_rows < T) {
++                if (himg) CK(cudaFreeHost(himg));
++                CK(cudaHostAlloc((void**) &himg, (size_t) T * N * 4, cudaHostAllocPortable));
++                himg_rows = T;
++            }
++            float* dst = at(cur, d);
++            for (int t = 0; t < T;) {
++                if (!is_img_id(toks[t])) { ++t; continue; }
++                int e = t;
++                for (; e < T && is_img_id(toks[e]); ++e) {
++                    const auto it = img->at.find(toks[e]);
++                    if (it == img->at.end()) throw std::runtime_error("inkling2: a picture's row not in the request's pictures");
++                    std::memcpy(himg + (size_t) e * N, img->rows.data() + it->second * (size_t) N, (size_t) N * 4);
++                }
++                CK(cudaMemcpyAsync(dst + (size_t) t * N, himg + (size_t) t * N, (size_t) (e - t) * N * 4, cudaMemcpyHostToDevice, D->st));
++                t = e;
++            }
++        }
+         std::vector<V> blocks, pre_blocks, bank;
+         V pre_cur, bank_last;
+         for (int il = 0; il < hp.n_vis; ++il) {
+@@ -5210,7 +5248,7 @@ struct Drafter {
+             for (int i = 0; i < n; ++i) tail[i] = at(L - (size_t) n + (size_t) i);
+             const auto it = ix[n - kMinN].find(key(tail, n));
+             if (it == ix[n - kMinN].end()) continue;
+-            for (size_t j = (size_t) it->second; j < L && (int) out.size() < kmax; ++j) out.push_back(at(j));
++            for (size_t j = (size_t) it->second; j < L && (int) out.size() < kmax && !is_img_id(at(j)); ++j) out.push_back(at(j));
+         }
+         return out;
+     }
+@@ -5887,12 +5925,15 @@ struct Request {
+     long long max_new = 0;
+     Sampling smp;
+     std::vector<int32_t> ids;
++    std::string emb;                  // GENI: the pictures' embeddings file (strata-vision records, in prompt order)
++    std::vector<uint64_t> img_keys;   // img_keys=<hex>,...: each picture's key (its normalized bytes' hash)
++    std::shared_ptr<ImgRows> img;     // their rows, the ids rewritten (attach_images)
+ };
+ 
+ /// The engine protocol (serve/server.py).  GEN reads and decodes one request on the control lines; with --batch N,
+ /// BGEN <slot> reads a request into the lane that holds the longest start of it, then the lane decodes on its own
+ /// thread (BT / BDONE) while the control lines take the next request.  STOP ends the control lines' request, BSTOP a
+-/// slot's.
++/// slot's.  GENI / BGENI: the same with pictures, `<max_new> [key=value ...] <embeddings file> <ids>`.
+ struct Serve {
+     Engine& big;
+     Pool* pool = nullptr;
+@@ -5926,7 +5967,7 @@ struct Serve {
+         std::fflush(stdout);
+     }
+ 
+-    bool parse(const char* p0, Request& r) {
++    bool parse(const char* p0, Request& r, bool pics = false) {
+         char* p = const_cast<char*>(p0);
+         r.max_new = std::strtoll(p, &p, 10);
+         for (;;) {
+@@ -5947,6 +5988,23 @@ struct Serve {
+             else if (key == "penalty_freq") r.smp.freq = std::strtof(v, nullptr);
+             else if (key == "penalty_present") r.smp.present = std::strtof(v, nullptr);
+             else if (key == "seed") r.smp.seed = std::strtoull(v, nullptr, 10);
++            else if (key == "img_keys")
++                for (const char* q = v; *q;) {
++                    char* e = nullptr;
++                    r.img_keys.push_back(std::strtoull(q, &e, 16));
++                    q = *e == ',' ? e + 1 : e;
++                    if (e == q && *q) break;
++                }
++        }
++        if (pics) {   // the embeddings file: the first word without an =
++            while (*p == ' ') ++p;
++            const char* f0 = p;
++            while (*p && *p != ' ') ++p;
++            r.emb.assign(f0, (size_t) (p - f0));
++            if (r.emb.empty()) {
++                say("ERR GENI: no embeddings file\n");
++                return false;
++            }
+         }
+         r.ids = parse_ids(p);
+         if (r.max_new < 1 || r.ids.empty()) {
+@@ -5962,8 +6020,74 @@ struct Serve {
+                 say("ERR a token id is outside the vocabulary\n");
+                 return false;
+             }
++        return !pics || attach_images(r);
++    }
++    /// GENI: the file's pictures onto their runs of <|unused_200054|>, in order (one row a token); each row's id made from
++    /// the picture's key (the server's, else its rows' hash) and the row.
++    bool attach_images(Request& r) {
++        auto fail = [&](const std::string& why) {
++            say("ERR %s\n", why.c_str());
++            return false;
++        };
++        const int N = big.m->hp.n_embd;
++        auto img = std::make_shared<ImgRows>();
++        img->n_embd = N;
++        struct Pic { int64_t n; size_t off; };
++        std::vector<Pic> pics;
++        std::FILE* f = std::fopen(r.emb.c_str(), "rb");
++        if (!f) return fail("cannot open " + r.emb);
++        for (;;) {
++            int32_t h[5];
++            const size_t got = std::fread(h, 4, 5, f);
++            if (got == 0) break;
++            if (got != 5 || h[0] != 0x31455653 || h[1] < 1 || h[2] < 1 || h[3] < 1 || (int64_t) h[2] * h[3] != h[1] || h[4] != N) {
++                std::fclose(f);
++                return fail("bad embeddings file (expected strata-vision records of width " + std::to_string(N) + ")");
++            }
++            const size_t off = img->rows.size() / (size_t) N, cnt = (size_t) h[1] * (size_t) N;
++            img->rows.resize(img->rows.size() + cnt);
++            if (std::fread(img->rows.data() + off * (size_t) N, 4, cnt, f) != cnt) {
++                std::fclose(f);
++                return fail("short embeddings file");
++            }
++            pics.push_back({h[1], off});
++        }
++        std::fclose(f);
++        auto fnv = [](const void* p, size_t n, uint64_t h) {
++            const uint8_t* b = static_cast<const uint8_t*>(p);
++            for (size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 0x100000001B3ull;
++            return h;
++        };
++        size_t k = 0;
++        for (size_t i = 0; i < r.ids.size();) {
++            if (r.ids[i] != kImagePad) { ++i; continue; }
++            if (k >= pics.size()) return fail("the prompt has more images than the embeddings file");
++            const Pic& pc = pics[k];
++            uint64_t key = fnv(&pc.n, sizeof pc.n, 0xCBF29CE484222325ull);
++            key = r.img_keys.size() == pics.size() ? fnv(&r.img_keys[k], 8, key)
++                                                   : fnv(img->rows.data() + pc.off * (size_t) N, (size_t) pc.n * N * 4, key);
++            ++k;
++            for (int64_t j = 0; j < pc.n; ++j) {
++                if (i + (size_t) j >= r.ids.size() || r.ids[i + (size_t) j] != kImagePad)
++                    return fail("image " + std::to_string(k) + " has " + std::to_string((long long) pc.n) + " rows but fewer <|unused_200054|> tokens");
++                int32_t id = kImgId0 | (int32_t) (fnv(&j, sizeof j, key) & 0x3FFFFFFF);
++                while (img->at.count(id)) id = kImgId0 | ((id + 1) & 0x3FFFFFFF);   // (a row the same key and row gave twice)
++                img->at[id] = pc.off + (size_t) j;
++                r.ids[i + (size_t) j] = id;
++            }
++            i += (size_t) pc.n;
++        }
++        if (k != pics.size()) return fail("the embeddings file has more images than the prompt");
++        if (is_img_id(r.ids.back())) return fail("the prompt cannot end in an image");
++        r.img = std::move(img);
+         return true;
+     }
++    /// The executors a request's prompt reads with: its pictures' rows, or none.
++    void show_images(Lane& L, const ImgRows* img) {
++        for (Engine* e : prompt->ex)
++            if (e) e->img = img;
++        L.ex->img = img;
++    }
+ 
+     static size_t match(const Lane& L, const std::vector<int32_t>& ids) {
+         if (L.live.empty() || L.live.size() >= ids.size()) return 0;
+@@ -6559,19 +6683,26 @@ struct Serve {
+     }
+     std::vector<int32_t> history(const std::vector<int32_t>& ids) {
+         static const bool pen_prompt = strata::kernels::penalty_counts_prompt(std::getenv("STRATA_PENALTY_PROMPT"));
+-        return strata::qwen35::penalty_history_start(ids, pen_prompt);
++        std::vector<int32_t> text;   // (the pictures' rows are not tokens)
++        text.reserve(ids.size());
++        for (int32_t t : ids)
++            if (!is_img_id(t)) text.push_back(t);
++        return strata::qwen35::penalty_history_start(text, pen_prompt);
+     }
+ 
+     void solo(const std::string& line) {
+         Request q;
+-        if (!parse(line.c_str() + 4, q)) return;
++        const bool pics = line.rfind("GENI ", 0) == 0;
++        if (!parse(line.c_str() + (pics ? 5 : 4), q, pics)) return;
+         const int li = pick(q.ids, -1);
+         if (li < 0) { say("ERR every lane is decoding\n"); return; }
+         Lane& L = *lanes[(size_t) li];
+         const int64_t forked = start_from(li, q.ids);
+         L.busy = true;
+         stop.store(false);
++        show_images(L, q.img.get());
+         const Read r = read(L, q.ids, forked);
++        show_images(L, nullptr);
+         if (r.cancelled) {
+             say("DONE 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0 0 0 0.0 %lld 0\n", q.ids.size(), r.ms, r.reuse, (long long) r.got);
+             L.busy = false;
+@@ -6621,14 +6752,15 @@ struct Serve {
+     }
+ 
+     void admit(const std::string& line) {
+-        char* p = const_cast<char*>(line.c_str()) + 5;
++        const bool pics = line.rfind("BGENI ", 0) == 0;
++        char* p = const_cast<char*>(line.c_str()) + (pics ? 6 : 5);
+         const long sl = std::strtol(p, &p, 10);
+         if (sl < 0 || sl >= (long) lanes.size() || lanes.size() < 2 || lanes[(size_t) slot_lane[(size_t) sl]]->busy) {
+             say("ERR BGEN: no such free slot (--batch %zu)\n", lanes.size() < 2 ? (size_t) 0 : lanes.size());
+             return;
+         }
+         Request q;
+-        if (!parse(p, q)) return;
++        if (!parse(p, q, pics)) return;
+         const int li = pick(q.ids, slot_lane[(size_t) sl]);
+         if (li < 0) { say("ERR BGEN: every lane is decoding\n"); return; }
+         for (size_t s2 = 0; s2 < slot_lane.size(); ++s2)   // the slot takes the lane; the slot that had it, this one's
+@@ -6640,7 +6772,9 @@ struct Serve {
+         L.busy = true;
+         slot_stop[(size_t) sl] = false;
+         stop.store(false);
++        show_images(L, q.img.get());
+         const Read r = read(L, q.ids, forked);
++        show_images(L, nullptr);
+         if (r.cancelled) {
+             say("DONE 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0 0 0 0.0 %lld 0\n", q.ids.size(), r.ms, r.reuse, (long long) r.got);
+             say("BADM %ld 0\n", sl);
+@@ -6750,9 +6884,9 @@ struct Serve {
+                 lines.pop_front();
+             }
+             if (line.empty()) continue;
+-            if (line.rfind("GEN ", 0) == 0) solo(line);
+-            else if (line.rfind("BGEN ", 0) == 0) admit(line);
+-            else say("ERR expected: GEN <max_new> [key=value ...] <id,id,...>\n");
++            if (line.rfind("GEN ", 0) == 0 || line.rfind("GENI ", 0) == 0) solo(line);
++            else if (line.rfind("BGEN ", 0) == 0 || line.rfind("BGENI ", 0) == 0) admit(line);
++            else say("ERR expected: GEN <max_new> [key=value ...] <id,id,...> or GENI <max_new> [key=value ...] <file> <id,id,...>\n");
+         }
+         for (int i = 0; i < (int) lanes.size(); ++i) slot_stop[(size_t) i] = true;
+         for (auto& L : lanes)
+@@ -6780,6 +6914,7 @@ int strata::inkling2::run(int argc, char** argv) {
+         else if (a == "--gpu") (void) next();   // applied by strata before the switch (CUDA_VISIBLE_DEVICES)
+         else if (a == "--greedy") {}
+         else if (a == "--serve") serve_mode = true;
++        else if (a == "--vision") {}   // GENI is always taken (the pictures come from strata-vision)
+         else if (a == "--ppl") ppl = true;
+         else if (a == "--dspark") dspark_path = next();
+         else if (a == "--temperature") cli_temp = (float) std::atof(next().c_str());
+diff --git a/vendor/tools/vision/own/cpu_kernels_impl.h b/vendor/tools/vision/own/cpu_kernels_impl.h
+index b1f54d8..87b0727 100644
+--- a/vendor/tools/vision/own/cpu_kernels_impl.h
++++ b/vendor/tools/vision/own/cpu_kernels_impl.h
+@@ -191,6 +191,34 @@ void gelu(float* x, size_t ldx, int rows, int n) {
+     }
+ }
+ 
++inline VR gelu_erf_v(VR x) {
++    // x erf(x / sqrt 2) = |x| erf(|x| / sqrt 2): 0.5 (x + |x| E(|x| / sqrt 2)), E(a) = 1 - t (a1 + t (a2 + ... a5)) exp(-a^2), t = 1 / (1 + p a)
++    const VR one = vr_set1(1.0f), ax = vr_max(x, vr_sub(vr_zero(), x)), a = vr_mul(ax, vr_set1(0.70710678118654752440f));
++    const VR t = vr_div(one, vr_fma(vr_set1(0.3275911f), a, one));
++    VR p = vr_set1(1.061405429f);
++    p = vr_fma(p, t, vr_set1(-1.453152027f));
++    p = vr_fma(p, t, vr_set1(1.421413741f));
++    p = vr_fma(p, t, vr_set1(-0.284496736f));
++    p = vr_fma(p, t, vr_set1(0.254829592f));
++    const VR e = vr_exp(vr_max(vr_sub(vr_zero(), vr_mul(a, a)), vr_set1(-87.0f)));
++    const VR erf = vr_sub(one, vr_mul(vr_mul(p, t), e));
++    return vr_mul(vr_set1(0.5f), vr_fma(ax, erf, x));
++}
++
++void gelu_erf(float* x, size_t ldx, int rows, int n) {
++    for (int r = 0; r < rows; ++r) {
++        float* p = x + (size_t) r * ldx;
++        int i = 0;
++        for (; i + W <= n; i += W) vr_store(p + i, gelu_erf_v(vr_load(p + i)));
++        if (i < n) {
++            float buf[W] = {0};
++            KN_COPY(buf, p + i, n - i);
++            vr_store(buf, gelu_erf_v(vr_load(buf)));
++            KN_COPY(p + i, buf, n - i);
++        }
++    }
++}
++
+ void layernorm(const float* x, float* y, int D, const float* w, const float* b, float eps) {
+     VR s = vr_zero();
+     int i = 0;
+@@ -276,7 +304,7 @@ void pos_add(float* xr, const float* a, const float* b, const float* c, const fl
+ 
+ const CpuOps& STRATA_KN_GETTER() {
+     static const CpuOps ops = {STRATA_KN_NAME, kn::MRF, kn::NR, kn::pack_w, kn::conv, kn::gemm, kn::gelu, kn::layernorm, kn::add, kn::round16, kn::softmax_update,
+-                               kn::rope_row, kn::pos_add};
++                               kn::rope_row, kn::pos_add, kn::gelu_erf};
+     return ops;
+ }
+ 
+diff --git a/vendor/tools/vision/own/cpu_tier.h b/vendor/tools/vision/own/cpu_tier.h
+index 7c001d7..2326095 100644
+--- a/vendor/tools/vision/own/cpu_tier.h
++++ b/vendor/tools/vision/own/cpu_tier.h
+@@ -44,6 +44,8 @@ struct CpuOps {
+     // row[kstride ..); pair j of a head turns by (c1, s1)[j] for j < hd/4, else by (c2, s2)[j - hd/4]), and the position table's bilinear add of one row.
+     void (*rope_row)(float* row, size_t kstride, int heads, int hd, const float* c1, const float* s1, const float* c2, const float* s2);
+     void (*pos_add)(float* xr, const float* a, const float* b, const float* c, const float* d, float dx, float dy, int D);
++    // x = gelu_erf(x) = x / 2 (1 + erf(x / sqrt 2)) on rows x n, as gelu (erf: Abramowitz-Stegun 7.1.26, within 1.5e-7)
++    void (*gelu_erf)(float* x, size_t ldx, int rows, int n);
+ };
+ 
+ const CpuOps& cpu_ops_scalar();
+diff --git a/vendor/tools/vision/own/image_prep.cpp b/vendor/tools/vision/own/image_prep.cpp
+index a8ed2ac..c8f824a 100644
+--- a/vendor/tools/vision/own/image_prep.cpp
++++ b/vendor/tools/vision/own/image_prep.cpp
+@@ -202,7 +202,22 @@ void resize_pad_ceil(const ImageU8& src, ImageU8& dst, Size2 target) {
+     dst = std::move(out);
+ }
+ 
++namespace {
++int align_up(int v, int a) { return (v + a - 1) / a * a; }
++// Inkling 2's size before its padding: the picture's own, or (over max_pixels once padded) mtmd's preserved-ratio size under it
++Size2 inkling_size(int w, int h, const VitGeometry& g, int max_tokens) {
++    const int64_t max_px = (int64_t) (max_tokens > 0 ? max_tokens : g.max_tokens) * g.patch * g.patch * g.merge * g.merge;
++    const int a = g.align();
++    if ((int64_t) align_up(w, a) * align_up(h, a) <= max_px) return {w, h};
++    return smart_resize(w, h, a, 0, (int) max_px);
++}
++}  // namespace
++
+ Size2 prepared_size(int w, int h, const VitGeometry& g, int min_tokens, int max_tokens) {
++    if (g.family == Family::Inkling2V) {   // padded on the right and the bottom to a multiple of patch * merge
++        const Size2 s = inkling_size(w, h, g, max_tokens);
++        return {align_up(s.w, g.align()), align_up(s.h, g.align())};
++    }
+     const int patch_area = g.patch * g.patch * g.merge * g.merge;
+     const int min_px = (min_tokens > 0 ? min_tokens : g.min_tokens) * patch_area;
+     const int max_px = (max_tokens > 0 ? max_tokens : g.max_tokens) * patch_area;
+@@ -213,6 +228,29 @@ bool prepare_image(const ImageU8& src, const VitGeometry& g, int min_tokens, int
+     if (src.w <= 0 || src.h <= 0 || src.rgb.size() != (size_t) src.w * src.h * 3) { err = "the picture is empty"; return false; }
+     const Size2 t = prepared_size(src.w, src.h, g, min_tokens, max_tokens);
+     if (t.w <= 0 || t.h <= 0) { err = "the picture has no usable size"; return false; }
++    if (g.family == Family::Inkling2V) {
++        // as mtmd's inkling2v preprocessor: the picture (resized only when over the limit) at the top left, the rest -1 before the
++        // normalisation, then (v - 255 mean) / (255 std)
++        const Size2 s = inkling_size(src.w, src.h, g, max_tokens);
++        ImageU8 r;
++        if (s.w != src.w || s.h != src.h) resize_bicubic(src, r, s.w, s.h);
++        const ImageU8& img = s.w != src.w || s.h != src.h ? r : src;
++        out.w = t.w;
++        out.h = t.h;
++        const size_t n = (size_t) t.w * t.h;
++        out.chw.resize(3 * n);
++        for (int c = 0; c < 3; ++c) {
++            const float m = g.mean[c] * 255.0f, sd = g.stdv[c] * 255.0f;
++            float* pl = &out.chw[(size_t) c * n];
++            for (int y = 0; y < t.h; ++y)
++                for (int x = 0; x < t.w; ++x) {
++                    const float v = y < img.h && x < img.w ? (float) img.rgb[((size_t) y * img.w + x) * 3 + c] : -1.0f;
++                    pl[(size_t) y * t.w + x] = (v - m) / sd;
++                }
++        }
++        if (resized) *resized = img;
++        return true;
++    }
+     ImageU8 r;
+     resize_pad_ceil(src, r, t);
+     out.w = t.w;
+diff --git a/vendor/tools/vision/own/own_reader.cpp b/vendor/tools/vision/own/own_reader.cpp
+index 1cc22bd..b624fa5 100644
+--- a/vendor/tools/vision/own/own_reader.cpp
++++ b/vendor/tools/vision/own/own_reader.cpp
+@@ -55,7 +55,7 @@ int own_reader_run(const OwnReaderOptions& o) {
+     Gguf gg;
+     VitGeometry geo;
+     std::string err;
+-    if (!gg.open(o.mmproj, err) || !vit_geometry_from_gguf(gg, geo, err) || !vit_geometry_supported(geo, err))
++    if (!gg.open(o.mmproj, err) || !vit_geometry_from_gguf(gg, geo, err) || !vit_geometry_supported_cpu(geo, err))
+         return fail("cannot load the vision encoder " + o.mmproj + " (" + err + ")", 1);
+     int threads = o.threads;
+     std::unique_ptr<VitRef> cpu;
+@@ -64,6 +64,7 @@ int own_reader_run(const OwnReaderOptions& o) {
+     std::unique_ptr<VitGpu> gpu;
+     if (o.gpu) {
+         std::string why;
++        if (!vit_geometry_supported(geo, why)) return fail("this picture reader file is read on the CPU only (" + why + ")", 3);
+         if (geo.head_dim > kVitGpuMaxHeadDim)
+             return fail("this picture reader file has attention heads of size " + std::to_string(geo.head_dim) + "; the GPU picture reader handles up to " +
+                             std::to_string(kVitGpuMaxHeadDim) + " (the CPU picture reader reads it)", 1);
+diff --git a/vendor/tools/vision/own/vit_cpu.cpp b/vendor/tools/vision/own/vit_cpu.cpp
+index 450926b..eded650 100644
+--- a/vendor/tools/vision/own/vit_cpu.cpp
++++ b/vendor/tools/vision/own/vit_cpu.cpp
+@@ -31,6 +31,8 @@ struct Mat {                     // a weight matrix [rows = out][cols = in]
+ struct Layer {
+     std::vector<float> ln1_w, ln1_b, ln2_w, ln2_b, qkv_b, o_b, up_b, down_b;
+     Mat qkv, o, up, down;
++    std::vector<float> q_b, k_b, v_b, ls1, ls2;   // inkling2v: separate q / k / v, the layer scales
++    Mat q, k, v;
+ };
+ 
+ }  // namespace
+@@ -40,7 +42,8 @@ struct VitCpu::Impl {
+     const CpuOps* ops = nullptr;
+     int act_round = 0;                  // STRATA_VIT_REF_ROUND: 0 none, 1 BF16, 2 F16 (the weight's type)
+     std::vector<float> patch_b, pos, post_w, post_b, mm0_b, mm2_b;
+-    Mat patch_w, mm0, mm2;
++    Mat patch_w, mm0, mm2;                      // (inkling2v: mm0 is mm.1)
++    std::vector<float> cls, pre_w, pre_b;       // inkling2v: the class token with its position, the pre-norm
+     std::vector<Layer> layers;
+     std::unique_ptr<Team> team;
+     int team_threads = 0;
+@@ -80,6 +83,9 @@ struct VitCpu::Impl {
+     template <class F>
+     void run(int n, F f) { team->run(n, [&](int task, int thr) { f(task, thr); }); }
+ 
++    bool load_inkling(const Gguf& gg, std::string& err);
++    bool encode_inkling(const PreparedImage& img, std::vector<float>& rows, int& nx, int& ny, std::string& err);
++
+     // rows of simple per-row work, 16 rows per task
+     template <class F>
+     void rows_par(int n, F f) {
+@@ -142,9 +148,10 @@ const char* VitCpu::isa_name() const { return impl_->ops ? impl_->ops->name : "n
+ bool VitCpu::load(const Gguf& gg, const VitGeometry& g, std::string& err) {
+     Impl& m = *impl_;
+     std::string why;
+-    if (!vit_geometry_supported(g, why)) { err = "this tower is not supported: " + why; return false; }
++    if (!vit_geometry_supported_cpu(g, why)) { err = "this tower is not supported: " + why; return false; }
+     m.g = g;
+     m.ops = &cpu_ops(quant::best_isa());
++    if (g.family == Family::Inkling2V) return m.load_inkling(gg, err);
+     // the patch embedding: the two temporal taps summed (a still picture is fed to both), kept float32 (a small matrix)
+     {
+         const GgufTensorInfo* t0 = gg.tensor("v.patch_embd.weight");
+@@ -200,6 +207,7 @@ bool VitCpu::encode(const PreparedImage& img, int threads, std::vector<float>& r
+     if (img.w <= 0 || img.h <= 0 || img.w % g.align() != 0 || img.h % g.align() != 0) { err = "the picture size is not a multiple of patch * merge"; return false; }
+     int nth = threads > 0 ? threads : (int) std::max(1u, std::min(16u, std::thread::hardware_concurrency() / 2));
+     if (!m.team || m.team_threads != nth) { m.team.reset(new Team(nth)); m.team_threads = nth; }
++    if (g.family == Family::Inkling2V) return m.encode_inkling(img, rows, nx, ny, err);
+     const CpuOps& ops = *m.ops;
+     // STRATA_VIT_PROF=1 (a diagnostic, stderr only, off by default): the time of each stage (every stage ends with its team run, so no extra wait)
+     static const bool prof = std::getenv("STRATA_VIT_PROF") != nullptr;
+@@ -402,4 +410,226 @@ bool VitCpu::encode(const PreparedImage& img, int threads, std::vector<float>& r
+     return true;
+ }
+ 
++// ---- Inkling 2's tower (inkling2v), as llama.cpp's mtmd_graph_inkling2v ----
++
++bool VitCpu::Impl::load_inkling(const Gguf& gg, std::string& err) {
++    {   // the patch embedding (one tap, no bias), float32
++        const GgufTensorInfo* t0 = gg.tensor("v.patch_embd.weight");
++        if (!t0) { err = "the mmproj file lacks v.patch_embd.weight"; return false; }
++        patch_w.kind = 0;
++        patch_w.rows = g.width;
++        patch_w.cols = 3 * g.patch * g.patch;
++        patch_w.f32.resize((size_t) t0->nelem());
++        if (!gg.read_f32(*t0, patch_w.f32.data(), err)) return false;
++    }
++    std::vector<float> cpos;
++    if (!read_f(gg, "v.position_embd.weight", pos, err) || !read_f(gg, "v.class_embd", cls, err) || !read_f(gg, "v.class_position_embd.weight", cpos, err) ||
++        !read_f(gg, "v.pre_ln.weight", pre_w, err) || !read_f(gg, "v.pre_ln.bias", pre_b, err) || !read_m(gg, "mm.1.weight", mm0, err) ||
++        !read_m(gg, "mm.2.weight", mm2, err))
++        return false;
++    for (size_t i = 0; i < cls.size(); ++i) cls[i] += cpos[i];
++    layers.assign((size_t) g.layers, Layer{});
++    for (int il = 0; il < g.layers; ++il) {
++        Layer& L = layers[(size_t) il];
++        const std::string p = "v.blk." + std::to_string(il) + ".";
++        if (!read_f(gg, p + "ln1.weight", L.ln1_w, err) || !read_f(gg, p + "ln1.bias", L.ln1_b, err) || !read_f(gg, p + "ln2.weight", L.ln2_w, err) ||
++            !read_f(gg, p + "ln2.bias", L.ln2_b, err) || !read_f(gg, p + "ls1.weight", L.ls1, err) || !read_f(gg, p + "ls2.weight", L.ls2, err) ||
++            !read_m(gg, p + "attn_q.weight", L.q, err) || !read_f(gg, p + "attn_q.bias", L.q_b, err) || !read_m(gg, p + "attn_k.weight", L.k, err) ||
++            !read_f(gg, p + "attn_k.bias", L.k_b, err) || !read_m(gg, p + "attn_v.weight", L.v, err) || !read_f(gg, p + "attn_v.bias", L.v_b, err) ||
++            !read_m(gg, p + "attn_out.weight", L.o, err) || !read_f(gg, p + "attn_out.bias", L.o_b, err) || !read_m(gg, p + "ffn_up.weight", L.up, err) ||
++            !read_f(gg, p + "ffn_up.bias", L.up_b, err) || !read_m(gg, p + "ffn_down.weight", L.down, err) || !read_f(gg, p + "ffn_down.bias", L.down_b, err))
++            return false;
++    }
++    act_round = vit_cpu_round_kind(layers.empty() ? 0 : layers[0].q.kind, std::getenv("STRATA_VIT_REF_ROUND"));
++    return true;
++}
++
++// Token 0 is the class token, token 1 + y * pw + x the patch at (x, y).  Per layer: x += ls1 * o(attn(LN1 x)), x += ls2 * down(gelu_erf(up(LN2 x)));
++// the rotary turns pairs (2i, 2i + 1) of a head's first half with the column + 1 and of its second half with the row + 1 (the class token: 0, 0).
++// Then the class token dropped, the patches merged 2x2 (x then y within a block, blocks row-major) and projected: mm.2(gelu_erf(mm.1 m)).
++bool VitCpu::Impl::encode_inkling(const PreparedImage& img, std::vector<float>& rows, int& nx, int& ny, std::string& err) {
++    const int P = g.patch, D = g.width, H = g.heads, HD = g.head_dim, F = g.ffn;
++    if (HD > 128 || HD % 4 != 0) { err = "this head size is not handled by the CPU tower"; return false; }
++    const int pw = img.w / P, ph = img.h / P, NP = pw * ph, N = NP + 1;
++    nx = pw / 2;
++    ny = ph / 2;
++    const int R = std::min(N, kRowsChunk);
++    std::vector<std::vector<float>> scratch((size_t) team->size(), std::vector<float>((size_t) kKC * 2 * ops->NR));
++    const CpuOps& o = *ops;
++
++    // ---- the patches (row-major) and their positions: the table as is at its own grid, else ggml's bilinear (half-pixel centres) ----
++    const int K0 = 3 * P * P;
++    std::vector<float> x((size_t) N * D);
++    std::memcpy(x.data(), cls.data(), sizeof(float) * (size_t) D);
++    {
++        std::vector<float> A((size_t) std::min(NP, kRowsChunk) * K0);
++        const size_t plane = (size_t) img.w * img.h;
++        for (int r0 = 0; r0 < NP; r0 += kRowsChunk) {
++            const int rn = std::min(kRowsChunk, NP - r0);
++            rows_par(rn, [&](int i) {
++                const int t = r0 + i, py = t / pw, px = t % pw;
++                float* a = &A[(size_t) i * K0];
++                for (int c = 0; c < 3; ++c)
++                    for (int ky = 0; ky < P; ++ky)
++                        std::memcpy(a + (size_t) c * P * P + (size_t) ky * P, &img.chw[c * plane + (size_t) (py * P + ky) * img.w + (size_t) px * P], (size_t) P * sizeof(float));
++            });
++            linear(patch_w, A.data(), (size_t) K0, rn, x.data() + (size_t) (1 + r0) * D, (size_t) D, 0, nullptr, false, scratch);
++        }
++        const int G = g.pos_grid;
++        const float sfx = (float) pw / G, sfy = (float) ph / G;
++        rows_par(NP, [&](int t) {
++            float* xr = &x[(size_t) (1 + t) * D];
++            const int py = t / pw, px = t % pw;
++            if (pw == G && ph == G) {
++                const float* a = &pos[(size_t) t * D];
++                for (int i = 0; i < D; ++i) xr[i] += a[i];
++                return;
++            }
++            const float fy = ((float) py + 0.5f) / sfy - 0.5f, fx = ((float) px + 0.5f) / sfx - 0.5f;
++            int y0 = (int) std::floor(fy), x0 = (int) std::floor(fx), y1 = y0 + 1, x1 = x0 + 1;
++            y0 = std::max(0, std::min(y0, G - 1)); y1 = std::max(0, std::min(y1, G - 1));
++            x0 = std::max(0, std::min(x0, G - 1)); x1 = std::max(0, std::min(x1, G - 1));
++            const float dy = std::max(0.0f, std::min(fy - (float) y0, 1.0f)), dx = std::max(0.0f, std::min(fx - (float) x0, 1.0f));
++            o.pos_add(xr, &pos[((size_t) y0 * G + x0) * D], &pos[((size_t) y0 * G + x1) * D], &pos[((size_t) y1 * G + x0) * D], &pos[((size_t) y1 * G + x1) * D], dx,
++                      dy, D);
++        });
++    }
++    rows_par(N, [&](int t) {   // the pre-norm, in place
++        std::vector<float> tmp((size_t) D);
++        o.layernorm(&x[(size_t) t * D], tmp.data(), D, pre_w.data(), pre_b.data(), g.eps);
++        std::memcpy(&x[(size_t) t * D], tmp.data(), sizeof(float) * (size_t) D);
++    });
++
++    // ---- rotary: pair i of a half turns by pos * theta^(-2i / (HD / 2)) ----
++    const int half = HD / 2, npair = half / 2;
++    std::vector<float> inv((size_t) npair);
++    for (int i = 0; i < npair; ++i) inv[(size_t) i] = std::pow(g.rope_theta, -2.0f * (float) i / (float) half);
++    auto rope = [&](float* hrow, int pa, int pb) {   // one head's HD values: the first half by pa (the column), the second by pb (the row)
++        for (int hf = 0; hf < 2; ++hf) {
++            const float p = (float) (hf ? pb : pa);
++            float* v = hrow + hf * half;
++            for (int i = 0; i < npair; ++i) {
++                const float th = p * inv[(size_t) i], c = std::cos(th), s = std::sin(th);
++                const float a = v[2 * i], b = v[2 * i + 1];
++                v[2 * i] = a * c - b * s;
++                v[2 * i + 1] = a * s + b * c;
++            }
++        }
++    };
++    const float kq_scale = 1.0f / std::sqrt((float) HD);
++
++    const size_t slack = 256, D3 = (size_t) 3 * D;
++    std::vector<float> qkv((size_t) N * D3 + slack, 0.0f), ctx((size_t) N * D), tmp((size_t) R * D);
++    const int Np = (N + 63) / 64 * 64;
++    std::vector<float> KT((size_t) H * HD * Np, 0.0f), VP((size_t) H * N * HD + slack);
++    std::vector<float> hbuf((size_t) R * D), up((size_t) R * F);
++    const int OD = (HD + 15) / 16 * 16, QB = kQBDefault, attn_tasks_q = (N + QB - 1) / QB;
++    std::vector<std::vector<float>> sscr((size_t) team->size(), std::vector<float>((size_t) QB * kTK + (size_t) QB * OD + 2 * QB));
++
++    for (const Layer& L : layers) {
++        for (int r0 = 0; r0 < N; r0 += R) {
++            const int rn = std::min(R, N - r0);
++            rows_par(rn, [&](int i) { o.layernorm(x.data() + (size_t) (r0 + i) * D, hbuf.data() + (size_t) i * D, D, L.ln1_w.data(), L.ln1_b.data(), g.eps); });
++            round_inplace(hbuf.data(), (size_t) rn * D, act_round);
++            float* dst = qkv.data() + (size_t) r0 * D3;
++            linear(L.q, hbuf.data(), (size_t) D, rn, dst, D3, 0, L.q_b.data(), false, scratch);
++            linear(L.k, hbuf.data(), (size_t) D, rn, dst + D, D3, 0, L.k_b.data(), false, scratch);
++            linear(L.v, hbuf.data(), (size_t) D, rn, dst + 2 * D, D3, 0, L.v_b.data(), false, scratch);
++        }
++        rows_par(N, [&](int t) {
++            float* row = qkv.data() + (size_t) t * D3;
++            const int pa = t == 0 ? 0 : (t - 1) % pw + 1, pb = t == 0 ? 0 : (t - 1) / pw + 1;
++            for (int hh = 0; hh < H; ++hh) {
++                rope(row + (size_t) hh * HD, pa, pb);
++                rope(row + D + (size_t) hh * HD, pa, pb);
++            }
++            if (act_round) o.round16(row, D3, 2);
++            for (int i = 0; i < D; ++i) row[i] *= kq_scale;
++        });
++        {
++            const int jb = 64, njb = (N + jb - 1) / jb;
++            team->run(H * njb, [&](int task, int) {
++                const int hh = task / njb, j0 = (task % njb) * jb, j1 = std::min(N, j0 + jb);
++                for (int j = j0; j < j1; ++j) {
++                    const float* kr = qkv.data() + (size_t) j * D3 + D + (size_t) hh * HD;
++                    float* kt = KT.data() + (size_t) hh * HD * Np + j;
++                    for (int d = 0; d < HD; ++d) kt[(size_t) d * Np] = kr[d];
++                    std::memcpy(VP.data() + ((size_t) hh * N + j) * HD, kr + D, sizeof(float) * (size_t) HD);
++                }
++            });
++        }
++        team->run(H * attn_tasks_q, [&](int task, int thr) {
++            const int hh = task / attn_tasks_q, q0 = (task % attn_tasks_q) * QB, qr = std::min(QB, N - q0);
++            float* S = sscr[(size_t) thr].data();
++            float* O = S + (size_t) QB * kTK;
++            float* mx = O + (size_t) QB * OD;
++            float* ls = mx + QB;
++            std::memset(O, 0, sizeof(float) * (size_t) QB * OD);
++            for (int r = 0; r < QB; ++r) { mx[r] = -3.0e38f; ls[r] = 0.0f; }
++            const float* Q = qkv.data() + (size_t) q0 * D3 + (size_t) hh * HD;
++            const float* KTh = KT.data() + (size_t) hh * HD * Np;
++            const float* Vh = VP.data() + (size_t) hh * N * HD;
++            for (int j0 = 0; j0 < N; j0 += kTK) {
++                const int tk = std::min(kTK, N - j0);
++                o.gemm(Q, D3, qr, KTh + j0, (size_t) Np, HD, tk, S, (size_t) kTK, 0, nullptr);
++                o.softmax_update(S, (size_t) kTK, qr, tk, mx, ls, O, (size_t) OD, HD);
++                o.gemm(S, (size_t) kTK, qr, Vh + (size_t) j0 * HD, (size_t) HD, tk, HD, O, (size_t) OD, 1, nullptr);
++            }
++            for (int r = 0; r < qr; ++r) {
++                const float iv = 1.0f / ls[r];
++                float* dst = ctx.data() + (size_t) (q0 + r) * D + (size_t) hh * HD;
++                for (int d = 0; d < HD; ++d) dst[d] = O[(size_t) r * OD + d] * iv;
++            }
++        });
++        round_inplace(ctx.data(), ctx.size(), act_round);
++        for (int r0 = 0; r0 < N; r0 += R) {      // x += ls1 * o(ctx)
++            const int rn = std::min(R, N - r0);
++            linear(L.o, ctx.data() + (size_t) r0 * D, (size_t) D, rn, tmp.data(), (size_t) D, 0, L.o_b.data(), false, scratch);
++            rows_par(rn, [&](int i) {
++                float* xr = x.data() + (size_t) (r0 + i) * D;
++                const float* tr = tmp.data() + (size_t) i * D;
++                for (int k = 0; k < D; ++k) xr[k] += tr[k] * L.ls1[(size_t) k];
++            });
++        }
++        for (int r0 = 0; r0 < N; r0 += R) {      // x += ls2 * down(gelu_erf(up(LN2 x)))
++            const int rn = std::min(R, N - r0);
++            rows_par(rn, [&](int i) { o.layernorm(x.data() + (size_t) (r0 + i) * D, hbuf.data() + (size_t) i * D, D, L.ln2_w.data(), L.ln2_b.data(), g.eps); });
++            round_inplace(hbuf.data(), (size_t) rn * D, act_round);
++            linear(L.up, hbuf.data(), (size_t) D, rn, up.data(), (size_t) F, 0, L.up_b.data(), false, scratch);
++            rows_par(rn, [&](int i) { o.gelu_erf(up.data() + (size_t) i * F, (size_t) F, 1, F); });
++            round_inplace(up.data(), (size_t) rn * F, act_round);
++            linear(L.down, up.data(), (size_t) F, rn, tmp.data(), (size_t) D, 0, L.down_b.data(), false, scratch);
++            rows_par(rn, [&](int i) {
++                float* xr = x.data() + (size_t) (r0 + i) * D;
++                const float* tr = tmp.data() + (size_t) i * D;
++                for (int k = 0; k < D; ++k) xr[k] += tr[k] * L.ls2[(size_t) k];
++            });
++        }
++    }
++
++    // ---- the class token dropped, 2x2 blocks merged (x then y inside a block), projected ----
++    const int M = nx * ny, Kin = 4 * D, Hid = g.merger_hidden, OUT = g.out_dim;
++    std::vector<float>& mrg = ctx;   // N * D >= M * 4 * D floats
++    rows_par(M, [&](int b) {
++        const int by = b / nx, bx = b % nx;
++        float* dst = mrg.data() + (size_t) b * Kin;
++        for (int r = 0; r < 4; ++r) {
++            const int py = 2 * by + r / 2, px = 2 * bx + r % 2;
++            std::memcpy(dst + (size_t) r * D, x.data() + (size_t) (1 + py * pw + px) * D, sizeof(float) * (size_t) D);
++        }
++    });
++    round_inplace(mrg.data(), (size_t) M * Kin, act_round);
++    rows.assign((size_t) M * OUT, 0.0f);
++    const int RM = std::max(1, R / 4);
++    std::vector<float> m1((size_t) std::min(M, RM) * Hid);
++    for (int r0 = 0; r0 < M; r0 += RM) {
++        const int rn = std::min(RM, M - r0);
++        linear(mm0, mrg.data() + (size_t) r0 * Kin, (size_t) Kin, rn, m1.data(), (size_t) Hid, 0, nullptr, false, scratch);
++        rows_par(rn, [&](int i) { o.gelu_erf(m1.data() + (size_t) i * Hid, (size_t) Hid, 1, Hid); });
++        round_inplace(m1.data(), (size_t) rn * Hid, act_round);
++        linear(mm2, m1.data(), (size_t) Hid, rn, rows.data() + (size_t) r0 * OUT, (size_t) OUT, 0, nullptr, false, scratch);
++    }
++    return true;
++}
++
+ }  // namespace strata_vit
+diff --git a/vendor/tools/vision/own/vit_geometry.cpp b/vendor/tools/vision/own/vit_geometry.cpp
+index c2b9773..3f577d6 100644
+--- a/vendor/tools/vision/own/vit_geometry.cpp
++++ b/vendor/tools/vision/own/vit_geometry.cpp
+@@ -32,6 +32,41 @@ bool shape_is(const Gguf& gg, const std::string& name, std::initializer_list<int
+     return true;
+ }
+ 
++// Inkling 2's tower: a class token and its position, the patch embedding without a bias, a pre-norm, per layer LayerNorms, q / k / v
++// and the output with biases, layer scales ls1 / ls2, an erf-GELU MLP; no post-norm; the 2x2 merge into mm.1 (no bias), erf GELU, mm.2
++// (no bias).  The image limits are llama.cpp's for it (1 to 4,096 tokens), the rotary base 10,000.
++bool inkling2v_from_gguf(const Gguf& gg, VitGeometry& g, std::string& err) {
++    const int64_t W = g.width, F = g.ffn;
++    g.family = Family::Inkling2V;
++    g.act = ActKind::GeluErf;
++    g.norm = NormKind::LayerNorm;
++    g.rope_theta = 10000.0f;
++    g.min_tokens = 1;
++    g.max_tokens = 4096;
++    if (!shape_is(gg, "v.patch_embd.weight", {g.patch, g.patch, 3, W}, err) || !shape_is(gg, "v.class_embd", {W}, err) ||
++        !shape_is(gg, "v.class_position_embd.weight", {W}, err) || !shape_is(gg, "v.pre_ln.weight", {W}, err) || !shape_is(gg, "v.pre_ln.bias", {W}, err))
++        return false;
++    const GgufTensorInfo* pos = gg.tensor("v.position_embd.weight");
++    if (!pos || pos->ne.size() != 2 || pos->ne[0] != W) { err = "the vision projector's position table is missing or not [width, rows]"; return false; }
++    g.pos_grid = (int) std::lround(std::sqrt((double) pos->ne[1]));
++    if ((int64_t) g.pos_grid * g.pos_grid != pos->ne[1]) { err = "the position table's rows are not a square grid"; return false; }
++    for (int il = 0; il < g.layers; ++il) {
++        for (const char* n : {"ln1", "ln2"})
++            if (!shape_is(gg, blk(il, n, "weight"), {W}, err) || !shape_is(gg, blk(il, n, "bias"), {W}, err)) return false;
++        for (const char* n : {"ls1", "ls2"})
++            if (!shape_is(gg, blk(il, n, "weight"), {W}, err)) return false;
++        for (const char* n : {"attn_q", "attn_k", "attn_v", "attn_out"})
++            if (!shape_is(gg, blk(il, n, "weight"), {W, W}, err) || !shape_is(gg, blk(il, n, "bias"), {W}, err)) return false;
++        if (!shape_is(gg, blk(il, "ffn_up", "weight"), {W, F}, err) || !shape_is(gg, blk(il, "ffn_up", "bias"), {F}, err)) return false;
++        if (!shape_is(gg, blk(il, "ffn_down", "weight"), {F, W}, err) || !shape_is(gg, blk(il, "ffn_down", "bias"), {W}, err)) return false;
++    }
++    g.merger_in = (int) (W * g.merge * g.merge);
++    const GgufTensorInfo* m1 = gg.tensor("mm.1.weight");
++    if (!m1 || m1->ne.size() != 2 || m1->ne[0] != g.merger_in) { err = "the vision projector's mm.1.weight is missing or not [width * merge^2, hidden]"; return false; }
++    g.merger_hidden = (int) m1->ne[1];
++    return shape_is(gg, "mm.2.weight", {g.merger_hidden, g.out_dim}, err);
++}
++
+ }  // namespace
+ 
+ bool vit_geometry_from_gguf(const Gguf& gg, VitGeometry& g, std::string& err) {
+@@ -40,7 +75,9 @@ bool vit_geometry_from_gguf(const Gguf& gg, VitGeometry& g, std::string& err) {
+     if (!gg.get_str("general.architecture", arch) || arch != "clip") { err = "not an mmproj file (general.architecture is not clip)"; return false; }
+     bool has_v = false;
+     if (!gg.get_bool("clip.has_vision_encoder", has_v) || !has_v) { err = "the mmproj file has no vision encoder"; return false; }
+-    if (!gg.get_str("clip.projector_type", g.projector) || g.projector.empty()) { err = "the mmproj file names no projector type"; return false; }
++    if ((!gg.get_str("clip.projector_type", g.projector) || g.projector.empty()) && !gg.get_str("clip.vision.projector_type", g.projector))
++        g.projector.clear();   // (Inkling 2's file names it under clip.vision)
++    if (g.projector.empty()) { err = "the mmproj file names no projector type"; return false; }
+     if (!need_u32(gg, "clip.vision.block_count", g.layers, err) || !need_u32(gg, "clip.vision.embedding_length", g.width, err) ||
+         !need_u32(gg, "clip.vision.attention.head_count", g.heads, err) || !need_u32(gg, "clip.vision.feed_forward_length", g.ffn, err) ||
+         !need_u32(gg, "clip.vision.patch_size", g.patch, err) || !need_u32(gg, "clip.vision.projection_dim", g.out_dim, err))
+@@ -76,6 +113,7 @@ bool vit_geometry_from_gguf(const Gguf& gg, VitGeometry& g, std::string& err) {
+     }
+ 
+     const int64_t W = g.width, F = g.ffn;
++    if (g.projector == "inkling2v") return inkling2v_from_gguf(gg, g, err);
+     if (!shape_is(gg, "v.patch_embd.weight", {g.patch, g.patch, 3, W}, err) || !shape_is(gg, "v.patch_embd.bias", {W}, err)) return false;
+     if (g.patch_taps == 2 && !shape_is(gg, "v.patch_embd.weight.1", {g.patch, g.patch, 3, W}, err)) return false;
+     const GgufTensorInfo* pos = gg.tensor("v.position_embd.weight");
+@@ -107,7 +145,15 @@ bool vit_geometry_from_gguf(const Gguf& gg, VitGeometry& g, std::string& err) {
+     return true;
+ }
+ 
++bool vit_geometry_supported_cpu(const VitGeometry& g, std::string& why) {
++    if (g.family != Family::Inkling2V) return vit_geometry_supported(g, why);
++    if (g.head_dim % 4 != 0) { why = "a head size that is not a multiple of 4 (the 2D rotary turns pairs in each half)"; return false; }
++    if (g.merge != 2) { why = "a merge size other than 2"; return false; }
++    return true;
++}
++
+ bool vit_geometry_supported(const VitGeometry& g, std::string& why) {
++    if (g.family == Family::Inkling2V) { why = "Inkling 2's tower is read by the CPU picture reader only"; return false; }
+     if (g.projector != "qwen3vl_merger") { why = "projector type " + g.projector + " is not one of this tower's families"; return false; }
+     if (g.norm != NormKind::LayerNorm) { why = "RMS norm"; return false; }
+     if (g.act != ActKind::GeluTanh) { why = "an activation other than the tanh GELU"; return false; }
+diff --git a/vendor/tools/vision/own/vit_geometry.h b/vendor/tools/vision/own/vit_geometry.h
+index d6b183e..cf9d0d9 100644
+--- a/vendor/tools/vision/own/vit_geometry.h
++++ b/vendor/tools/vision/own/vit_geometry.h
+@@ -2,8 +2,10 @@
+ //
+ // Nothing about a Qwen tower is a constant in the code: layers, widths, heads, patch and merge sizes, the position grid, the output
+ // width, the norm, the activation and the image limits all come from the file.  What the code does know is the list of *operations* a
+-// tower may be made of (see supported()): today the Qwen3-VL family ("qwen3vl_merger": LayerNorm, fused QKV, 2D rotary, global
+-// attention, a plain tanh-GELU MLP, a 2x2 merger).  A tower of that family with other numbers is a new file, not new code.
++// tower may be made of (see supported()): the Qwen3-VL family ("qwen3vl_merger": LayerNorm, fused QKV, 2D rotary, global
++// attention, a plain tanh-GELU MLP, a 2x2 merger), and on the CPU Inkling 2's ("inkling2v": a class token, separate q/k/v, layer
++// scale, 2D rotary on pairs, an erf-GELU MLP, a 2x2 merge into a two-layer projector).  A tower of a family with other numbers is a
++// new file, not new code.
+ #pragma once
+ 
+ #include "gguf_lite.h"
+@@ -14,10 +16,12 @@
+ namespace strata_vit {
+ 
+ enum class NormKind { LayerNorm, RMSNorm };
++enum class Family { Qwen3VL, Inkling2V };
+ enum class ActKind { GeluTanh, GeluErf, Silu, GeluQuick };
+ 
+ struct VitGeometry {
+     std::string projector;            // clip.projector_type
++    Family family = Family::Qwen3VL;  // inkling2v: Inkling2V, else Qwen3VL
+     int layers = 0;                   // clip.vision.block_count
+     int width = 0;                    // clip.vision.embedding_length
+     int heads = 0;                    // clip.vision.attention.head_count
+@@ -43,7 +47,7 @@ struct VitGeometry {
+     int min_tokens = 8;               // the image's token limits (Qwen's preprocessor_config; --min-tokens / --max-tokens override)
+     int max_tokens = 4096;
+     int merger_in = 0;                // width * merge^2
+-    int merger_hidden = 0;            // mm.0's output width
++    int merger_hidden = 0;            // mm.0's output width (inkling2v: mm.1's)
+ 
+     // tokens a patch grid gives: (w / merge) * (h / merge) for a w x h patch grid
+     int align() const { return patch * merge; }   // image sides are multiples of this
+@@ -54,7 +58,10 @@ struct VitGeometry {
+ // have is NOT an error here: from_gguf succeeds and supported() says why not.
+ bool vit_geometry_from_gguf(const Gguf& gg, VitGeometry& g, std::string& err);
+ 
+-// True when the operations this geometry needs are all implemented; otherwise `why` says which one is not.
++// True when the operations this geometry needs are all implemented (on every tower: the Qwen3-VL family); otherwise `why` says which one is not.
+ bool vit_geometry_supported(const VitGeometry& g, std::string& why);
+ 
++// As vit_geometry_supported, for the CPU tower (VitCpu), which also reads Inkling 2's tower.
++bool vit_geometry_supported_cpu(const VitGeometry& g, std::string& why);
++
+ }  // namespace strata_vit
+-- 
+2.56.1
+

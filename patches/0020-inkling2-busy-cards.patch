@@ -1,0 +1,564 @@
+From d726cb510a0d31036e46b3007d968477a2d5cf85 Mon Sep 17 00:00:00 2001
+From: LegendaryFire <tristan.balon@outlook.com>
+Date: Sun, 22 Nov 2026 05:13:45 -0700
+Subject: [PATCH] Keep Inkling 2's cards busy through a prompt with experts in
+ RAM
+
+Bartowski's Q4_K_M read a 60K prompt at ~1975 tok/s in the pool
+against UD-Q4_K_XL's ~2350, with each card idle 6 s of 30. Now:
+
+- the prompt GEMM's converters (k_expert_ws) take a weight's bytes
+  into numbers without conversion instructions (16 a clock an SM):
+  a byte into a half's mantissa (1024 + q, Q8_0 / Q5_0: the offset
+  off exactly, one rounding by d) or a float's (2^23 + q, the
+  K-quants), the 2-byte aligned rows read 16 bits at a time; the
+  same values. A visit's launches at 60K: Q5_0 down 3.79 -> 2.55
+  ms, Q8_0 down 3.35 -> 2.81, Q4_K gate-up 4.92 -> 4.72, Q5_K 6.3
+  -> 5.6, Q6_K 18.6 -> 17.8;
+- a staged visit no longer reads the routing back (a host sync a
+  visit, so a host thread could not queue past one): a chunk's
+  routings reach all of a layer's experts, so every expert in RAM is
+  copied, in batches whose order, pointers and sizes are the
+  layer's, built again when its experts in VRAM change (k_group
+  keeps listed experts' empty groups, so their numbers are known);
+- the two-card split takes the fastest of the pipeline estimates to
+  1% (5% let through splits whose hand-offs leave a card waiting:
+  layers 0-5, 11-16 on card 0 for Bartowski's, 4-7% slower than
+  0-5, 12-17);
+- decode: native_qrows_kernel reads Q4_K gate-up and Q5_0 / Q8_0
+  down rows at Inkling's shapes from 4 rows a step (a verify): 4 / 8
+  lanes a row, each a ninth of it, the group's entries' q8_1 rows in
+  shared memory, every weight read once for all of them (an 8-row
+  step 64.7 -> 54-59 ms; to 3 rows the generic kernels, as fast).
+
+The converters and the staging: output and perplexity bit for bit
+the same. The split: a 59K-token perplexity 2.9914 -> 2.9820 (the
+rows' rounding); decode's rows within ~1e-7 of the generic kernels.
+
+Two cards, the pool at 512K: Bartowski's prompt 7K 1839 -> 2024
+tok/s, 60K 1974 -> 2208; UD-Q4_K_XL 60K 2350 -> 2443.
+---
+ vendor/src/inkling2/ink_engine.cu     | 199 ++++++++++++++------------
+ vendor/src/kernels/cuda/iq_kernels.cu | 182 +++++++++++++++++++++++
+ 2 files changed, 287 insertions(+), 94 deletions(-)
+
+diff --git a/vendor/src/inkling2/ink_engine.cu b/vendor/src/inkling2/ink_engine.cu
+index 892c9a4..601f118 100644
+--- a/vendor/src/inkling2/ink_engine.cu
++++ b/vendor/src/inkling2/ink_engine.cu
+@@ -1980,6 +1980,22 @@ template <int TY, int MR, int NC> constexpr size_t expert_ws_smem() {
+     constexpr size_t cs = (size_t) MR * (NC + 4) * 4;
+     return body > cs ? body : cs;
+ }
++/// Bytes into numbers without conversion instructions (16 a clock an SM): byte k of w as 2^23 + it (a float's
++/// mantissa), or bytes k, k + 1 as 1024 + them (a half2's).
++__device__ __forceinline__ float byte_f(uint32_t w, int k) {
++    return __int_as_float((int) __byte_perm(w, 0x4B000000u, 0x7650u | (uint32_t) k)) - 8388608.0f;
++}
++__device__ __forceinline__ __half2 bytes_h2(uint32_t w, uint32_t sel) {   // sel: 0x4140 (bytes 0, 1) or 0x4342
++    const uint32_t r = __byte_perm(w, 0x64646464u, sel);
++    return *reinterpret_cast<const __half2*>(&r);
++}
++__device__ __forceinline__ uint32_t ld_u32_a2(const uint8_t* p) {   // 4 bytes at a 2-byte aligned address
++    const uint16_t* h = reinterpret_cast<const uint16_t*>(p);
++    return (uint32_t) h[0] | ((uint32_t) h[1] << 16);
++}
++__device__ __forceinline__ uint32_t spread4(uint32_t b) {   // bits 0..3 to bit 0 of bytes 0..3
++    return (b & 1u) | ((b & 2u) << 7) | ((b & 4u) << 14) | ((b & 8u) << 21);
++}
+ __device__ __forceinline__ void cp_async8(void* dst, const void* src, int bytes) {
+     asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;\n" ::"r"((uint32_t) __cvta_generic_to_shared(dst)), "l"(src), "r"(bytes));
+ }
+@@ -2109,16 +2125,16 @@ __global__ void __launch_bounds__(ws_threads<MR, NC, WC>(), 1) k_expert_ws(const
+                         const float ds = d * (float) sc, dm = dmin * (float) mn;
+                         constexpr int QS = TY == 13 ? 48 : 16;
+                         const uint2 qb = *reinterpret_cast<const uint2*>(sb_ + QS + 32 * qt + l0);
+-                        uint2 hb = make_uint2(0u, 0u);   // Q5_K: the fifth bits, bit sb of qh[l]
+-                        if constexpr (TY == 13) hb = *reinterpret_cast<const uint2*>(sb_ + 16 + l0);
+                         const int sh = (ch >> 2) * 4;   // the low nibbles: the first 32, the high: the second
+-#pragma unroll
+-                        for (int q = 0; q < 4; ++q) {
+-                            const uint32_t w = q < 2 ? qb.x : qb.y, hw = q < 2 ? hb.x : hb.y, b = 16 * (q & 1);
+-                            const int a0 = (int) ((w >> (b + sh)) & 0xF) + (TY == 13 ? (int) ((hw >> (b + sb)) & 1) * 16 : 0);
+-                            const int a1 = (int) ((w >> (b + 8 + sh)) & 0xF) + (TY == 13 ? (int) ((hw >> (b + 8 + sb)) & 1) * 16 : 0);
+-                            v[q] = __floats2half2_rn(ds * (float) a0 - dm, ds * (float) a1 - dm);
++                        uint32_t u[2] = {(qb.x >> sh) & 0x0F0F0F0Fu, (qb.y >> sh) & 0x0F0F0F0Fu};   // the values, a byte each
++                        if constexpr (TY == 13) {   // Q5_K: the fifth bits, bit sb of qh[l]
++                            const uint2 hb = *reinterpret_cast<const uint2*>(sb_ + 16 + l0);
++                            u[0] |= ((hb.x >> sb) & 0x01010101u) << 4;
++                            u[1] |= ((hb.y >> sb) & 0x01010101u) << 4;
+                         }
++#pragma unroll
++                        for (int q = 0; q < 4; ++q)
++                            v[q] = __floats2half2_rn(ds * byte_f(u[q / 2], 2 * (q & 1)) - dm, ds * byte_f(u[q / 2], 2 * (q & 1) + 1) - dm);
+                     } else if constexpr (TY == 14) {   // Q6_K: d sc q, 6-bit q - 32, int8 scales a 16
+                         const uint8_t* sb_ = rblk + col * RSEG;   // ql[128], qh[64], scales[16], d
+                         const int qt = st % RK, hf = qt >> 1, k0 = (qt & 1) * 64 + (ch & 7) * 8;   // within the half: 0..127
+@@ -2128,36 +2144,38 @@ __global__ void __launch_bounds__(ws_threads<MR, NC, WC>(), 1) k_expert_ws(const
+                         const int8_t* scl = reinterpret_cast<const int8_t*>(sb_ + 192) + 8 * hf;
+                         const float d = __half2float(__ushort_as_half((uint16_t) (sb_[208] | (sb_[209] << 8))));
+                         const int lsh = (grp >> 1) * 4, hsh = grp * 2;
+-                        float f[8];
++                        const float ds = d * (float) scl[l0 / 16 + 2 * grp];   // (l0 .. l0 + 7: one scale)
++                        uint32_t u[2];
+ #pragma unroll
+-                        for (int i = 0; i < 8; ++i) {
+-                            const int l = l0 + i;
+-                            const int q = (int) (((ql[l] >> lsh) & 0xF) | (((qh[l] >> hsh) & 3) << 4)) - 32;
+-                            f[i] = d * (float) scl[l / 16 + 2 * grp] * (float) q;
+-                        }
++                        for (int h = 0; h < 2; ++h)
++                            u[h] = ((ld_u32_a2(ql + l0 + 4 * h) >> lsh) & 0x0F0F0F0Fu) | (((ld_u32_a2(qh + l0 + 4 * h) >> hsh) & 0x03030303u) << 4);
+ #pragma unroll
+-                        for (int q = 0; q < 4; ++q) v[q] = __floats2half2_rn(f[2 * q], f[2 * q + 1]);
++                        for (int q = 0; q < 4; ++q)
++                            v[q] = __floats2half2_rn(ds * (byte_f(u[q / 2], 2 * (q & 1)) - 32.0f), ds * (byte_f(u[q / 2], 2 * (q & 1) + 1) - 32.0f));
+                     } else if constexpr (TY == 6) {   // Q5_0: (q - 16) d, the fifth bit from qh
+-                        const uint8_t* bp = sg + (ch >> 2) * 22;   // d, qh[4], qs[16]
+-                        const float d = __half2float(__ushort_as_half((uint16_t) (bp[0] | (bp[1] << 8))));
+-                        const uint32_t qh = (uint32_t) bp[2] | ((uint32_t) bp[3] << 8) | ((uint32_t) bp[4] << 16) | ((uint32_t) bp[5] << 24);
+-                        const int j0 = (ch & 3) * 8;
+-                        float f[8];
++                        const uint8_t* bp = sg + (ch >> 2) * 22;   // d, qh[4], qs[16] (2-byte aligned)
++                        const __half dh = __ushort_as_half(*reinterpret_cast<const uint16_t*>(bp));
++                        const uint32_t qh = ld_u32_a2(bp + 2);
++                        const int j0 = (ch & 3) * 8, sh = j0 >= 16 ? 4 : 0;   // values j0 .. j0 + 7: qs[j0 % 16 ..]'s nibbles
++                        const uint32_t hb = (qh >> j0) & 0xFFu;
++                        const __half2 d2 = __halves2half2(dh, dh), o2 = __float2half2_rn(1040.0f);   // 1024 + 16
+ #pragma unroll
+-                        for (int i = 0; i < 8; ++i) {
+-                            const int j = j0 + i;
+-                            const int q = j < 16 ? (bp[6 + j] & 0xF) | (((qh >> j) & 1) << 4) : (bp[6 + j - 16] >> 4) | (((qh >> j) & 1) << 4);
+-                            f[i] = (float) (q - 16) * d;
++                        for (int h = 0; h < 2; ++h) {
++                            const uint32_t u = ((ld_u32_a2(bp + 6 + (j0 & 15) + 4 * h) >> sh) & 0x0F0F0F0Fu) | (spread4(hb >> (4 * h)) << 4);
++                            v[2 * h] = __hmul2(__hsub2(bytes_h2(u, 0x4140), o2), d2);   // (q - 16) d: exact, then one rounding
++                            v[2 * h + 1] = __hmul2(__hsub2(bytes_h2(u, 0x4342), o2), d2);
+                         }
+-#pragma unroll
+-                        for (int q = 0; q < 4; ++q) v[q] = __floats2half2_rn(f[2 * q], f[2 * q + 1]);
+                     } else {
+                         const int bl = ch / 4, off = (ch % 4) * 8;
+-                        const uint8_t* bp = sg + bl * 34;
+-                        const float d = __half2float(__ushort_as_half((uint16_t) (bp[0] | (bp[1] << 8))));
++                        const uint8_t* bp = sg + bl * 34;   // (2-byte aligned)
++                        const __half dh = __ushort_as_half(*reinterpret_cast<const uint16_t*>(bp));
++                        const __half2 d2 = __halves2half2(dh, dh), o2 = __float2half2_rn(1152.0f);   // 1024 + 128
+ #pragma unroll
+-                        for (int q = 0; q < 4; ++q)
+-                            v[q] = __floats2half2_rn(d * (float) (int8_t) bp[2 + off + 2 * q], d * (float) (int8_t) bp[3 + off + 2 * q]);
++                        for (int h = 0; h < 2; ++h) {
++                            const uint32_t u = ld_u32_a2(bp + 2 + off + 4 * h) ^ 0x80808080u;   // q + 128
++                            v[2 * h] = __hmul2(__hsub2(bytes_h2(u, 0x4140), o2), d2);
++                            v[2 * h + 1] = __hmul2(__hsub2(bytes_h2(u, 0x4342), o2), d2);
++                        }
+                     }
+                     *reinterpret_cast<uint4*>(bd + a_sw(col, ch)) = *reinterpret_cast<const uint4*>(v);
+                 }
+@@ -2312,10 +2330,11 @@ __global__ void k_route(const float* logits, const float* bias, int n_expert, in
+ }
+ 
+ /// The routed entries grouped by expert, a group an expert in VRAM (eptr != 0) in `order` (none: by id); the entries of
+-/// an expert not in VRAM are left out (ent_inv -1): the CPU computes them.
++/// an expert not in VRAM are left out (ent_inv -1): the CPU computes them. order's first n_keep experts take a group
++/// even with no entries (an empty one), so their groups' numbers are known before the routing is.
+ __global__ void k_group(const int32_t* ids, int n_ent, int K_, int n_expert, const unsigned long long* eptr,
+                         const int32_t* order, unsigned long long* grp_ptr, int32_t* grp_start, int32_t* n_groups,
+-                        int32_t* ent_dst, int32_t* ent_tok, int32_t* ent_inv) {
++                        int32_t* ent_dst, int32_t* ent_tok, int32_t* ent_inv, int n_keep = 0) {
+     __shared__ int cnt[256], off[256];
+     for (int x = threadIdx.x; x < n_expert; x += blockDim.x) cnt[x] = 0;
+     __syncthreads();
+@@ -2326,7 +2345,7 @@ __global__ void k_group(const int32_t* ids, int n_ent, int K_, int n_expert, con
+         for (int o = 0; o < n_expert; ++o) {
+             const int x = order ? order[o] : o;
+             off[x] = pos;
+-            if (cnt[x] == 0 || eptr[x] == 0) continue;
++            if ((cnt[x] == 0 && o >= n_keep) || eptr[x] == 0) continue;
+             grp_ptr[g] = eptr[x];
+             grp_start[g] = pos;
+             pos += cnt[x];
+@@ -2953,7 +2972,8 @@ bool place(Model& m, const std::vector<uint64_t>& lb, const std::vector<uint64_t
+     if (use == 2) {   // two cards: the split whose two-chunk prompt pipeline keeps both busiest, where both fit
+         const HP& hp = m.hp;
+         // card 0 takes [0, x) and [y, z): with a looped core, its halves on the two cards make every hand-off as long
+-        // (then, of those within 5% of the fastest, the one leaving both cards the closest free VRAM: the pool's experts)
++        // (then, of those within 1% of the fastest, the one leaving both cards the closest free VRAM: the pool's experts;
++        // 5% let through splits whose hand-offs leave a card waiting, 4-7% slower)
+         struct Cand { int x, y, z, hd; double t, gap; };
+         std::vector<Cand> cands;
+         std::vector<int> dev((size_t) L);
+@@ -2978,7 +2998,7 @@ bool place(Model& m, const std::vector<uint64_t>& lb, const std::vector<uint64_t
+         int bx = -1, by = -1, bz = -1;
+         double best_gap = 1e30;
+         for (const Cand& c : cands)
+-            if (c.t <= best_t * 1.05 && c.gap < best_gap) { best_gap = c.gap; bx = c.x; by = c.y; bz = c.z; head_card = c.hd; }
++            if (c.t <= best_t * 1.01 && c.gap < best_gap) { best_gap = c.gap; bx = c.x; by = c.y; bz = c.z; head_card = c.hd; }
+         if (bx > 0)
+             for (int l = 0; l < L; ++l) m.layers[(size_t) l].dev = l < bx || (l >= by && l < bz) ? 0 : 1;
+     }
+@@ -3492,8 +3512,13 @@ struct Dev {
+     // ... and a prompt chunk's: experts copied into two halves of kStageExp VRAM slots, the groups' order and pointers
+     uint8_t* stage = nullptr;
+     cudaEvent_t evsr[2] = {}, evsf[2] = {};
+-    int32_t *sids_h = nullptr, *order_h = nullptr, *order_d = nullptr, *rng_h = nullptr, *rng_d = nullptr;
+-    unsigned long long *eptr_tmp_h = nullptr, *eptr_tmp = nullptr;
++    struct StagePlan {   // a layer's: its experts in VRAM, then those in RAM (U) into the slots; built for `key`
++        std::vector<unsigned long long> key;   // the layer's eptr_h it was built for
++        std::vector<int> U, rng;               // rng: the groups of the VRAM experts, then of each batch of U
++        int32_t *order_d = nullptr, *rng_d = nullptr;
++        unsigned long long* eptr_d = nullptr;
++    };
++    std::vector<StagePlan> plans;   // by physical layer
+     size_t cv_cap = 0, cv_used = 0;
+     int id = 0;
+     cudaStream_t st = nullptr;
+@@ -3809,14 +3834,7 @@ struct Engine {
+                         CK(cudaEventCreateWithFlags(&D.evsr[i], cudaEventDisableTiming));
+                         CK(cudaEventCreateWithFlags(&D.evsf[i], cudaEventDisableTiming));
+                     }
+-                    const size_t E = (size_t) hp.n_expert;
+-                    CK(cudaHostAlloc((void**) &D.sids_h, T * Kp * 4, cudaHostAllocPortable));
+-                    CK(cudaHostAlloc((void**) &D.order_h, E * 4, cudaHostAllocPortable));
+-                    CK(cudaHostAlloc((void**) &D.rng_h, (E + 2) * 4, cudaHostAllocPortable));
+-                    CK(cudaHostAlloc((void**) &D.eptr_tmp_h, E * 8, cudaHostAllocPortable));
+-                    D.order_d = dalloc_t<int32_t>(E);
+-                    D.rng_d = dalloc_t<int32_t>(E + 2);
+-                    D.eptr_tmp = dalloc_t<unsigned long long>(E);
++                    D.plans.resize(m->layers.size());
+                 }
+             }
+             if (kv_resident != 0) {
+@@ -4237,57 +4255,66 @@ struct Engine {
+         else if (L.L.d_type == 6) expert_mma<6, false>(D, L, D.hg, L.L.down_off, L.L.d_row, N, FF, g0, ng, grid_g);
+         else expert_mma<8, false>(D, L, D.hg, L.L.down_off, L.L.d_row, N, FF, g0, ng, grid_g);
+     }
+-    /// A prompt chunk's experts when some are in RAM: the routing read back, the groups ordered (the experts in VRAM,
+-    /// then the others kStageExp at a time), each batch copied into one half of the staging slots while the GPU runs
+-    /// the one before. The same products as with every expert in VRAM.
++    /// A prompt chunk's experts when some are in RAM: the groups ordered (the experts in VRAM, then the layer's others
++    /// kStageExp at a time, every one: a chunk's routings reach all of them, so no read back of the routing holds the
++    /// host thread), each batch copied into one half of the staging slots while the GPU runs the one before. The order,
++    /// pointers and batches are the layer's, built again when its experts in VRAM change. The same products as with
++    /// every expert in VRAM.
+     void experts_staged(Dev& D, const Layer& L, const float* xn, int T, int n_ent) {
+         const HP& hp = m->hp;
+         const int E = hp.n_expert, N = hp.n_embd;
+-        CK(cudaMemcpyAsync(D.sids_h, D.ids, (size_t) n_ent * 4, cudaMemcpyDeviceToHost, D.st));
+-        CK(cudaStreamSynchronize(D.st));
+-        std::vector<int> cnt((size_t) E, 0), R, U;
+-        for (int e = 0; e < n_ent; ++e) ++cnt[(size_t) D.sids_h[e]];
+-        for (int x = 0; x < E; ++x)
+-            if (cnt[(size_t) x]) (L.on_gpu[(size_t) x] ? R : U).push_back(x);
+-        int o = 0;
+-        for (int x : R) D.order_h[o++] = x;
+-        for (int x : U) D.order_h[o++] = x;
+-        for (int x = 0; x < E; ++x)
+-            if (!cnt[(size_t) x]) D.order_h[o++] = x;
+-        for (int x = 0; x < E; ++x) D.eptr_tmp_h[x] = L.eptr_h[(size_t) x];
+-        for (size_t j = 0; j < U.size(); ++j)
+-            D.eptr_tmp_h[U[j]] = (unsigned long long) (D.stage + ((j / kStageExp) % 2 * kStageExp + j % kStageExp) * L.stride);
+-        const int nb = (int) ((U.size() + kStageExp - 1) / kStageExp);
+-        D.rng_h[0] = (int) R.size();
+-        for (int b = 0; b < nb; ++b) D.rng_h[1 + b] = (int) std::min<size_t>(kStageExp, U.size() - (size_t) b * kStageExp);
+-        CK(cudaMemcpyAsync(D.order_d, D.order_h, (size_t) E * 4, cudaMemcpyHostToDevice, D.st));
+-        CK(cudaMemcpyAsync(D.eptr_tmp, D.eptr_tmp_h, (size_t) E * 8, cudaMemcpyHostToDevice, D.st));
+-        CK(cudaMemcpyAsync(D.rng_d, D.rng_h, (size_t) (nb + 1) * 4, cudaMemcpyHostToDevice, D.st));
+-        k_group<<<1, kThreads, 0, D.st>>>(D.ids, n_ent, hp.top_k, E, D.eptr_tmp, D.order_d, D.grp_ptr, D.grp_start,
+-                                           D.n_groups, D.ent_dst, D.ent_tok, D.ent_inv);
++        Dev::StagePlan& P = D.plans[(size_t) (&L - m->layers.data())];
++        if (P.key != L.eptr_h) {
++            std::vector<int32_t> order;
++            P.U.clear();
++            for (int x = 0; x < E; ++x)
++                if (L.on_gpu[(size_t) x]) order.push_back(x);
++                else P.U.push_back(x);
++            const int nR = (int) order.size(), nb = (int) ((P.U.size() + kStageExp - 1) / kStageExp);
++            order.insert(order.end(), P.U.begin(), P.U.end());
++            std::vector<unsigned long long> ep(L.eptr_h);
++            for (size_t j = 0; j < P.U.size(); ++j)
++                ep[(size_t) P.U[j]] = (unsigned long long) (D.stage + ((j / kStageExp) % 2 * kStageExp + j % kStageExp) * L.stride);
++            P.rng.assign(1, nR);
++            for (int b = 0; b < nb; ++b) P.rng.push_back((int) std::min<size_t>(kStageExp, P.U.size() - (size_t) b * kStageExp));
++            if (!P.order_d) {
++                P.order_d = dalloc_t<int32_t>((size_t) E);
++                P.rng_d = dalloc_t<int32_t>((size_t) E + 2);
++                P.eptr_d = dalloc_t<unsigned long long>((size_t) E);
++            }
++            CK(cudaStreamSynchronize(D.st));   // (an earlier chunk's visit may still read the old ones)
++            CK(cudaMemcpy(P.order_d, order.data(), (size_t) E * 4, cudaMemcpyHostToDevice));
++            CK(cudaMemcpy(P.eptr_d, ep.data(), (size_t) E * 8, cudaMemcpyHostToDevice));
++            CK(cudaMemcpy(P.rng_d, P.rng.data(), P.rng.size() * 4, cudaMemcpyHostToDevice));
++            P.key = L.eptr_h;
++        }
++        k_group<<<1, kThreads, 0, D.st>>>(D.ids, n_ent, hp.top_k, E, P.eptr_d, P.order_d, D.grp_ptr, D.grp_start,
++                                           D.n_groups, D.ent_dst, D.ent_tok, D.ent_inv, E);
+         const bool mma = L.mma;
+         auto run = [&](int g0, int k) {   // the groups [g0, g0 + rng[k])
+-            const int n = D.rng_h[k];
++            const int n = P.rng[(size_t) k];
+             if (n <= 0) return;
+             if (mma)
+-                experts_gemm(D, L, xn, n_ent, g0, D.rng_d + k, n, false);
++                experts_gemm(D, L, xn, n_ent, g0, P.rng_d + k, n, false);
+             else
+-                K::native_expert_grouped(L.L, D.grp_ptr + g0, D.grp_start + g0, D.rng_d + k, D.ent_dst, D.ent_tok, n, n_ent,
++                K::native_expert_grouped(L.L, D.grp_ptr + g0, D.grp_start + g0, P.rng_d + k, D.ent_dst, D.ent_tok, n, n_ent,
+                                          D.xq, D.escr, D.eparts, D.st);
+         };
+         if (mma && L.L.gu_type == 40) k_gather_f16p<<<n_ent, kThreads, 0, D.st>>>(xn, D.ent_tok, D.xg, n_ent, N);
+         else if (mma) k_gather_f16<<<n_ent, kThreads, 0, D.st>>>(xn, D.ent_tok, D.xg, n_ent, N);
+         run(0, 0);
+-        for (int b = 0; b < nb; ++b) {
++        const int nR = P.rng[0];
++        for (int b = 0; b + 1 < (int) P.rng.size(); ++b) {
+             const int half = b % 2;
+             CK(cudaStreamWaitEvent(D.cs, D.evsf[half], 0));
+-            for (int i = 0; i < D.rng_h[1 + b]; ++i) {
+-                const int x = U[(size_t) b * kStageExp + (size_t) i];
+-                CK(cudaMemcpyAsync((void*) D.eptr_tmp_h[x], L.hblobs + (size_t) x * L.stride, L.stride, cudaMemcpyHostToDevice, D.cs));
++            for (int i = 0; i < P.rng[(size_t) (1 + b)]; ++i) {
++                const int x = P.U[(size_t) b * kStageExp + (size_t) i];
++                uint8_t* dst = D.stage + (size_t) (half * kStageExp + i) * L.stride;
++                CK(cudaMemcpyAsync(dst, L.hblobs + (size_t) x * L.stride, L.stride, cudaMemcpyHostToDevice, D.cs));
+             }
+             CK(cudaEventRecord(D.evsr[half], D.cs));
+             CK(cudaStreamWaitEvent(D.st, D.evsr[half], 0));
+-            run((int) R.size() + b * kStageExp, 1 + b);
++            run(nR + b * kStageExp, 1 + b);
+             CK(cudaEventRecord(D.evsf[half], D.st));
+         }
+         (void) T;
+@@ -4963,22 +4990,6 @@ struct Engine {
+                 } else {
+                     K::native_expert_grouped(L.L, D->grp_ptr, D->grp_start, D->n_groups, D->ent_dst, D->ent_tok,
+                                              std::min(n_ent, hp.n_expert), n_ent, D->xq, D->escr, D->eparts, D->st);
+-                    static int echk = 0;   // DEVDBG
+-                    if (getenv("INK_EXPCHECK") && echk < 14 && !mr) {
+-                        ++echk;
+-                        const size_t no = (size_t) n_ent * N;
+-                        std::vector<float> A(no), B(no);
+-                        CK(cudaMemcpyAsync(A.data(), D->eparts, no * 4, cudaMemcpyDeviceToHost, D->st));
+-                        K::iq_set_old_kernels(true);
+-                        K::native_expert_grouped(L.L, D->grp_ptr, D->grp_start, D->n_groups, D->ent_dst, D->ent_tok,
+-                                                 std::min(n_ent, hp.n_expert), n_ent, D->xq, D->escr, D->eparts, D->st);
+-                        K::iq_set_old_kernels(false);
+-                        CK(cudaMemcpyAsync(B.data(), D->eparts, no * 4, cudaMemcpyDeviceToHost, D->st));
+-                        CK(cudaStreamSynchronize(D->st));
+-                        double num = 0, den = 0;
+-                        for (size_t j = 0; j < no; ++j) { num += (A[j] - B[j]) * (A[j] - B[j]); den += B[j] * B[j]; }
+-                        std::fprintf(stderr, "EXPCHECK visit %d types %d/%d T=%d: rel rms diff %.3e\n", il, L.L.gu_type, L.L.d_type, T, std::sqrt(num / std::max(den, 1e-30)));
+-                    }
+                     if (mr) k_fill_cpu_wait<<<n_ent, kThreads, 0, D->st>>>(D->eparts, D->ids, L.eptr, mr->out_h, mr->done, mr->seq, N);
+                     if (fconv) moe_parts = true;   // weighted in the conv's launch
+                     else k_combine<<<T, kThreads, 0, D->st>>>(D->eparts, D->ewts, hp.top_k, D->moe, N);
+diff --git a/vendor/src/kernels/cuda/iq_kernels.cu b/vendor/src/kernels/cuda/iq_kernels.cu
+index e90cd6b..7ff42f9 100644
+--- a/vendor/src/kernels/cuda/iq_kernels.cu
++++ b/vendor/src/kernels/cuda/iq_kernels.cu
+@@ -4403,6 +4403,182 @@ __global__ void __launch_bounds__(256, 3) native_gu_nv4_kernel(const unsigned lo
+         }
+     }
+ }
++/// Inkling 2's K-quant / Q5_0 / Q8_0 expert rows in decode (the generic native_gu_kernel / native_down_kernel took a
++/// warp a row and every entry on its own, the weights read once an entry): LPR lanes a row, each a 9th of it (Q4_K:
++/// 64 values a piece, Q5_0 / Q8_0: a 32-value block), every lane busy; the group's entries' q8_1 rows staged in shared
++/// memory, each weight read once for all of them. ggml's sums (int dp4a dots, Q4_K's min on the codes' sum).
++template <int TY> struct QRow;
++template <> struct QRow<12> {   // Q4_K: a piece is 64 values (super-block quarter q): qs[32 q ..], scales 2q, 2q + 1
++    static constexpr int vals = 64;
++    __device__ static void dot(const uint8_t* row, int p, const block_q8_1* x, int x_stride, int ne, float (&acc)[kDn4Ent]) {
++        const uint8_t* sb = row + (size_t) (p / 4) * 144;
++        const int q = p % 4;
++        const uint4 hdr = *reinterpret_cast<const uint4*>(sb);   // d, dmin, scales[12]
++        const uint8_t* scl = reinterpret_cast<const uint8_t*>(&hdr) + 4;
++        const float d = __half2float(__ushort_as_half((unsigned short) (hdr.x & 0xFFFF)));
++        const float dmin = __half2float(__ushort_as_half((unsigned short) (hdr.x >> 16)));
++        int sc[2], mn[2];
++#pragma unroll
++        for (int h = 0; h < 2; ++h) {
++            const int j = 2 * q + h;
++            if (j < 4) {
++                sc[h] = scl[j] & 63;
++                mn[h] = scl[j + 4] & 63;
++            } else {
++                sc[h] = (scl[j + 4] & 0xF) | ((scl[j - 4] >> 6) << 4);
++                mn[h] = (scl[j + 4] >> 4) | ((scl[j] >> 6) << 4);
++            }
++        }
++        const uint4 w0 = *reinterpret_cast<const uint4*>(sb + 16 + 32 * q), w1 = *reinterpret_cast<const uint4*>(sb + 32 + 32 * q);
++        const int wv[8] = {(int) w0.x, (int) w0.y, (int) w0.z, (int) w0.w, (int) w1.x, (int) w1.y, (int) w1.z, (int) w1.w};
++#pragma unroll
++        for (int k = 0; k < kDn4Ent; ++k) {
++            if (k >= ne) break;
++            const block_q8_1* xa = x + (size_t) k * x_stride + 2 * p;   // blocks 2p, 2p + 1: the low, the high nibbles
++            const block_q8_1* xb = xa + 1;
++            int sa = 0, sb_ = 0, ua = 0, ub = 0;
++#pragma unroll
++            for (int i = 0; i < 8; ++i) {
++                const int a = get_int_b4(xa->qs, i), b = get_int_b4(xb->qs, i);
++                sa = ggml_cuda_dp4a(wv[i] & 0x0F0F0F0F, a, sa);
++                sb_ = ggml_cuda_dp4a((wv[i] >> 4) & 0x0F0F0F0F, b, sb_);
++                ua = ggml_cuda_dp4a(0x01010101, a, ua);
++                ub = ggml_cuda_dp4a(0x01010101, b, ub);
++            }
++            acc[k] += __low2float(xa->ds) * (d * (float) sc[0] * (float) sa - dmin * (float) mn[0] * (float) ua) +
++                      __low2float(xb->ds) * (d * (float) sc[1] * (float) sb_ - dmin * (float) mn[1] * (float) ub);
++        }
++    }
++};
++template <> struct QRow<6> {   // Q5_0: a block of 32 (22 bytes, 2-byte aligned): (q - 16) d
++    static constexpr int vals = 32;
++    __device__ static void dot(const uint8_t* row, int p, const block_q8_1* x, int x_stride, int ne, float (&acc)[kDn4Ent]) {
++        const uint8_t* bp = row + (size_t) p * 22;
++        const uint16_t* h = reinterpret_cast<const uint16_t*>(bp);
++        const float d = __half2float(__ushort_as_half(h[0]));
++        const uint32_t qh = (uint32_t) h[1] | ((uint32_t) h[2] << 16);
++        int lo[4], hi[4];
++#pragma unroll
++        for (int i = 0; i < 4; ++i) {
++            const uint32_t qs = (uint32_t) h[3 + 2 * i] | ((uint32_t) h[4 + 2 * i] << 16);
++            auto spread = [](uint32_t b4) { return (b4 & 1u) | ((b4 & 2u) << 7) | ((b4 & 4u) << 14) | ((b4 & 8u) << 21); };
++            lo[i] = (int) ((qs & 0x0F0F0F0Fu) | (spread((qh >> (4 * i)) & 0xF) << 4));
++            hi[i] = (int) (((qs >> 4) & 0x0F0F0F0Fu) | (spread((qh >> (16 + 4 * i)) & 0xF) << 4));
++        }
++#pragma unroll
++        for (int k = 0; k < kDn4Ent; ++k) {
++            if (k >= ne) break;
++            const block_q8_1* xb = x + (size_t) k * x_stride + p;
++            int s = 0, u = 0;
++#pragma unroll
++            for (int i = 0; i < 4; ++i) {
++                const int a = get_int_b4(xb->qs, i), b = get_int_b4(xb->qs, i + 4);
++                s = ggml_cuda_dp4a(lo[i], a, s);
++                s = ggml_cuda_dp4a(hi[i], b, s);
++                u = ggml_cuda_dp4a(0x01010101, a, u);
++                u = ggml_cuda_dp4a(0x01010101, b, u);
++            }
++            acc[k] += __low2float(xb->ds) * d * (float) (s - 16 * u);
++        }
++    }
++};
++template <> struct QRow<8> {   // Q8_0: a block of 32 (34 bytes, 2-byte aligned)
++    static constexpr int vals = 32;
++    __device__ static void dot(const uint8_t* row, int p, const block_q8_1* x, int x_stride, int ne, float (&acc)[kDn4Ent]) {
++        const uint8_t* bp = row + (size_t) p * 34;
++        const uint16_t* h = reinterpret_cast<const uint16_t*>(bp);
++        const float d = __half2float(__ushort_as_half(h[0]));
++        int wv[8];
++#pragma unroll
++        for (int i = 0; i < 8; ++i) wv[i] = (int) ((uint32_t) h[1 + 2 * i] | ((uint32_t) h[2 + 2 * i] << 16));
++#pragma unroll
++        for (int k = 0; k < kDn4Ent; ++k) {
++            if (k >= ne) break;
++            const block_q8_1* xb = x + (size_t) k * x_stride + p;
++            int s = 0;
++#pragma unroll
++            for (int i = 0; i < 8; ++i) s = ggml_cuda_dp4a(wv[i], get_int_b4(xb->qs, i), s);
++            acc[k] += __low2float(xb->ds) * d * (float) s;
++        }
++    }
++};
++/// The kernel: GU, rows 0 .. 2 n_ff of gate then up (n_embd wide, the entries' activations by ent_tok); else the down
++/// rows (n_ff wide, the entries' h rows in order, written at ent_dst). LPR lanes a row, 32 / LPR rows a warp.
++template <int TY, bool GU, int LPR>
++__global__ void __launch_bounds__(256) native_qrows_kernel(const unsigned long long* __restrict__ grp_ptr,
++                                                          const int32_t* __restrict__ grp_start,
++                                                          const int32_t* __restrict__ n_groups,
++                                                          const int32_t* __restrict__ ent_idx,
++                                                          const block_q8_1* __restrict__ xq, NativeExpertLayout L,
++                                                          float* __restrict__ o0, float* __restrict__ o1) {
++    extern __shared__ __align__(16) unsigned char qr_sm[];
++    const int g = blockIdx.y;
++    if (g >= *n_groups) return;
++    constexpr int RPW = 32 / LPR;
++    const int n_in = GU ? (int) L.n_embd : (int) L.n_ff, xb = n_in / 32, np = n_in / QRow<TY>::vals;
++    const int n_rows = GU ? 2 * (int) L.n_ff : (int) L.n_embd;
++    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, sub = lane % LPR;
++    const int row = blockIdx.x * (8 * RPW) + warp * RPW + lane / LPR;
++    const bool live = row < n_rows, is_up = GU && live && row >= (int) L.n_ff;
++    const int r = is_up ? row - (int) L.n_ff : row;
++    const unsigned char* blob = (const unsigned char*) grp_ptr[g];
++    const float* tail = L.tail_off ? (const float*) (blob + L.tail_off) : nullptr;
++    const float sc = tail ? tail[GU ? (is_up ? 1 : 0) : 2] : 1.0f;
++    const uint8_t* wr = blob + (GU ? (is_up ? L.up_off : 0) + (size_t) (live ? r : 0) * L.gu_row
++                                   : L.down_off + (size_t) (live ? r : 0) * L.d_row);
++    const int e0 = grp_start[g], e1 = grp_start[g + 1];
++    block_q8_1* xs = reinterpret_cast<block_q8_1*>(qr_sm);
++    for (int e = e0; e < e1; e += kDn4Ent) {
++        const int ne = min(kDn4Ent, e1 - e);
++        __syncthreads();
++        for (int k = 0; k < ne; ++k) {
++            const uint32_t* src = reinterpret_cast<const uint32_t*>(xq + (size_t) (GU ? ent_idx[e + k] : e + k) * xb);
++            for (int i = threadIdx.x; i < xb * (int) (sizeof(block_q8_1) / 4); i += blockDim.x)
++                reinterpret_cast<uint32_t*>(xs + (size_t) k * xb)[i] = src[i];
++        }
++        __syncthreads();
++        float acc[kDn4Ent];
++#pragma unroll
++        for (int k = 0; k < kDn4Ent; ++k) acc[k] = 0.f;
++        if (live)
++#pragma unroll 3
++            for (int p = sub; p < np; p += LPR) QRow<TY>::dot(wr, p, xs, xb, ne, acc);
++#pragma unroll
++        for (int k = 0; k < kDn4Ent; ++k) {
++            if (k >= ne) break;
++            float a = acc[k];
++#pragma unroll
++            for (int o = LPR / 2; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o, LPR);
++            if (sub == 0 && live) {
++                if constexpr (GU) (is_up ? o1 : o0)[(size_t) (e + k) * L.n_ff + r] = a * sc;
++                else o0[(size_t) ent_idx[e + k] * L.n_embd + r] = a * sc;
++            }
++        }
++    }
++}
++/// Inkling 2's shapes (n_embd 2304, n_ff 1152: 36 or 72 pieces a row, 9 a lane): launched, true; else false.
++template <int TY, bool GU>
++bool launch_qrows(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
++                  const int32_t* ent_idx, const block_q8_1* xq, const NativeExpertLayout& L, float* o0, float* o1) {
++    // (one launch a group slot: 8 a decode row; up to 3 rows the generic kernels are as fast, their weights still in L2)
++    if (g_old_kernels || L.n_embd != 2304 || L.n_ff != 1152 || grid.y < 32) return false;
++    const int n_in = GU ? (int) L.n_embd : (int) L.n_ff, np = n_in / QRow<TY>::vals;
++    const size_t sm = (size_t) kDn4Ent * (n_in / 32) * sizeof(block_q8_1);
++    const int n_rows = GU ? 2 * (int) L.n_ff : (int) L.n_embd;
++    if (np == 36) {
++        dim3 gq = grid;
++        gq.x = (unsigned) ((n_rows + 63) / 64);
++        native_qrows_kernel<TY, GU, 4><<<gq, 256, sm, s>>>(grp_ptr, grp_start, n_groups, ent_idx, xq, L, o0, o1);
++        return true;
++    }
++    if (np == 72) {
++        dim3 gq = grid;
++        gq.x = (unsigned) ((n_rows + 31) / 32);
++        native_qrows_kernel<TY, GU, 8><<<gq, 256, sm, s>>>(grp_ptr, grp_start, n_groups, ent_idx, xq, L, o0, o1);
++        return true;
++    }
++    return false;
++}
+ template<int TG>
+ void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X, const NativeExpertLayout& L,
+@@ -4410,6 +4586,9 @@ void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, con
+     // the sub-16 rows (row_dot_80_sub16) assume 80 dots per row: (n_embd / qk) * ipb == 80. The APR trellis types
+     // (qk 128, ipb 8: 160 dots at n_embd 2560) take the full-warp multi kernel, as before the sub-16 kernels.
+     const bool g_no_sub16_gu = ::strata::kernels::g_no_sub16_gu || (L.n_embd / Fmt<TG>::qk) * Fmt<TG>::ipb != 80;
++    if constexpr (TG == 12 || TG == 8) {   // Inkling 2's Q4_K / Q8_0 rows: native_qrows_kernel
++        if (launch_qrows<TG, true>(grid, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up)) return;
++    }
+     if constexpr (TG == 40) {   // NVFP4 rows of 72 halves (Inkling 2): 8 lanes a row (native_gu_nv4_kernel)
+         if (!g_old_kernels && L.n_embd == 2304) {
+             dim3 g4 = grid;
+@@ -4507,6 +4686,9 @@ template<int TD>
+ void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                  const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq, const NativeExpertLayout& L,
+                  float* out) {
++    if constexpr (TD == 6 || TD == 8) {   // Inkling 2's Q5_0 / Q8_0 down rows: native_qrows_kernel
++        if (launch_qrows<TD, false>(grid, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, nullptr)) return;
++    }
+     if constexpr (!kSplit<TD>) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+     else if (g_old_kernels || split_off<TD>()) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+     else if constexpr (kTqType<TD>) {   // the trellis down types: the codebook staged where tq_stage_on() or tq_sub8_on()
+-- 
+2.56.1
+

@@ -54,6 +54,7 @@ struct NativeExpertLayout {
     bool gu_nib = false;                // STRATA_EXPERT_NIBBLE: gate/up as 4-bit codes (strata/core/expert_nibble.hpp's
                                         // slot); set only by native_expert_layout_nib
     const float* d_signs = nullptr;
+    float situ_beta = 0.f, situ_lb = 0.f;   // Inkling 2's experts were SwiGLU only, so now situ_beta > 0 runs SITU
 };
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
 /// STRATA_EXPERT_NIBBLE: a converted VRAM slot - gate/up as 4-bit codes, scales and d (expert_nibble.hpp's layout:

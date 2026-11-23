@@ -1,0 +1,81 @@
+From a02f6428a61e1ac8af7201746c56124b6cd75343 Mon Sep 17 00:00:00 2001
+From: LegendaryFire <tristan.balon@outlook.com>
+Date: Sun, 22 Nov 2026 13:28:22 -0700
+Subject: [PATCH] Mark Inkling 2's pictures with its template's markers
+
+The server found a picture's run by Qwen's <|vision_start|>
+<|image_pad|>, so Inkling 2's template (<|content_image|>
+<|unused_200054|><|end_message|>) gave no images. Now the inkling2
+family takes its pair, and both are escaped in message text as Qwen's
+are (a quoted marker stays text).
+---
+ vendor/serve/frontend.py          | 4 +++-
+ vendor/serve/server.py            | 9 ++++++---
+ vendor/serve/server_parts/base.py | 2 ++
+ 3 files changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/vendor/serve/frontend.py b/vendor/serve/frontend.py
+index a6ad9f7..be434f2 100644
+--- a/vendor/serve/frontend.py
++++ b/vendor/serve/frontend.py
+@@ -276,7 +276,9 @@ THINK_TAGS = {"<think>": "\U000F0E01", "</think>": "\U000F0E02"}
+ # item; the same strings in a message's text (an agent reading chat_template.jinja, a tool result quoting it) became
+ # the same special ids, so text with <|vision_start|><|image_pad|> before a picture took that picture's embeddings
+ VISION_TAGS = {"<|vision_start|>": "\U000F0E03", "<|image_pad|>": "\U000F0E04", "<|vision_end|>": "\U000F0E05",
+-               "<|video_pad|>": "\U000F0E06"}
++               "<|video_pad|>": "\U000F0E06",
++               # Inkling 2's image marker and placeholder (its template writes <|content_image|><|unused_200054|>)
++               "<|content_image|>": "\U000F0E0B", "<|unused_200054|>": "\U000F0E0C"}
+ # #2026: `</tool_call>` the same way.  A user asking for the string verbatim handed the model the real end-of-call token
+ # (type 4, matched everywhere); it copied that token into its answer and the reply came back empty.  An assistant
+ # message keeps its own: a client replaying the model's raw call text sends the tokens the model wrote.
+diff --git a/vendor/serve/server.py b/vendor/serve/server.py
+index 19a26ea..73b60f2 100644
+--- a/vendor/serve/server.py
++++ b/vendor/serve/server.py
+@@ -112,6 +112,7 @@ from serve.server_parts.base import (  # noqa: F401  (moved unchanged, file spli
+     STALL_IO_EPS_B,
+     V1_V1_ALIASES,
+     VISION_START,
++    INKLING_IMAGE,
+     _timeout_env,
+     engine_frozen,
+     fit_floor,
+@@ -5063,8 +5064,10 @@ class Service:
+                     if src.startswith(("http://", "https://")) else src
+             images = [fetch(src) for src in images]
+         if images:
+-            pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
+-            start = self.tok.encode(VISION_START, parse_special=True)[0]
++            # the template's marker pair: Qwen's <|vision_start|><|image_pad|>, Inkling 2's <|content_image|><|unused_200054|>
++            pad_text, start_text = INKLING_IMAGE if self.family == "inkling2" else (IMAGE_PAD, VISION_START)
++            pad = self.tok.encode(pad_text, parse_special=True)[0]
++            start = self.tok.encode(start_text, parse_special=True)[0]
+             # Encode only while the engine is idle: the engine and the image encoder (a separate process) must not
+             # run on the GPU at the same time - an encode during a running request left that request stuck at
+             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
+@@ -5080,7 +5083,7 @@ class Service:
+             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
+             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
+             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
+-            literal = self.tok.encode(IMAGE_PAD, parse_special=False)
++            literal = self.tok.encode(pad_text, parse_special=False)
+             out, k = [], 0
+             for j, t in enumerate(ids):
+                 if t == pad and j > 0 and ids[j - 1] == start:
+diff --git a/vendor/serve/server_parts/base.py b/vendor/serve/server_parts/base.py
+index 9478a3b..164836e 100644
+--- a/vendor/serve/server_parts/base.py
++++ b/vendor/serve/server_parts/base.py
+@@ -87,6 +87,8 @@ EFFORT_TEXT = {"low": "Reasoning effort is set to low. Keep your thinking brief
+ 
+ 
+ VISION_START = "<|vision_start|>"
++# Inkling 2's image placeholder and the marker before it (its chat template: <|content_image|><|unused_200054|><|end_message|>)
++INKLING_IMAGE = ("<|unused_200054|>", "<|content_image|>")
+ 
+ 
+ # #606: a reply that repeats one token this many times in a row is ended there ("length"): a model in a loop, or a
+-- 
+2.56.1
+

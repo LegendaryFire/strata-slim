@@ -31,6 +31,8 @@ struct Mat {                     // a weight matrix [rows = out][cols = in]
 struct Layer {
     std::vector<float> ln1_w, ln1_b, ln2_w, ln2_b, qkv_b, o_b, up_b, down_b;
     Mat qkv, o, up, down;
+    std::vector<float> q_b, k_b, v_b, ls1, ls2;   // inkling2v: separate q / k / v, the layer scales
+    Mat q, k, v;
 };
 
 }  // namespace
@@ -40,7 +42,8 @@ struct VitCpu::Impl {
     const CpuOps* ops = nullptr;
     int act_round = 0;                  // STRATA_VIT_REF_ROUND: 0 none, 1 BF16, 2 F16 (the weight's type)
     std::vector<float> patch_b, pos, post_w, post_b, mm0_b, mm2_b;
-    Mat patch_w, mm0, mm2;
+    Mat patch_w, mm0, mm2;                      // (inkling2v: mm0 is mm.1)
+    std::vector<float> cls, pre_w, pre_b;       // inkling2v: the class token with its position, the pre-norm
     std::vector<Layer> layers;
     std::unique_ptr<Team> team;
     int team_threads = 0;
@@ -79,6 +82,9 @@ struct VitCpu::Impl {
 
     template <class F>
     void run(int n, F f) { team->run(n, [&](int task, int thr) { f(task, thr); }); }
+
+    bool load_inkling(const Gguf& gg, std::string& err);
+    bool encode_inkling(const PreparedImage& img, std::vector<float>& rows, int& nx, int& ny, std::string& err);
 
     // rows of simple per-row work, 16 rows per task
     template <class F>
@@ -142,9 +148,10 @@ const char* VitCpu::isa_name() const { return impl_->ops ? impl_->ops->name : "n
 bool VitCpu::load(const Gguf& gg, const VitGeometry& g, std::string& err) {
     Impl& m = *impl_;
     std::string why;
-    if (!vit_geometry_supported(g, why)) { err = "this tower is not supported: " + why; return false; }
+    if (!vit_geometry_supported_cpu(g, why)) { err = "this tower is not supported: " + why; return false; }
     m.g = g;
     m.ops = &cpu_ops(quant::best_isa());
+    if (g.family == Family::Inkling2V) return m.load_inkling(gg, err);
     // the patch embedding: the two temporal taps summed (a still picture is fed to both), kept float32 (a small matrix)
     {
         const GgufTensorInfo* t0 = gg.tensor("v.patch_embd.weight");
@@ -200,6 +207,7 @@ bool VitCpu::encode(const PreparedImage& img, int threads, std::vector<float>& r
     if (img.w <= 0 || img.h <= 0 || img.w % g.align() != 0 || img.h % g.align() != 0) { err = "the picture size is not a multiple of patch * merge"; return false; }
     int nth = threads > 0 ? threads : (int) std::max(1u, std::min(16u, std::thread::hardware_concurrency() / 2));
     if (!m.team || m.team_threads != nth) { m.team.reset(new Team(nth)); m.team_threads = nth; }
+    if (g.family == Family::Inkling2V) return m.encode_inkling(img, rows, nx, ny, err);
     const CpuOps& ops = *m.ops;
     // STRATA_VIT_PROF=1 (a diagnostic, stderr only, off by default): the time of each stage (every stage ends with its team run, so no extra wait)
     static const bool prof = std::getenv("STRATA_VIT_PROF") != nullptr;
@@ -399,6 +407,228 @@ bool VitCpu::encode(const PreparedImage& img, int threads, std::vector<float>& r
         std::fprintf(stderr, "vit-cpu-prof N=%d threads=%d isa=%s: patch+pos %.1f, ln+qkv %.1f, rope+KT %.1f, attention %.1f (thread 0, %d tasks: QK %.1f, softmax %.1f, PV %.1f), "
                              "o-proj %.1f, ln+up+gelu %.1f, down %.1f, post+merger %.1f ms\n",
                      N, nth, ops.name, pt[0], pt[1], pt[2], pt[3], (int) pt[11], pt[8], pt[9], pt[10], pt[4], pt[5], pt[6], pt[7]);
+    return true;
+}
+
+// ---- Inkling 2's tower (inkling2v), as llama.cpp's mtmd_graph_inkling2v ----
+
+bool VitCpu::Impl::load_inkling(const Gguf& gg, std::string& err) {
+    {   // the patch embedding (one tap, no bias), float32
+        const GgufTensorInfo* t0 = gg.tensor("v.patch_embd.weight");
+        if (!t0) { err = "the mmproj file lacks v.patch_embd.weight"; return false; }
+        patch_w.kind = 0;
+        patch_w.rows = g.width;
+        patch_w.cols = 3 * g.patch * g.patch;
+        patch_w.f32.resize((size_t) t0->nelem());
+        if (!gg.read_f32(*t0, patch_w.f32.data(), err)) return false;
+    }
+    std::vector<float> cpos;
+    if (!read_f(gg, "v.position_embd.weight", pos, err) || !read_f(gg, "v.class_embd", cls, err) || !read_f(gg, "v.class_position_embd.weight", cpos, err) ||
+        !read_f(gg, "v.pre_ln.weight", pre_w, err) || !read_f(gg, "v.pre_ln.bias", pre_b, err) || !read_m(gg, "mm.1.weight", mm0, err) ||
+        !read_m(gg, "mm.2.weight", mm2, err))
+        return false;
+    for (size_t i = 0; i < cls.size(); ++i) cls[i] += cpos[i];
+    layers.assign((size_t) g.layers, Layer{});
+    for (int il = 0; il < g.layers; ++il) {
+        Layer& L = layers[(size_t) il];
+        const std::string p = "v.blk." + std::to_string(il) + ".";
+        if (!read_f(gg, p + "ln1.weight", L.ln1_w, err) || !read_f(gg, p + "ln1.bias", L.ln1_b, err) || !read_f(gg, p + "ln2.weight", L.ln2_w, err) ||
+            !read_f(gg, p + "ln2.bias", L.ln2_b, err) || !read_f(gg, p + "ls1.weight", L.ls1, err) || !read_f(gg, p + "ls2.weight", L.ls2, err) ||
+            !read_m(gg, p + "attn_q.weight", L.q, err) || !read_f(gg, p + "attn_q.bias", L.q_b, err) || !read_m(gg, p + "attn_k.weight", L.k, err) ||
+            !read_f(gg, p + "attn_k.bias", L.k_b, err) || !read_m(gg, p + "attn_v.weight", L.v, err) || !read_f(gg, p + "attn_v.bias", L.v_b, err) ||
+            !read_m(gg, p + "attn_out.weight", L.o, err) || !read_f(gg, p + "attn_out.bias", L.o_b, err) || !read_m(gg, p + "ffn_up.weight", L.up, err) ||
+            !read_f(gg, p + "ffn_up.bias", L.up_b, err) || !read_m(gg, p + "ffn_down.weight", L.down, err) || !read_f(gg, p + "ffn_down.bias", L.down_b, err))
+            return false;
+    }
+    act_round = vit_cpu_round_kind(layers.empty() ? 0 : layers[0].q.kind, std::getenv("STRATA_VIT_REF_ROUND"));
+    return true;
+}
+
+// Token 0 is the class token, token 1 + y * pw + x the patch at (x, y).  Per layer: x += ls1 * o(attn(LN1 x)), x += ls2 * down(gelu_erf(up(LN2 x)));
+// the rotary turns pairs (2i, 2i + 1) of a head's first half with the column + 1 and of its second half with the row + 1 (the class token: 0, 0).
+// Then the class token dropped, the patches merged 2x2 (x then y within a block, blocks row-major) and projected: mm.2(gelu_erf(mm.1 m)).
+bool VitCpu::Impl::encode_inkling(const PreparedImage& img, std::vector<float>& rows, int& nx, int& ny, std::string& err) {
+    const int P = g.patch, D = g.width, H = g.heads, HD = g.head_dim, F = g.ffn;
+    if (HD > 128 || HD % 4 != 0) { err = "this head size is not handled by the CPU tower"; return false; }
+    const int pw = img.w / P, ph = img.h / P, NP = pw * ph, N = NP + 1;
+    nx = pw / 2;
+    ny = ph / 2;
+    const int R = std::min(N, kRowsChunk);
+    std::vector<std::vector<float>> scratch((size_t) team->size(), std::vector<float>((size_t) kKC * 2 * ops->NR));
+    const CpuOps& o = *ops;
+
+    // ---- the patches (row-major) and their positions: the table as is at its own grid, else ggml's bilinear (half-pixel centres) ----
+    const int K0 = 3 * P * P;
+    std::vector<float> x((size_t) N * D);
+    std::memcpy(x.data(), cls.data(), sizeof(float) * (size_t) D);
+    {
+        std::vector<float> A((size_t) std::min(NP, kRowsChunk) * K0);
+        const size_t plane = (size_t) img.w * img.h;
+        for (int r0 = 0; r0 < NP; r0 += kRowsChunk) {
+            const int rn = std::min(kRowsChunk, NP - r0);
+            rows_par(rn, [&](int i) {
+                const int t = r0 + i, py = t / pw, px = t % pw;
+                float* a = &A[(size_t) i * K0];
+                for (int c = 0; c < 3; ++c)
+                    for (int ky = 0; ky < P; ++ky)
+                        std::memcpy(a + (size_t) c * P * P + (size_t) ky * P, &img.chw[c * plane + (size_t) (py * P + ky) * img.w + (size_t) px * P], (size_t) P * sizeof(float));
+            });
+            linear(patch_w, A.data(), (size_t) K0, rn, x.data() + (size_t) (1 + r0) * D, (size_t) D, 0, nullptr, false, scratch);
+        }
+        const int G = g.pos_grid;
+        const float sfx = (float) pw / G, sfy = (float) ph / G;
+        rows_par(NP, [&](int t) {
+            float* xr = &x[(size_t) (1 + t) * D];
+            const int py = t / pw, px = t % pw;
+            if (pw == G && ph == G) {
+                const float* a = &pos[(size_t) t * D];
+                for (int i = 0; i < D; ++i) xr[i] += a[i];
+                return;
+            }
+            const float fy = ((float) py + 0.5f) / sfy - 0.5f, fx = ((float) px + 0.5f) / sfx - 0.5f;
+            int y0 = (int) std::floor(fy), x0 = (int) std::floor(fx), y1 = y0 + 1, x1 = x0 + 1;
+            y0 = std::max(0, std::min(y0, G - 1)); y1 = std::max(0, std::min(y1, G - 1));
+            x0 = std::max(0, std::min(x0, G - 1)); x1 = std::max(0, std::min(x1, G - 1));
+            const float dy = std::max(0.0f, std::min(fy - (float) y0, 1.0f)), dx = std::max(0.0f, std::min(fx - (float) x0, 1.0f));
+            o.pos_add(xr, &pos[((size_t) y0 * G + x0) * D], &pos[((size_t) y0 * G + x1) * D], &pos[((size_t) y1 * G + x0) * D], &pos[((size_t) y1 * G + x1) * D], dx,
+                      dy, D);
+        });
+    }
+    rows_par(N, [&](int t) {   // the pre-norm, in place
+        std::vector<float> tmp((size_t) D);
+        o.layernorm(&x[(size_t) t * D], tmp.data(), D, pre_w.data(), pre_b.data(), g.eps);
+        std::memcpy(&x[(size_t) t * D], tmp.data(), sizeof(float) * (size_t) D);
+    });
+
+    // ---- rotary: pair i of a half turns by pos * theta^(-2i / (HD / 2)) ----
+    const int half = HD / 2, npair = half / 2;
+    std::vector<float> inv((size_t) npair);
+    for (int i = 0; i < npair; ++i) inv[(size_t) i] = std::pow(g.rope_theta, -2.0f * (float) i / (float) half);
+    auto rope = [&](float* hrow, int pa, int pb) {   // one head's HD values: the first half by pa (the column), the second by pb (the row)
+        for (int hf = 0; hf < 2; ++hf) {
+            const float p = (float) (hf ? pb : pa);
+            float* v = hrow + hf * half;
+            for (int i = 0; i < npair; ++i) {
+                const float th = p * inv[(size_t) i], c = std::cos(th), s = std::sin(th);
+                const float a = v[2 * i], b = v[2 * i + 1];
+                v[2 * i] = a * c - b * s;
+                v[2 * i + 1] = a * s + b * c;
+            }
+        }
+    };
+    const float kq_scale = 1.0f / std::sqrt((float) HD);
+
+    const size_t slack = 256, D3 = (size_t) 3 * D;
+    std::vector<float> qkv((size_t) N * D3 + slack, 0.0f), ctx((size_t) N * D), tmp((size_t) R * D);
+    const int Np = (N + 63) / 64 * 64;
+    std::vector<float> KT((size_t) H * HD * Np, 0.0f), VP((size_t) H * N * HD + slack);
+    std::vector<float> hbuf((size_t) R * D), up((size_t) R * F);
+    const int OD = (HD + 15) / 16 * 16, QB = kQBDefault, attn_tasks_q = (N + QB - 1) / QB;
+    std::vector<std::vector<float>> sscr((size_t) team->size(), std::vector<float>((size_t) QB * kTK + (size_t) QB * OD + 2 * QB));
+
+    for (const Layer& L : layers) {
+        for (int r0 = 0; r0 < N; r0 += R) {
+            const int rn = std::min(R, N - r0);
+            rows_par(rn, [&](int i) { o.layernorm(x.data() + (size_t) (r0 + i) * D, hbuf.data() + (size_t) i * D, D, L.ln1_w.data(), L.ln1_b.data(), g.eps); });
+            round_inplace(hbuf.data(), (size_t) rn * D, act_round);
+            float* dst = qkv.data() + (size_t) r0 * D3;
+            linear(L.q, hbuf.data(), (size_t) D, rn, dst, D3, 0, L.q_b.data(), false, scratch);
+            linear(L.k, hbuf.data(), (size_t) D, rn, dst + D, D3, 0, L.k_b.data(), false, scratch);
+            linear(L.v, hbuf.data(), (size_t) D, rn, dst + 2 * D, D3, 0, L.v_b.data(), false, scratch);
+        }
+        rows_par(N, [&](int t) {
+            float* row = qkv.data() + (size_t) t * D3;
+            const int pa = t == 0 ? 0 : (t - 1) % pw + 1, pb = t == 0 ? 0 : (t - 1) / pw + 1;
+            for (int hh = 0; hh < H; ++hh) {
+                rope(row + (size_t) hh * HD, pa, pb);
+                rope(row + D + (size_t) hh * HD, pa, pb);
+            }
+            if (act_round) o.round16(row, D3, 2);
+            for (int i = 0; i < D; ++i) row[i] *= kq_scale;
+        });
+        {
+            const int jb = 64, njb = (N + jb - 1) / jb;
+            team->run(H * njb, [&](int task, int) {
+                const int hh = task / njb, j0 = (task % njb) * jb, j1 = std::min(N, j0 + jb);
+                for (int j = j0; j < j1; ++j) {
+                    const float* kr = qkv.data() + (size_t) j * D3 + D + (size_t) hh * HD;
+                    float* kt = KT.data() + (size_t) hh * HD * Np + j;
+                    for (int d = 0; d < HD; ++d) kt[(size_t) d * Np] = kr[d];
+                    std::memcpy(VP.data() + ((size_t) hh * N + j) * HD, kr + D, sizeof(float) * (size_t) HD);
+                }
+            });
+        }
+        team->run(H * attn_tasks_q, [&](int task, int thr) {
+            const int hh = task / attn_tasks_q, q0 = (task % attn_tasks_q) * QB, qr = std::min(QB, N - q0);
+            float* S = sscr[(size_t) thr].data();
+            float* O = S + (size_t) QB * kTK;
+            float* mx = O + (size_t) QB * OD;
+            float* ls = mx + QB;
+            std::memset(O, 0, sizeof(float) * (size_t) QB * OD);
+            for (int r = 0; r < QB; ++r) { mx[r] = -3.0e38f; ls[r] = 0.0f; }
+            const float* Q = qkv.data() + (size_t) q0 * D3 + (size_t) hh * HD;
+            const float* KTh = KT.data() + (size_t) hh * HD * Np;
+            const float* Vh = VP.data() + (size_t) hh * N * HD;
+            for (int j0 = 0; j0 < N; j0 += kTK) {
+                const int tk = std::min(kTK, N - j0);
+                o.gemm(Q, D3, qr, KTh + j0, (size_t) Np, HD, tk, S, (size_t) kTK, 0, nullptr);
+                o.softmax_update(S, (size_t) kTK, qr, tk, mx, ls, O, (size_t) OD, HD);
+                o.gemm(S, (size_t) kTK, qr, Vh + (size_t) j0 * HD, (size_t) HD, tk, HD, O, (size_t) OD, 1, nullptr);
+            }
+            for (int r = 0; r < qr; ++r) {
+                const float iv = 1.0f / ls[r];
+                float* dst = ctx.data() + (size_t) (q0 + r) * D + (size_t) hh * HD;
+                for (int d = 0; d < HD; ++d) dst[d] = O[(size_t) r * OD + d] * iv;
+            }
+        });
+        round_inplace(ctx.data(), ctx.size(), act_round);
+        for (int r0 = 0; r0 < N; r0 += R) {      // x += ls1 * o(ctx)
+            const int rn = std::min(R, N - r0);
+            linear(L.o, ctx.data() + (size_t) r0 * D, (size_t) D, rn, tmp.data(), (size_t) D, 0, L.o_b.data(), false, scratch);
+            rows_par(rn, [&](int i) {
+                float* xr = x.data() + (size_t) (r0 + i) * D;
+                const float* tr = tmp.data() + (size_t) i * D;
+                for (int k = 0; k < D; ++k) xr[k] += tr[k] * L.ls1[(size_t) k];
+            });
+        }
+        for (int r0 = 0; r0 < N; r0 += R) {      // x += ls2 * down(gelu_erf(up(LN2 x)))
+            const int rn = std::min(R, N - r0);
+            rows_par(rn, [&](int i) { o.layernorm(x.data() + (size_t) (r0 + i) * D, hbuf.data() + (size_t) i * D, D, L.ln2_w.data(), L.ln2_b.data(), g.eps); });
+            round_inplace(hbuf.data(), (size_t) rn * D, act_round);
+            linear(L.up, hbuf.data(), (size_t) D, rn, up.data(), (size_t) F, 0, L.up_b.data(), false, scratch);
+            rows_par(rn, [&](int i) { o.gelu_erf(up.data() + (size_t) i * F, (size_t) F, 1, F); });
+            round_inplace(up.data(), (size_t) rn * F, act_round);
+            linear(L.down, up.data(), (size_t) F, rn, tmp.data(), (size_t) D, 0, L.down_b.data(), false, scratch);
+            rows_par(rn, [&](int i) {
+                float* xr = x.data() + (size_t) (r0 + i) * D;
+                const float* tr = tmp.data() + (size_t) i * D;
+                for (int k = 0; k < D; ++k) xr[k] += tr[k] * L.ls2[(size_t) k];
+            });
+        }
+    }
+
+    // ---- the class token dropped, 2x2 blocks merged (x then y inside a block), projected ----
+    const int M = nx * ny, Kin = 4 * D, Hid = g.merger_hidden, OUT = g.out_dim;
+    std::vector<float>& mrg = ctx;   // N * D >= M * 4 * D floats
+    rows_par(M, [&](int b) {
+        const int by = b / nx, bx = b % nx;
+        float* dst = mrg.data() + (size_t) b * Kin;
+        for (int r = 0; r < 4; ++r) {
+            const int py = 2 * by + r / 2, px = 2 * bx + r % 2;
+            std::memcpy(dst + (size_t) r * D, x.data() + (size_t) (1 + py * pw + px) * D, sizeof(float) * (size_t) D);
+        }
+    });
+    round_inplace(mrg.data(), (size_t) M * Kin, act_round);
+    rows.assign((size_t) M * OUT, 0.0f);
+    const int RM = std::max(1, R / 4);
+    std::vector<float> m1((size_t) std::min(M, RM) * Hid);
+    for (int r0 = 0; r0 < M; r0 += RM) {
+        const int rn = std::min(RM, M - r0);
+        linear(mm0, mrg.data() + (size_t) r0 * Kin, (size_t) Kin, rn, m1.data(), (size_t) Hid, 0, nullptr, false, scratch);
+        rows_par(rn, [&](int i) { o.gelu_erf(m1.data() + (size_t) i * Hid, (size_t) Hid, 1, Hid); });
+        round_inplace(m1.data(), (size_t) rn * Hid, act_round);
+        linear(mm2, m1.data(), (size_t) Hid, rn, rows.data() + (size_t) r0 * OUT, (size_t) OUT, 0, nullptr, false, scratch);
+    }
     return true;
 }
 

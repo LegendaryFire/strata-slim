@@ -202,7 +202,22 @@ void resize_pad_ceil(const ImageU8& src, ImageU8& dst, Size2 target) {
     dst = std::move(out);
 }
 
+namespace {
+int align_up(int v, int a) { return (v + a - 1) / a * a; }
+// Inkling 2's size before its padding: the picture's own, or (over max_pixels once padded) mtmd's preserved-ratio size under it
+Size2 inkling_size(int w, int h, const VitGeometry& g, int max_tokens) {
+    const int64_t max_px = (int64_t) (max_tokens > 0 ? max_tokens : g.max_tokens) * g.patch * g.patch * g.merge * g.merge;
+    const int a = g.align();
+    if ((int64_t) align_up(w, a) * align_up(h, a) <= max_px) return {w, h};
+    return smart_resize(w, h, a, 0, (int) max_px);
+}
+}  // namespace
+
 Size2 prepared_size(int w, int h, const VitGeometry& g, int min_tokens, int max_tokens) {
+    if (g.family == Family::Inkling2V) {   // padded on the right and the bottom to a multiple of patch * merge
+        const Size2 s = inkling_size(w, h, g, max_tokens);
+        return {align_up(s.w, g.align()), align_up(s.h, g.align())};
+    }
     const int patch_area = g.patch * g.patch * g.merge * g.merge;
     const int min_px = (min_tokens > 0 ? min_tokens : g.min_tokens) * patch_area;
     const int max_px = (max_tokens > 0 ? max_tokens : g.max_tokens) * patch_area;
@@ -213,6 +228,29 @@ bool prepare_image(const ImageU8& src, const VitGeometry& g, int min_tokens, int
     if (src.w <= 0 || src.h <= 0 || src.rgb.size() != (size_t) src.w * src.h * 3) { err = "the picture is empty"; return false; }
     const Size2 t = prepared_size(src.w, src.h, g, min_tokens, max_tokens);
     if (t.w <= 0 || t.h <= 0) { err = "the picture has no usable size"; return false; }
+    if (g.family == Family::Inkling2V) {
+        // as mtmd's inkling2v preprocessor: the picture (resized only when over the limit) at the top left, the rest -1 before the
+        // normalisation, then (v - 255 mean) / (255 std)
+        const Size2 s = inkling_size(src.w, src.h, g, max_tokens);
+        ImageU8 r;
+        if (s.w != src.w || s.h != src.h) resize_bicubic(src, r, s.w, s.h);
+        const ImageU8& img = s.w != src.w || s.h != src.h ? r : src;
+        out.w = t.w;
+        out.h = t.h;
+        const size_t n = (size_t) t.w * t.h;
+        out.chw.resize(3 * n);
+        for (int c = 0; c < 3; ++c) {
+            const float m = g.mean[c] * 255.0f, sd = g.stdv[c] * 255.0f;
+            float* pl = &out.chw[(size_t) c * n];
+            for (int y = 0; y < t.h; ++y)
+                for (int x = 0; x < t.w; ++x) {
+                    const float v = y < img.h && x < img.w ? (float) img.rgb[((size_t) y * img.w + x) * 3 + c] : -1.0f;
+                    pl[(size_t) y * t.w + x] = (v - m) / sd;
+                }
+        }
+        if (resized) *resized = img;
+        return true;
+    }
     ImageU8 r;
     resize_pad_ceil(src, r, t);
     out.w = t.w;

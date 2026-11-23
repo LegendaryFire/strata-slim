@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import jinja2
+from jinja2 import nodes
+from jinja2.ext import Extension
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 LOGGER = logging.getLogger(__name__)
@@ -36,6 +38,16 @@ LOGGER = logging.getLogger(__name__)
 class TemplateRequestError(jinja2.exceptions.TemplateError, ValueError):
     """The template refused the request's messages (e.g. "No user query found in messages."): a ValueError, so the
     client gets a 400 with the template's message instead of a dropped connection (#365)."""
+
+
+class _GenerationTag(Extension):
+    """transformers' {% generation %}: rendered as its body."""
+    tags = {"generation"}
+
+    def parse(self, parser):
+        lineno = next(parser.stream).lineno
+        body = parser.parse_statements(("name:endgeneration",), drop_needle=True)
+        return nodes.Scope(body, lineno=lineno)
 
 
 class ChatTemplate:
@@ -48,7 +60,7 @@ class ChatTemplate:
         def tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
             return json.dumps(x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)
 
-        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"])
+        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols", _GenerationTag])
         env.filters["tojson"] = tojson
         env.globals["raise_exception"] = raise_exception
         self.source = Path(path).read_text(encoding="utf-8")
@@ -137,12 +149,15 @@ EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false":
 
 
 _EFFORT_QWEN = dict(EFFORT)
+# Inkling 2 had only the Qwen words, so now its template's own effort names are used
+_EFFORT_INKLING = {"none": "none", "off": "none", "disabled": "none", "false": "none", "minimal": "minimal", "low": "low",
+                   "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max", "maximum": "max"}
 
 
 def use_family(family: str | None) -> None:
     """The reasoning-effort words of the model family this server runs (module state, like ENV_TO_USER): the Qwen table."""
     EFFORT.clear()
-    EFFORT.update(_EFFORT_QWEN)
+    EFFORT.update(_EFFORT_INKLING if family == "inkling2" else _EFFORT_QWEN)
 
 
 def effort_kwargs(value) -> dict:
@@ -261,7 +276,9 @@ THINK_TAGS = {"<think>": "\U000F0E01", "</think>": "\U000F0E02"}
 # item; the same strings in a message's text (an agent reading chat_template.jinja, a tool result quoting it) became
 # the same special ids, so text with <|vision_start|><|image_pad|> before a picture took that picture's embeddings
 VISION_TAGS = {"<|vision_start|>": "\U000F0E03", "<|image_pad|>": "\U000F0E04", "<|vision_end|>": "\U000F0E05",
-               "<|video_pad|>": "\U000F0E06"}
+               "<|video_pad|>": "\U000F0E06",
+               # Inkling 2's image marker and placeholder (its template writes <|content_image|><|unused_200054|>)
+               "<|content_image|>": "\U000F0E0B", "<|unused_200054|>": "\U000F0E0C"}
 # #2026: `</tool_call>` the same way.  A user asking for the string verbatim handed the model the real end-of-call token
 # (type 4, matched everywhere); it copied that token into its answer and the reply came back empty.  An assistant
 # message keeps its own: a client replaying the model's raw call text sends the tokens the model wrote.
@@ -2951,9 +2968,138 @@ class JsonOutputParser(OutputParser):
                          declared_only=declared_only, deferred=deferred)
 
 
+INK_HEADER = "<|message_model|>"
+INK_THINK = "<|content_thinking|>"
+INK_TEXT = "<|content_text|>"
+INK_TOOL = "<|content_invoke_tool_json|>"
+INK_END = "<|end_message|>"
+_INK_MARKERS = (INK_HEADER, INK_THINK, INK_TEXT, INK_TOOL, INK_END)
+
+
+def is_inkling_template(source: str | None) -> bool:
+    """llama.cpp's test for an Inkling template (common/parsers/inkling.cpp)."""
+    return bool(source) and "<|message_user|>" in source and "<|content_image|>" in source
+
+
+class InklingOutputParser(OutputParser):
+    """Inkling's reply blocks (thinking, text, tool calls), each closed by <|end_message|>."""
+
+    def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
+                 recover: bool = False, declared_only: bool = False, deferred: bool = False):
+        super().__init__(thinking=False, tools=tools, stream_tools=False, recover=False, declared_only=declared_only,
+                         deferred=deferred)
+        self.mode = "between"        # between | head | think | text | tool
+        self.tool_name = ""
+
+    @property
+    def clean(self) -> bool:
+        return not self.buf
+
+    @staticmethod
+    def _held_tail(text: str) -> int:
+        start = text.rfind("<", max(0, len(text) - max(len(m) for m in _INK_MARKERS)))
+        if start < 0:
+            return 0
+        tail = text[start:]
+        return len(tail) if any(m.startswith(tail) for m in _INK_MARKERS) else 0
+
+    def _call(self, name: str, body: str) -> list[Event]:
+        try:
+            obj = json.loads(body)
+            args = obj.get("args") if isinstance(obj, dict) else None
+            if not isinstance(args, dict):
+                raise ValueError("no args object")
+        except ValueError:
+            return [Event("content", INK_HEADER + name + INK_TOOL + body)]
+        if self.schemas and name not in self.schemas and not self.deferred:
+            name = self.aliases.get(name, name)
+        if (self.schemas or self.declared_only) and name not in self.schemas and not self.deferred:
+            self.unread += 1
+            return [Event("content", INK_HEADER + name + INK_TOOL + body)]
+        return [Event("tool_call", call=ToolCall(name, args))]
+
+    def _ink(self, final: bool) -> list[Event]:
+        out: list[Event] = []
+        while self.buf:
+            if self.mode == "between":
+                if self.buf.startswith(INK_HEADER):
+                    self.buf = self.buf[len(INK_HEADER):]
+                    self.mode = "head"
+                    continue
+                if not final and INK_HEADER.startswith(self.buf):
+                    break
+                if self.buf.startswith(INK_END):            # a stray end marker
+                    self.buf = self.buf[len(INK_END):]
+                    continue
+                for m, mode in ((INK_THINK, "think"), (INK_TEXT, "text")):   # a block without its header
+                    if self.buf.startswith(m):
+                        self.buf = self.buf[len(m):]
+                        self.mode = mode
+                        break
+                else:
+                    self.mode = "text"                     # text outside any block is the answer
+                continue
+            if self.mode == "head":
+                if self.buf.startswith(INK_THINK):
+                    self.buf, self.mode, self.state = self.buf[len(INK_THINK):], "think", "reasoning"
+                    continue
+                if self.buf.startswith(INK_TEXT):
+                    self.buf, self.mode, self.state = self.buf[len(INK_TEXT):], "text", "content"
+                    continue
+                i = self.buf.find(INK_TOOL)
+                if i > 0 and "<" not in self.buf[:i]:
+                    self.tool_name = self.buf[:i]
+                    self.buf, self.mode, self.state = self.buf[i + len(INK_TOOL):], "tool", "call"
+                    continue
+                if not final and len(self.buf) < 256 and ("<" not in self.buf or self._held_tail(self.buf)):
+                    break
+                self.mode, self.state = "text", "content"   # a header with no content marker: its text is the answer
+                continue
+            if self.mode in ("think", "text"):
+                kind = "reasoning" if self.mode == "think" else "content"
+                ends = [i for i in (self.buf.find(INK_END), self.buf.find(INK_HEADER)) if i >= 0]
+                if ends:
+                    i = min(ends)
+                    if i:
+                        out.append(Event(kind, self.buf[:i]))
+                    self.buf = self.buf[i + (len(INK_END) if self.buf.startswith(INK_END, i) else 0):]
+                    self.mode, self.state = "between", "content"
+                    continue
+                keep = 0 if final else self._held_tail(self.buf)
+                if len(self.buf) > keep:
+                    out.append(Event(kind, self.buf[:len(self.buf) - keep]))
+                    self.buf = self.buf[len(self.buf) - keep:]
+                break
+            if self.mode == "tool":
+                i = self.buf.find(INK_END)
+                if i < 0:
+                    if final:
+                        out.append(Event("content", INK_HEADER + self.tool_name + INK_TOOL + self.buf))
+                        self.buf = ""
+                    break
+                out += self._call(self.tool_name, self.buf[:i])
+                self.buf = self.buf[i + len(INK_END):]
+                self.mode, self.state = "between", "content"
+                continue
+        return out
+
+    def feed(self, delta: str) -> list[Event]:
+        self.buf += delta
+        return self._ink(False)
+
+    def finish(self, reason: str | None = None) -> list[Event]:
+        out = self._ink(True)
+        if self.buf:
+            out.append(Event("content", self.buf))
+            self.buf = ""
+        return out
+
+
 def parser_for_template(source: str | None):
     """The OutputParser class for a chat template's text, by the tool-call form the template documents (serve/toolformat.py):
     the JSON form gets JsonOutputParser; the XML form every Strata model ships with, templates without tools, and forms nothing
     here reads keep OutputParser (the same class as before this existed)."""
     from serve import toolformat
+    if is_inkling_template(source):
+        return InklingOutputParser
     return JsonOutputParser if toolformat.tool_format(source or "") == "json" else OutputParser

@@ -101,6 +101,18 @@ QWEN2_PATTERN = (
 )
 
 
+# Inkling 2's `inkling2` pre-tokenizer had no rule, so now it is llama.cpp's GPT4O (the tokenizer.json original)
+GPT4O_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
+
 def _sequence_findall(patterns, text: str) -> list[str]:
     """llama.cpp's unicode_regex_split: the pieces of `text` after each pattern in turn splits every piece into its
     matches and the unmatched spans between them."""
@@ -134,6 +146,8 @@ def pre_tokenizer_kind(pre) -> str | None:
         return "qwen2"
     if p.startswith("deepseek"):
         return "deepseek3"
+    if p == "inkling2":
+        return "gpt4o"
     return None
 
 
@@ -172,6 +186,9 @@ class Tokenizer:
             self._split = self._re.findall
         else:
             self._re = regex.compile(QWEN35_PATTERN)
+            self._split = self._re.findall
+        if pre_tokenizer_kind(pre) == "gpt4o":
+            self._re = regex.compile(GPT4O_PATTERN)
             self._split = self._re.findall
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
@@ -526,8 +543,9 @@ def extract(gguf_path, out_dir) -> dict:
         "add_bos_token": False,
         # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
         # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
-        "pre_pattern": QWEN35_PATTERN,
-        "pre_pattern_source": ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
+        "pre_pattern": GPT4O_PATTERN if pre_tokenizer_kind(tk.pre) == "gpt4o" else QWEN35_PATTERN,
+        "pre_pattern_source": "tokenizer.json (o200k, LLAMA_VOCAB_PRE_TYPE_GPT4O)" if pre_tokenizer_kind(tk.pre) == "gpt4o"
+                              else ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
     }
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
     (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in

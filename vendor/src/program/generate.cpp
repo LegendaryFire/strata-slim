@@ -168,6 +168,9 @@
 #if defined(STRATA_HAVE_QWEN35)
 #include "strata/qwen35/engine.hpp"
 #endif
+#if defined(STRATA_HAVE_INKLING2)
+#include "strata/inkling2/engine.hpp"
+#endif
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -3736,6 +3739,21 @@ int main(int argc, char** argv) {
 #endif
         break;
     }
+#if defined(STRATA_HAVE_INKLING2)
+    // an Inkling 2 file had no engine path, so now its architecture string hands it to src/inkling2 before anything else
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--native") != 0 && std::strcmp(argv[i], "--model") != 0) continue;
+        bool inkling2 = false;
+        try {
+            const strata::GgufFile meta(strata::gguf_split_paths(argv[i + 1]).front());
+            const strata::MetaValue* arch = meta.get("general.architecture");
+            inkling2 = arch != nullptr && (arch->s == "inkling2" || arch->s == "inkling2_loop");
+        } catch (const std::exception&) {
+        }
+        if (inkling2) return strata::inkling2::run(argc, argv);
+        break;
+    }
+#endif
 #if defined(STRATA_HAVE_QWEN35)
     // **THE FAMILY SWITCH.**  A Qwen3.6-35B-A3B file (GGUF architecture qwen35moe) runs on its own engine path
     // (src/qwen35), decided here from the file's header before any of this engine's state exists; every other file

@@ -194,13 +194,12 @@ class Launcher:
         paths = ModelPaths.from_settings(self.settings)
         model, mmproj = self.model_files(paths)
         if gguf_architecture(model) in ("inkling2", "inkling2_loop"):
-            # Inkling 2 runs without Qwen's MTP layer, DFlash2 and picture reader
-            for name, on in (("DRAFTER", paths.mtp is not None or self.settings.drafter != Drafter.OFF),
-                             ("VISION", mmproj is not None or self.settings.vision_on)):
-                if on:
-                    log.warning(f"{name} is not used with an Inkling 2 model")
+            # Inkling 2 runs without Qwen's MTP layer and DFlash2; its picture reader (mmproj, inkling2v) reads on the CPU
+            if paths.mtp is not None or self.settings.drafter != Drafter.OFF:
+                log.warning("DRAFTER is not used with an Inkling 2 model")
+            if mmproj is not None and self.settings.vision == Vision.GPU:
+                log.warning("VISION=gpu: Inkling 2's picture reader reads on the CPU (the GPU one does not read its tower)")
             paths.mtp = None
-            mmproj = None
             self.inkling = True
         if self.command == "prepare":
             return
@@ -208,6 +207,8 @@ class Launcher:
         cfg = Config(self.settings, paths, model, mmproj).build()
         if self.inkling:
             cfg["drafting"] = str(Drafter.OFF)
+            if "vision" in cfg:
+                cfg["vision"]["gpu"] = False
             if cfg.pop("layer_split", None) is not None:
                 log.info("CONFIG_LAYER_SPLIT is not used with an Inkling 2 model: its engine splits the layers itself")
         config_path = self.write_config(cfg)

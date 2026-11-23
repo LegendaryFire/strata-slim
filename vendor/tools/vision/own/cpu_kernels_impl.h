@@ -191,6 +191,34 @@ void gelu(float* x, size_t ldx, int rows, int n) {
     }
 }
 
+inline VR gelu_erf_v(VR x) {
+    // x erf(x / sqrt 2) = |x| erf(|x| / sqrt 2): 0.5 (x + |x| E(|x| / sqrt 2)), E(a) = 1 - t (a1 + t (a2 + ... a5)) exp(-a^2), t = 1 / (1 + p a)
+    const VR one = vr_set1(1.0f), ax = vr_max(x, vr_sub(vr_zero(), x)), a = vr_mul(ax, vr_set1(0.70710678118654752440f));
+    const VR t = vr_div(one, vr_fma(vr_set1(0.3275911f), a, one));
+    VR p = vr_set1(1.061405429f);
+    p = vr_fma(p, t, vr_set1(-1.453152027f));
+    p = vr_fma(p, t, vr_set1(1.421413741f));
+    p = vr_fma(p, t, vr_set1(-0.284496736f));
+    p = vr_fma(p, t, vr_set1(0.254829592f));
+    const VR e = vr_exp(vr_max(vr_sub(vr_zero(), vr_mul(a, a)), vr_set1(-87.0f)));
+    const VR erf = vr_sub(one, vr_mul(vr_mul(p, t), e));
+    return vr_mul(vr_set1(0.5f), vr_fma(ax, erf, x));
+}
+
+void gelu_erf(float* x, size_t ldx, int rows, int n) {
+    for (int r = 0; r < rows; ++r) {
+        float* p = x + (size_t) r * ldx;
+        int i = 0;
+        for (; i + W <= n; i += W) vr_store(p + i, gelu_erf_v(vr_load(p + i)));
+        if (i < n) {
+            float buf[W] = {0};
+            KN_COPY(buf, p + i, n - i);
+            vr_store(buf, gelu_erf_v(vr_load(buf)));
+            KN_COPY(p + i, buf, n - i);
+        }
+    }
+}
+
 void layernorm(const float* x, float* y, int D, const float* w, const float* b, float eps) {
     VR s = vr_zero();
     int i = 0;
@@ -276,7 +304,7 @@ void pos_add(float* xr, const float* a, const float* b, const float* c, const fl
 
 const CpuOps& STRATA_KN_GETTER() {
     static const CpuOps ops = {STRATA_KN_NAME, kn::MRF, kn::NR, kn::pack_w, kn::conv, kn::gemm, kn::gelu, kn::layernorm, kn::add, kn::round16, kn::softmax_update,
-                               kn::rope_row, kn::pos_add};
+                               kn::rope_row, kn::pos_add, kn::gelu_erf};
     return ops;
 }
 

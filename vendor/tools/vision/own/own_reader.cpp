@@ -55,7 +55,7 @@ int own_reader_run(const OwnReaderOptions& o) {
     Gguf gg;
     VitGeometry geo;
     std::string err;
-    if (!gg.open(o.mmproj, err) || !vit_geometry_from_gguf(gg, geo, err) || !vit_geometry_supported(geo, err))
+    if (!gg.open(o.mmproj, err) || !vit_geometry_from_gguf(gg, geo, err) || !vit_geometry_supported_cpu(geo, err))
         return fail("cannot load the vision encoder " + o.mmproj + " (" + err + ")", 1);
     int threads = o.threads;
     std::unique_ptr<VitRef> cpu;
@@ -64,6 +64,7 @@ int own_reader_run(const OwnReaderOptions& o) {
     std::unique_ptr<VitGpu> gpu;
     if (o.gpu) {
         std::string why;
+        if (!vit_geometry_supported(geo, why)) return fail("this picture reader file is read on the CPU only (" + why + ")", 3);
         if (geo.head_dim > kVitGpuMaxHeadDim)
             return fail("this picture reader file has attention heads of size " + std::to_string(geo.head_dim) + "; the GPU picture reader handles up to " +
                             std::to_string(kVitGpuMaxHeadDim) + " (the CPU picture reader reads it)", 1);

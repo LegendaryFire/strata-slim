@@ -1,0 +1,502 @@
+From 7c8cf2547920e0e2ef9773a485b69249e9f55f99 Mon Sep 17 00:00:00 2001
+From: LegendaryFire <tristan.balon@outlook.com>
+Date: Sun, 22 Nov 2026 03:25:27 -0700
+Subject: [PATCH] Run Inkling 2's K-quant and Q5_0 experts (Bartowski's Q4_K_M)
+ at speed
+
+Only NVFP4 and Q8_0 experts had the prompt GEMM, the CPU decode path
+and the pool: a GGUF with Q4_K / Q5_K / Q6_K gate-up and Q5_0 down
+experts (bartowski's thinkingmachines_Inkling-2-Mini-Q4_K_M) read
+prompts at 357 tok/s with every expert in VRAM and could not run with
+experts in RAM at all. Now:
+
+- the warp-specialized prompt GEMM (k_expert_ws) converts Q4_K, Q5_K,
+  Q6_K and Q5_0 rows to FP16 as their formats define them (d sc q -
+  dmin m with 6-bit scales and mins; Q5_K's fifth bits; Q6_K's 6-bit
+  codes and scale a 16; Q5_0's (q - 16) d): a K-quant super-block a
+  raw copy (Q5_K / Q6_K on 64-column tiles, so the buffers fit; Q6_K's
+  2-byte aligned rows copied 16 bits at a time), Q5_0 two steps a
+  copy; Q8_0 moves to it from k_expert_mma2 (two steps a copy; the
+  16-byte copies only where every copy starts 16-aligned);
+- a layer takes the GEMM with any of NVFP4 / Q8_0 / Q4_K / Q5_K / Q6_K
+  gate-up and NVFP4 / Q8_0 / Q5_0 down, each projection by its type;
+- the CPU's expert dots (scalar and AVX2) take Q4_K, Q5_K, Q6_K and
+  Q5_0 (the K-quants' mins against the int8 codes' sums, as ggml's
+  GPU kernels), so these experts run from RAM in the pool.
+
+Checks: the GEMM's conversions agree with the generic grouped kernels
+as the NVFP4 path does (~0.9%, the q8_1 activations' rounding); the
+CPU dots against a double-precision dequantized reference (<2.4e-4)
+and the GPU's kernels in the engine (~1.3e-7).
+
+Bartowski's Q4_K_M, every expert in VRAM, 7K: prompt 357 -> 1708
+tok/s (1907 at 1024-token chunks). In the pool at 512K (two cards, the
+drafter): prompt 7K 1942, 60K 1685, 180K 1137 tok/s; decode 53.3,
+48.6, 45.4 (UD-Q4_K_XL: 2020 / 2379 / 1893 and 62.2 / 55.3 / 54.7:
+the larger file leaves fewer experts in VRAM). UD-Q4_K_XL's Q8_0
+layers on the new path: prompt at 1024-token chunks 2004 -> 2077.
+---
+ vendor/src/inkling2/cpu_attn.cpp  | 166 +++++++++++++++++++++++++++++-
+ vendor/src/inkling2/cpu_attn.hpp  |   2 +-
+ vendor/src/inkling2/ink_engine.cu | 142 +++++++++++++++++++++----
+ 3 files changed, 286 insertions(+), 24 deletions(-)
+
+diff --git a/vendor/src/inkling2/cpu_attn.cpp b/vendor/src/inkling2/cpu_attn.cpp
+index 839b690..bd1aa76 100644
+--- a/vendor/src/inkling2/cpu_attn.cpp
++++ b/vendor/src/inkling2/cpu_attn.cpp
+@@ -290,11 +290,76 @@ const int8_t kFp4[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12
+ /// One weight row against up to kMaxE activation rows at once (the row's blocks decoded once): x[e] the int8 codes of
+ /// q8_1 blocks (kQ81 bytes apart), dx[e] their scales as floats.
+ constexpr int kMaxE = 8;
++/// A Q4_K / Q5_K super-block's sub-block j scale and min (ggml's get_scale_min_k4).
++inline void kq_scale_min(const uint8_t* q, int j, int& sc, int& m) {
++    if (j < 4) {
++        sc = q[j] & 63;
++        m = q[j + 4] & 63;
++    } else {
++        sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
++        m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
++    }
++}
+ void dots_scalar(int type, const uint8_t* w, int n_in, const uint8_t* const* x, const float* const* dx, int ne, float* out) {
+     for (int e = 0; e < ne; ++e) {
+         float acc = 0.f;
+         const uint8_t* wr = w;
+-        if (type == 40) {
++        if (type == 12 || type == 13) {   // Q4_K / Q5_K: d sc q - dmin m a sub-block of 32 (the min against the codes' sum, as ggml)
++            const int bs = type == 12 ? 144 : 176;
++            for (int b = 0; b < n_in / 256; ++b, wr += bs) {
++                const float d = h2f(wr), dmin = h2f(wr + 2);
++                const uint8_t* qs = wr + (type == 12 ? 16 : 48);
++                const uint8_t* qh = wr + 16;
++                for (int j = 0; j < 8; ++j) {
++                    int sc, m;
++                    kq_scale_min(wr + 4, j, sc, m);
++                    const uint8_t* xb = x[e] + (size_t) (8 * b + j) * kQ81;
++                    const int8_t* xv = (const int8_t*) (xb + 4);
++                    int sm = 0, sx = 0;
++                    for (int l = 0; l < 32; ++l) {
++                        int q = (j & 1) ? qs[32 * (j / 2) + l] >> 4 : qs[32 * (j / 2) + l] & 0xF;
++                        if (type == 13) q += ((qh[l] >> j) & 1) << 4;
++                        sm += q * xv[l];
++                        sx += xv[l];
++                    }
++                    acc += dx[e][8 * b + j] * (d * (float) sc * (float) sm - dmin * (float) m * (float) sx);
++                }
++            }
++        } else if (type == 14) {   // Q6_K: d sc (q - 32), a scale every 16
++            for (int b = 0; b < n_in / 256; ++b, wr += 210) {
++                const float d = h2f(wr + 208);
++                const int8_t* scl = (const int8_t*) (wr + 192);
++                for (int hf = 0; hf < 2; ++hf)
++                    for (int grp = 0; grp < 4; ++grp) {   // 32 values: one q8_1 block
++                        const uint8_t* ql = wr + 64 * hf + (grp & 1) * 32;
++                        const uint8_t* qh = wr + 128 + 32 * hf;
++                        const int blk = 8 * b + 4 * hf + grp;
++                        const int8_t* xv = (const int8_t*) (x[e] + (size_t) blk * kQ81 + 4);
++                        for (int h16 = 0; h16 < 2; ++h16) {
++                            int sm = 0;
++                            for (int l = 16 * h16; l < 16 * h16 + 16; ++l) {
++                                const int q = (int) (((ql[l] >> ((grp >> 1) * 4)) & 0xF) | (((qh[l] >> (2 * grp)) & 3) << 4)) - 32;
++                                sm += q * xv[l];
++                            }
++                            acc += d * (float) scl[8 * hf + h16 + 2 * grp] * dx[e][blk] * (float) sm;
++                        }
++                    }
++            }
++        } else if (type == 6) {   // Q5_0: d (q - 16)
++            for (int b = 0; b < n_in / 32; ++b, wr += 22) {
++                const float d = h2f(wr);
++                uint32_t qh;
++                std::memcpy(&qh, wr + 2, 4);
++                const int8_t* xv = (const int8_t*) (x[e] + (size_t) b * kQ81 + 4);
++                int sm = 0;
++                for (int j = 0; j < 16; ++j) {
++                    const int q0 = ((wr[6 + j] & 0xF) | (((qh >> j) & 1) << 4)) - 16;
++                    const int q1 = ((wr[6 + j] >> 4) | (((qh >> (j + 16)) & 1) << 4)) - 16;
++                    sm += q0 * xv[j] + q1 * xv[j + 16];
++                }
++                acc += d * dx[e][b] * (float) sm;
++            }
++        } else if (type == 40) {
+             for (int b = 0; b < n_in / 64; ++b, wr += 36)
+                 for (int sb = 0; sb < 4; ++sb) {
+                     const int8_t* xv = (const int8_t*) (x[e] + (size_t) (2 * b + sb / 2) * kQ81 + 4) + (sb % 2) * 16;
+@@ -324,10 +389,102 @@ __attribute__((target("avx2,fma,f16c"))) void dots_avx2(int type, const uint8_t*
+     const __m256i ones = _mm256_set1_epi16(1);
+     __m256 acc[kMaxE];
+     for (int e = 0; e < ne; ++e) acc[e] = _mm256_setzero_ps();
+-    if (type == 40) {
++    const __m256i m4 = _mm256_set1_epi8(0x0F);
++    if (type == 12 || type == 13) {   // Q4_K / Q5_K: u8 codes (maddubs) per 32, d sc dx, the min on the codes' sum (as ggml)
++        const int bs = type == 12 ? 144 : 176;
++        const __m256i m1 = _mm256_set1_epi8(1);
++        for (int b = 0; b < n_in / 256; ++b, w += bs) {
++            uint16_t hd, hm;
++            std::memcpy(&hd, w, 2);
++            std::memcpy(&hm, w + 2, 2);
++            const float d = _cvtsh_ss(hd), dmin = _cvtsh_ss(hm);
++            const uint8_t* qs = w + (type == 12 ? 16 : 48);
++            const __m256i qhv = type == 13 ? _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w + 16)) : _mm256_setzero_si256();
++            int scs[8], mns[8];
++            for (int j = 0; j < 8; ++j) kq_scale_min(w + 4, j, scs[j], mns[j]);
++            for (int g = 0; g < 4; ++g) {
++                const __m256i q = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qs + 32 * g));
++                __m256i lo = _mm256_and_si256(q, m4), hi = _mm256_and_si256(_mm256_srli_epi16(q, 4), m4);
++                if (type == 13) {
++                    lo = _mm256_or_si256(lo, _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qhv, 2 * g), m1), 4));
++                    hi = _mm256_or_si256(hi, _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qhv, 2 * g + 1), m1), 4));
++                }
++                for (int e = 0; e < ne; ++e) {
++                    const uint8_t* x0 = x[e] + (size_t) (8 * b + 2 * g) * kQ81;
++                    const __m256i xa = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x0 + 4));
++                    const __m256i xb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x0 + kQ81 + 4));
++                    const __m256i p0 = _mm256_madd_epi16(_mm256_maddubs_epi16(lo, xa), ones);
++                    const __m256i p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(hi, xb), ones);
++                    const float dx0 = dx[e][8 * b + 2 * g], dx1 = dx[e][8 * b + 2 * g + 1];
++                    // the mins against the codes' sums (madd of 1 x codes), in the same lanes
++                    const __m256i s0 = _mm256_madd_epi16(_mm256_maddubs_epi16(m1, xa), ones);
++                    const __m256i s1 = _mm256_madd_epi16(_mm256_maddubs_epi16(m1, xb), ones);
++                    acc[e] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p0), _mm256_set1_ps(d * (float) scs[2 * g] * dx0), acc[e]);
++                    acc[e] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p1), _mm256_set1_ps(d * (float) scs[2 * g + 1] * dx1), acc[e]);
++                    acc[e] = _mm256_fnmadd_ps(_mm256_cvtepi32_ps(s0), _mm256_set1_ps(dmin * (float) mns[2 * g] * dx0), acc[e]);
++                    acc[e] = _mm256_fnmadd_ps(_mm256_cvtepi32_ps(s1), _mm256_set1_ps(dmin * (float) mns[2 * g + 1] * dx1), acc[e]);
++                }
++            }
++        }
++    } else if (type == 14) {   // Q6_K: u8 codes 0..63 (maddubs), less 32 x the codes' sum, a scale every 16 (4 lanes)
++        const __m256i m3 = _mm256_set1_epi8(3);
++        const __m256i u1 = _mm256_set1_epi8(1);
++        for (int b = 0; b < n_in / 256; ++b, w += 210) {
++            uint16_t hd;
++            std::memcpy(&hd, w + 208, 2);
++            const float d = _cvtsh_ss(hd);
++            const int8_t* scl = (const int8_t*) (w + 192);
++            for (int hf = 0; hf < 2; ++hf) {
++                const __m256i qh = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w + 128 + 32 * hf));
++                const __m256i qa = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w + 64 * hf));
++                const __m256i qb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w + 64 * hf + 32));
++                for (int grp = 0; grp < 4; ++grp) {
++                    const __m256i ql = grp & 1 ? qb : qa;
++                    const __m256i lo4 = grp >> 1 ? _mm256_and_si256(_mm256_srli_epi16(ql, 4), m4) : _mm256_and_si256(ql, m4);
++                    const __m256i h2 = _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh, 2 * grp), m3), 4);
++                    const __m256i q = _mm256_or_si256(lo4, h2);   // 0..63
++                    const int blk = 8 * b + 4 * hf + grp;
++                    const __m256 sv = _mm256_setr_ps(scl[8 * hf + 2 * grp], scl[8 * hf + 2 * grp], scl[8 * hf + 2 * grp], scl[8 * hf + 2 * grp],
++                                                     scl[8 * hf + 2 * grp + 1], scl[8 * hf + 2 * grp + 1], scl[8 * hf + 2 * grp + 1],
++                                                     scl[8 * hf + 2 * grp + 1]);
++                    for (int e = 0; e < ne; ++e) {
++                        const __m256i xv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x[e] + (size_t) blk * kQ81 + 4));
++                        const __m256i pq = _mm256_madd_epi16(_mm256_maddubs_epi16(q, xv), ones);
++                        const __m256i px = _mm256_madd_epi16(_mm256_maddubs_epi16(u1, xv), ones);   // the codes' sums
++                        const __m256i p = _mm256_sub_epi32(pq, _mm256_slli_epi32(px, 5));
++                        acc[e] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_mul_ps(sv, _mm256_set1_ps(d * dx[e][blk])), acc[e]);
++                    }
++                }
++            }
++        }
++    } else if (type == 6) {   // Q5_0: u8 codes 0..31 (maddubs), less 16 x the codes' sum
++        const __m256i u1 = _mm256_set1_epi8(1);
++        const __m256i bitsel = _mm256_setr_epi8(1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128,
++                                                1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128);
++        const __m256i bshuf = _mm256_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3);
++        for (int b = 0; b < n_in / 32; ++b, w += 22) {
++            uint16_t hd;
++            std::memcpy(&hd, w, 2);
++            const float d = _cvtsh_ss(hd);
++            uint32_t qhw;
++            std::memcpy(&qhw, w + 2, 4);
++            const __m128i q16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(w + 6));
++            const __m256i qq = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(q16, 4), _mm_set1_epi8(0x0F)), _mm_and_si128(q16, _mm_set1_epi8(0x0F)));
++            // the fifth bits: byte i of the 32 gets bit i of qh
++            const __m256i hb = _mm256_shuffle_epi8(_mm256_set1_epi32((int) qhw), bshuf);
++            const __m256i hbit = _mm256_and_si256(_mm256_cmpeq_epi8(_mm256_and_si256(hb, bitsel), bitsel), _mm256_set1_epi8(16));
++            const __m256i q = _mm256_or_si256(qq, hbit);   // 0..31
++            for (int e = 0; e < ne; ++e) {
++                const __m256i xv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x[e] + (size_t) b * kQ81 + 4));
++                const __m256i pq = _mm256_madd_epi16(_mm256_maddubs_epi16(q, xv), ones);
++                const __m256i px = _mm256_madd_epi16(_mm256_maddubs_epi16(u1, xv), ones);
++                const __m256i p = _mm256_sub_epi32(pq, _mm256_slli_epi32(px, 4));
++                acc[e] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(d * dx[e][b]), acc[e]);
++            }
++        }
++    } else if (type == 40) {
+         const __m256i lut = _mm256_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12, 0, 1, 2, 3, 4, 6, 8, 12,
+                                              0, -1, -2, -3, -4, -6, -8, -12);
+-        const __m256i m4 = _mm256_set1_epi8(0x0F);
+         for (int b = 0; b < n_in / 64; ++b, w += 36) {
+             const __m256i q = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w + 4));
+             const __m256i lo = _mm256_shuffle_epi8(lut, _mm256_and_si256(q, m4));
+@@ -401,7 +558,8 @@ void quantize_q8_1(const float* x, uint8_t* y, int n) {
+ }  // namespace
+ 
+ bool cpu_experts_supported(int gu_type, int d_type) {
+-    return (gu_type == 40 || gu_type == 8) && (d_type == 40 || d_type == 8);
++    auto ok = [](int t) { return t == 40 || t == 8 || t == 12 || t == 13 || t == 14 || t == 6; };
++    return ok(gu_type) && ok(d_type);
+ }
+ 
+ void cpu_moe(CpuMoeJob& j) {
+diff --git a/vendor/src/inkling2/cpu_attn.hpp b/vendor/src/inkling2/cpu_attn.hpp
+index 580e78d..64cbae0 100644
+--- a/vendor/src/inkling2/cpu_attn.hpp
++++ b/vendor/src/inkling2/cpu_attn.hpp
+@@ -43,7 +43,7 @@ void cpu_attn(const CpuAttnJob& job);
+ struct CpuExperts {
+     const uint8_t* blobs = nullptr;
+     size_t stride = 0, gu_row = 0, d_row = 0, up_off = 0, down_off = 0, tail_off = 0;
+-    int n_embd = 0, n_ff = 0, gu_type = 0, d_type = 0;   // GGUF types: 40 NVFP4, 8 Q8_0
++    int n_embd = 0, n_ff = 0, gu_type = 0, d_type = 0;   // GGUF types: 40 NVFP4, 8 Q8_0, 12 Q4_K, 13 Q5_K, 14 Q6_K, 6 Q5_0
+     float situ_beta = 0.f, situ_lb = 0.f;
+ };
+ 
+diff --git a/vendor/src/inkling2/ink_engine.cu b/vendor/src/inkling2/ink_engine.cu
+index 2acce6d..892c9a4 100644
+--- a/vendor/src/inkling2/ink_engine.cu
++++ b/vendor/src/inkling2/ink_engine.cu
+@@ -815,7 +815,16 @@ __device__ __forceinline__ void cp_async16(void* dst, const void* src, int bytes
+ __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+ template <int N> __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+ 
+-template <int TY> __host__ __device__ constexpr int seg_bytes() { return TY == 40 ? 36 : 68; }
++/// A 64-value K step's weight bytes a row: NVFP4 a block, Q8_0 two, Q4_K a quarter super-block (144 / 4: copied
++/// whole), Q5_0 two blocks of 22.
++template <int TY> __host__ __device__ constexpr int seg_bytes() { return TY == 40 || TY == 12 ? 36 : TY == 6 ? 44 : 68; }
++/// Steps a raw weight copy of the warp-specialized GEMM: a Q4_K super-block (4), Q5_0 2 (its rows only 8-byte aligned,
++/// and 4 steps of it would not fit beside the other buffers).
++template <int TY> __host__ __device__ constexpr int ws_raw_steps() { return TY == 6 || TY == 8 ? 2 : 4; }
++/// A row's bytes of such a copy: NVFP4 4 blocks, a Q4_K / Q5_K / Q6_K super-block, Q5_0 4 blocks, Q8_0 8 blocks.
++template <int TY> __host__ __device__ constexpr int ws_raw_bytes() {
++    return TY == 40 || TY == 12 ? 144 : TY == 13 ? 176 : TY == 14 ? 210 : TY == 6 ? 88 : 136;   // (Q8_0: 4 blocks)
++}
+ template <int TY> constexpr size_t expert_smem() {
+     return (size_t) 2 * kEM * kELd * 2 + (size_t) 2 * kEN * seg_bytes<TY>() + (size_t) kEN * kELd * 2;
+ }
+@@ -1967,7 +1976,7 @@ __global__ void __launch_bounds__(256) k_expert_mma2(const __half* X, const unsi
+ constexpr int kWsRaw = 4;   // steps a raw weight copy
+ template <int MR, int NC, int WC> __host__ __device__ constexpr int ws_threads() { return 32 * (MR / (MR == 128 ? 64 : 32)) * (NC / WC) + 256; }
+ template <int TY, int MR, int NC> constexpr size_t expert_ws_smem() {
+-    constexpr size_t body = (size_t) 3 * MR * kEK * 2 + (size_t) 2 * NC * kWsRaw * seg_bytes<TY>() + (size_t) 2 * NC * kEK * 2;
++    constexpr size_t body = (size_t) 3 * MR * kEK * 2 + (size_t) 2 * NC * ws_raw_bytes<TY>() + (size_t) 2 * NC * kEK * 2;
+     constexpr size_t cs = (size_t) MR * (NC + 4) * 4;
+     return body > cs ? body : cs;
+ }
+@@ -1994,7 +2003,8 @@ __global__ void __launch_bounds__(ws_threads<MR, NC, WC>(), 1) k_expert_ws(const
+         }
+     }
+     __syncthreads();
+-    constexpr int SEG = seg_bytes<TY>(), QK = TY == 40 ? 64 : 32, BB = TY == 40 ? 36 : 34;
++    constexpr int RK = ws_raw_steps<TY>();
++    constexpr bool KQ = TY == 12 || TY == 13 || TY == 14;   // a K-quant: a super-block a copy, converted by quarters
+     if ((int) blockIdx.y >= *n_tiles) return;
+     const int2 tl = tiles[blockIdx.y];   // (group, first row): a hot expert's rows over many blocks
+     const int g = tl.x;
+@@ -2005,7 +2015,8 @@ __global__ void __launch_bounds__(ws_threads<MR, NC, WC>(), 1) k_expert_ws(const
+     const float* tail = tail_off ? (const float*) (grp_ptr[g] + tail_off) : nullptr;
+     extern __shared__ __align__(128) unsigned char esm[];
+     __half* As = reinterpret_cast<__half*>(esm);                               // [3][MR * kEK], swizzled
+-    constexpr int RSEG = kWsRaw * SEG;                                         // a column's raw bytes of a copy
++    constexpr int RSEG = ws_raw_bytes<TY>();                                   // a column's raw bytes of a copy
++    constexpr int SEG = RSEG / RK;                                             // (a step's, but for the K-quants)
+     uint8_t* raw = esm + (size_t) 3 * MR * kEK * 2;                            // [2][NC * RSEG]
+     __half* Bs = reinterpret_cast<__half*>(raw + (size_t) 2 * NC * RSEG);      // [2][NC * kEK], column major, swizzled
+     float* Cs = reinterpret_cast<float*>(esm);                                 // [MR][NC + 4], after the K loop
+@@ -2013,9 +2024,7 @@ __global__ void __launch_bounds__(ws_threads<MR, NC, WC>(), 1) k_expert_ws(const
+     // a producer's copies (TPC threads a weight column: pieces part, part + TPC, ..; A_PT pieces of the rows) and
+     // conversions; 16-byte pieces where the rows allow (the down rows: 648 bytes, 8)
+     constexpr int TPC = PT / NC, A_PT = MR * (kEK / 8) / PT;
+-    constexpr int STEP_B = kEK / QK * BB;
+-    static_assert(STEP_B == SEG, "a step's bytes are a segment");
+-    const bool p16 = ((row_bytes | (size_t) W) & 15) == 0;
++    const bool p16 = ((row_bytes | (size_t) W | (size_t) RSEG) & 15) == 0;   // (every copy starts a multiple of RSEG on)
+     const int pb = p16 ? 16 : 8, n_pc = RSEG / pb;
+     const int pt = tid - CT;
+     const int wj = (producer ? pt : 0) / TPC, wpart = (producer ? pt : 0) % TPC;
+@@ -2038,14 +2047,19 @@ __global__ void __launch_bounds__(ws_threads<MR, NC, WC>(), 1) k_expert_ws(const
+             }
+             auto issue = [&](int st) {
+                 const int buf = st % 3;
+-                if (st % kWsRaw == 0) {   // steps st .. st + 3's raw weights (the last copy: what is left of the row)
+-                    uint8_t* rd = wdst + (size_t) ((st / kWsRaw) & 1) * NC * RSEG;
+-                    const uint8_t* ws = wsrc + (size_t) st * STEP_B;
+-                    const int valid = min(kWsRaw, steps - st) * SEG;
+-                    for (int c = wpart; c < n_pc; c += TPC) {
+-                        const int bytes = max(0, min(pb, valid - c * pb));
+-                        if (p16) cp_async16(rd + c * 16, ws + c * 16, bytes);
+-                        else cp_async8(rd + c * 8, ws + c * 8, bytes);
++                if (st % RK == 0) {   // steps st .. st + 3's raw weights (the last copy: what is left of the row)
++                    uint8_t* rd = wdst + (size_t) ((st / RK) & 1) * NC * RSEG;
++                    const uint8_t* ws = wsrc + (size_t) (st / RK) * RSEG;
++                    if constexpr (TY == 14) {   // Q6_K rows (1890 bytes) are 2-byte aligned only: plain 16-bit copies
++                        for (int c = wpart; c < RSEG / 2; c += TPC)
++                            reinterpret_cast<uint16_t*>(rd)[c] = reinterpret_cast<const uint16_t*>(ws)[c];
++                    } else {
++                        const int valid = KQ ? RSEG : min(RK, steps - st) * SEG;
++                        for (int c = wpart; c < n_pc; c += TPC) {
++                            const int bytes = max(0, min(pb, valid - c * pb));
++                            if (p16) cp_async16(rd + c * 16, ws + c * 16, bytes);
++                            else cp_async8(rd + c * 8, ws + c * 8, bytes);
++                        }
+                     }
+                 }
+                 __half* ad = As + (size_t) buf * MR * kEK;
+@@ -2061,7 +2075,8 @@ __global__ void __launch_bounds__(ws_threads<MR, NC, WC>(), 1) k_expert_ws(const
+                 if (st + 1 < steps) cp_wait<1>();
+                 else cp_wait<0>();
+                 bar_sync(kProd, PT);   // every producer's copies of step st are in
+-                const uint8_t* rs = raw + (size_t) ((st / kWsRaw) & 1) * NC * RSEG + (st % kWsRaw) * SEG;
++                const uint8_t* rblk = raw + (size_t) ((st / RK) & 1) * NC * RSEG;   // this copy's (a Q4_K super-block)
++                const uint8_t* rs = rblk + (st % RK) * SEG;
+                 __half* bd = Bs + (size_t) (st & 1) * NC * kEK;
+ #pragma unroll
+                 for (int it = 0; it < NC * 8 / PT; ++it) {
+@@ -2077,6 +2092,65 @@ __global__ void __launch_bounds__(ws_threads<MR, NC, WC>(), 1) k_expert_ws(const
+                         v[1] = __hmul2(lut[(w >> 8) & 0xFF], d);
+                         v[2] = __hmul2(lut[(w >> 16) & 0xFF], d);
+                         v[3] = __hmul2(lut[w >> 24], d);
++                    } else if constexpr (TY == 12 || TY == 13) {   // Q4_K / Q5_K: d sc q - dmin m, 6-bit scales and mins a 32
++                        const uint8_t* sb_ = rblk + col * RSEG;   // d, dmin, scales[12], (Q5_K: qh[32],) qs[128]
++                        const int qt = st % RK, sb = 2 * qt + (ch >> 2), l0 = (ch & 3) * 8;
++                        const float d = __half2float(__ushort_as_half(*reinterpret_cast<const uint16_t*>(sb_)));
++                        const float dmin = __half2float(__ushort_as_half(*reinterpret_cast<const uint16_t*>(sb_ + 2)));
++                        const uint8_t* scl = sb_ + 4;
++                        int sc, mn;
++                        if (sb < 4) {
++                            sc = scl[sb] & 63;
++                            mn = scl[sb + 4] & 63;
++                        } else {
++                            sc = (scl[sb + 4] & 0xF) | ((scl[sb - 4] >> 6) << 4);
++                            mn = (scl[sb + 4] >> 4) | ((scl[sb] >> 6) << 4);
++                        }
++                        const float ds = d * (float) sc, dm = dmin * (float) mn;
++                        constexpr int QS = TY == 13 ? 48 : 16;
++                        const uint2 qb = *reinterpret_cast<const uint2*>(sb_ + QS + 32 * qt + l0);
++                        uint2 hb = make_uint2(0u, 0u);   // Q5_K: the fifth bits, bit sb of qh[l]
++                        if constexpr (TY == 13) hb = *reinterpret_cast<const uint2*>(sb_ + 16 + l0);
++                        const int sh = (ch >> 2) * 4;   // the low nibbles: the first 32, the high: the second
++#pragma unroll
++                        for (int q = 0; q < 4; ++q) {
++                            const uint32_t w = q < 2 ? qb.x : qb.y, hw = q < 2 ? hb.x : hb.y, b = 16 * (q & 1);
++                            const int a0 = (int) ((w >> (b + sh)) & 0xF) + (TY == 13 ? (int) ((hw >> (b + sb)) & 1) * 16 : 0);
++                            const int a1 = (int) ((w >> (b + 8 + sh)) & 0xF) + (TY == 13 ? (int) ((hw >> (b + 8 + sb)) & 1) * 16 : 0);
++                            v[q] = __floats2half2_rn(ds * (float) a0 - dm, ds * (float) a1 - dm);
++                        }
++                    } else if constexpr (TY == 14) {   // Q6_K: d sc q, 6-bit q - 32, int8 scales a 16
++                        const uint8_t* sb_ = rblk + col * RSEG;   // ql[128], qh[64], scales[16], d
++                        const int qt = st % RK, hf = qt >> 1, k0 = (qt & 1) * 64 + (ch & 7) * 8;   // within the half: 0..127
++                        const int grp = k0 >> 5, l0 = k0 & 31;   // q1..q4 of ggml's loop, and l
++                        const uint8_t* ql = sb_ + 64 * hf + (grp & 1) * 32;
++                        const uint8_t* qh = sb_ + 128 + 32 * hf;
++                        const int8_t* scl = reinterpret_cast<const int8_t*>(sb_ + 192) + 8 * hf;
++                        const float d = __half2float(__ushort_as_half((uint16_t) (sb_[208] | (sb_[209] << 8))));
++                        const int lsh = (grp >> 1) * 4, hsh = grp * 2;
++                        float f[8];
++#pragma unroll
++                        for (int i = 0; i < 8; ++i) {
++                            const int l = l0 + i;
++                            const int q = (int) (((ql[l] >> lsh) & 0xF) | (((qh[l] >> hsh) & 3) << 4)) - 32;
++                            f[i] = d * (float) scl[l / 16 + 2 * grp] * (float) q;
++                        }
++#pragma unroll
++                        for (int q = 0; q < 4; ++q) v[q] = __floats2half2_rn(f[2 * q], f[2 * q + 1]);
++                    } else if constexpr (TY == 6) {   // Q5_0: (q - 16) d, the fifth bit from qh
++                        const uint8_t* bp = sg + (ch >> 2) * 22;   // d, qh[4], qs[16]
++                        const float d = __half2float(__ushort_as_half((uint16_t) (bp[0] | (bp[1] << 8))));
++                        const uint32_t qh = (uint32_t) bp[2] | ((uint32_t) bp[3] << 8) | ((uint32_t) bp[4] << 16) | ((uint32_t) bp[5] << 24);
++                        const int j0 = (ch & 3) * 8;
++                        float f[8];
++#pragma unroll
++                        for (int i = 0; i < 8; ++i) {
++                            const int j = j0 + i;
++                            const int q = j < 16 ? (bp[6 + j] & 0xF) | (((qh >> j) & 1) << 4) : (bp[6 + j - 16] >> 4) | (((qh >> j) & 1) << 4);
++                            f[i] = (float) (q - 16) * d;
++                        }
++#pragma unroll
++                        for (int q = 0; q < 4; ++q) v[q] = __floats2half2_rn(f[2 * q], f[2 * q + 1]);
+                     } else {
+                         const int bl = ch / 4, off = (ch % 4) * 8;
+                         const uint8_t* bp = sg + bl * 34;
+@@ -3243,7 +3317,8 @@ bool load(const std::string& path, Model& m, int ctx, int tmax, bool q8, int n_s
+         size_t sgu = 0, sd = 0;
+         const strata::TensorInfo* tgu = gm.find(nm("ffn_gate_up_exps.weight"), &sgu);
+         const strata::TensorInfo* td = gm.find(nm("ffn_down_exps.weight"), &sd);
+-        y.mma = (tgu->type == 40 || tgu->type == 8) && (td->type == 40 || td->type == 8) && N % kEN == 0 &&
++        y.mma = (tgu->type == 40 || tgu->type == 8 || tgu->type == 12 || tgu->type == 13 || tgu->type == 14) &&
++                (td->type == 40 || td->type == 8 || td->type == 6) && N % kEN == 0 &&
+                 hp.n_ff % (kEN / 2) == 0 && hp.n_ff % kEK == 0 && N % kEK == 0;
+         if (!K::native_expert_supported((int) tgu->type, (int) td->type, N, hp.n_ff)) {
+             err = nm("experts are ") + tgu->type_name() + "/" + td->type_name() +
+@@ -3305,7 +3380,7 @@ bool load(const std::string& path, Model& m, int ctx, int tmax, bool q8, int n_s
+         y.cx = CpuExperts{y.hblobs, y.stride, y.L.gu_row, y.L.d_row, y.L.up_off, y.L.down_off, y.L.tail_off,
+                           N, hp.n_ff, y.L.gu_type, y.L.d_type, hp.situ_beta, hp.situ_lb};
+         if (!y.all_on_gpu() && !cpu_experts_supported(y.L.gu_type, y.L.d_type)) {
+-            err = nm("experts") + ": only NVFP4 and Q8_0 experts can run from RAM (--experts-vram)";
++            err = nm("experts") + ": only NVFP4, Q8_0, Q4_K, Q5_K, Q6_K and Q5_0 experts can run from RAM (--experts-vram)";
+             return false;
+         }
+         ld.bytes[dv] += y.stride * (size_t) y.n_slots;
+@@ -3772,6 +3847,12 @@ struct Engine {
+             CK(cudaFuncSetAttribute(k_expert_mma<8, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) expert_smem<8>()));
+             CK(cudaFuncSetAttribute(k_expert_ws<40, true, 64, 128, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) expert_ws_smem<40, 64, 128>()));
+             CK(cudaFuncSetAttribute(k_expert_ws<40, false, 64, 128, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) expert_ws_smem<40, 64, 128>()));
++            CK(cudaFuncSetAttribute(k_expert_ws<12, true, 64, 128, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) expert_ws_smem<12, 64, 128>()));
++            CK(cudaFuncSetAttribute(k_expert_ws<6, false, 64, 128, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) expert_ws_smem<6, 64, 128>()));
++            CK(cudaFuncSetAttribute(k_expert_ws<8, true, 64, 128, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) expert_ws_smem<8, 64, 128>()));
++            CK(cudaFuncSetAttribute(k_expert_ws<8, false, 64, 128, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) expert_ws_smem<8, 64, 128>()));
++            CK(cudaFuncSetAttribute(k_expert_ws<13, true, 64, 64, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) expert_ws_smem<13, 64, 64>()));
++            CK(cudaFuncSetAttribute(k_expert_ws<14, true, 64, 64, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) expert_ws_smem<14, 64, 64>()));
+             CK(cudaFuncSetAttribute(k_expert_mma2<8, true, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) expert2_smem<8, 64>()));
+             CK(cudaFuncSetAttribute(k_expert_mma2<8, false, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) expert2_smem<8, 64>()));
+             CK(cudaFuncSetAttribute(k_attn_fa2<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kFaSmem));
+@@ -4131,7 +4212,10 @@ struct Engine {
+         const int hpm = L.L.d_type == 40 ? 1 : 0;
+         const int32_t* ngp = ng ? ng : D.n_groups;
+         k_tiles<<<1, 32, 0, D.st>>>(D.grp_start + g0, ngp, MR, D.tiles, D.n_tiles);
+-        if constexpr (TY == 40)
++        if constexpr (TY == 13 || TY == 14)   // (their super-blocks: 64 columns a block, so the buffers fit)
++            k_expert_ws<TY, GU, MR, 64, 32><<<dim3((unsigned) (n_cols / (GU ? 32 : 64)), gy), ws_threads<MR, 64, 32>(), expert_ws_smem<TY, MR, 64>(), D.st>>>(
++                X, D.grp_ptr + g0, D.grp_start + g0, ngp, w_off, row_bytes, K, hp.n_ff, L.L.tail_off, hp.situ_beta, hp.situ_lb, D.dg, D.hg, hp.n_embd, hpm, D.tiles, D.n_tiles);
++        else if constexpr (TY == 40 || TY == 12 || TY == 6 || TY == 8)
+             k_expert_ws<TY, GU, MR, 128, 32><<<dim3((unsigned) (n_cols / (GU ? 64 : 128)), gy), ws_threads<MR, 128, 32>(), expert_ws_smem<TY, MR, 128>(), D.st>>>(
+                 X, D.grp_ptr + g0, D.grp_start + g0, ngp, w_off, row_bytes, K, hp.n_ff, L.L.tail_off, hp.situ_beta, hp.situ_lb, D.dg, D.hg, hp.n_embd, hpm, D.tiles, D.n_tiles);
+         else
+@@ -4145,8 +4229,12 @@ struct Engine {
+         if (gather && L.L.gu_type == 40) k_gather_f16p<<<n_ent, kThreads, 0, D.st>>>(xn, D.ent_tok, D.xg, n_ent, N);
+         else if (gather) k_gather_f16<<<n_ent, kThreads, 0, D.st>>>(xn, D.ent_tok, D.xg, n_ent, N);
+         if (L.L.gu_type == 40) expert_mma<40, true>(D, L, D.xg, 0, L.L.gu_row, FF, N, g0, ng, grid_g);
++        else if (L.L.gu_type == 12) expert_mma<12, true>(D, L, D.xg, 0, L.L.gu_row, FF, N, g0, ng, grid_g);
++        else if (L.L.gu_type == 13) expert_mma<13, true>(D, L, D.xg, 0, L.L.gu_row, FF, N, g0, ng, grid_g);
++        else if (L.L.gu_type == 14) expert_mma<14, true>(D, L, D.xg, 0, L.L.gu_row, FF, N, g0, ng, grid_g);
+         else expert_mma<8, true>(D, L, D.xg, 0, L.L.gu_row, FF, N, g0, ng, grid_g);
+         if (L.L.d_type == 40) expert_mma<40, false>(D, L, D.hg, L.L.down_off, L.L.d_row, N, FF, g0, ng, grid_g);
++        else if (L.L.d_type == 6) expert_mma<6, false>(D, L, D.hg, L.L.down_off, L.L.d_row, N, FF, g0, ng, grid_g);
+         else expert_mma<8, false>(D, L, D.hg, L.L.down_off, L.L.d_row, N, FF, g0, ng, grid_g);
+     }
+     /// A prompt chunk's experts when some are in RAM: the routing read back, the groups ordered (the experts in VRAM,
+@@ -4875,6 +4963,22 @@ struct Engine {
+                 } else {
+                     K::native_expert_grouped(L.L, D->grp_ptr, D->grp_start, D->n_groups, D->ent_dst, D->ent_tok,
+                                              std::min(n_ent, hp.n_expert), n_ent, D->xq, D->escr, D->eparts, D->st);
++                    static int echk = 0;   // DEVDBG
++                    if (getenv("INK_EXPCHECK") && echk < 14 && !mr) {
++                        ++echk;
++                        const size_t no = (size_t) n_ent * N;
++                        std::vector<float> A(no), B(no);
++                        CK(cudaMemcpyAsync(A.data(), D->eparts, no * 4, cudaMemcpyDeviceToHost, D->st));
++                        K::iq_set_old_kernels(true);
++                        K::native_expert_grouped(L.L, D->grp_ptr, D->grp_start, D->n_groups, D->ent_dst, D->ent_tok,
++                                                 std::min(n_ent, hp.n_expert), n_ent, D->xq, D->escr, D->eparts, D->st);
++                        K::iq_set_old_kernels(false);
++                        CK(cudaMemcpyAsync(B.data(), D->eparts, no * 4, cudaMemcpyDeviceToHost, D->st));
++                        CK(cudaStreamSynchronize(D->st));
++                        double num = 0, den = 0;
++                        for (size_t j = 0; j < no; ++j) { num += (A[j] - B[j]) * (A[j] - B[j]); den += B[j] * B[j]; }
++                        std::fprintf(stderr, "EXPCHECK visit %d types %d/%d T=%d: rel rms diff %.3e\n", il, L.L.gu_type, L.L.d_type, T, std::sqrt(num / std::max(den, 1e-30)));
++                    }
+                     if (mr) k_fill_cpu_wait<<<n_ent, kThreads, 0, D->st>>>(D->eparts, D->ids, L.eptr, mr->out_h, mr->done, mr->seq, N);
+                     if (fconv) moe_parts = true;   // weighted in the conv's launch
+                     else k_combine<<<T, kThreads, 0, D->st>>>(D->eparts, D->ewts, hp.top_k, D->moe, N);
+-- 
+2.56.1
+

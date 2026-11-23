@@ -18,8 +18,13 @@ def end_token_ids(tokenizer) -> set[int]:
         got = tokenizer.encode(marker, parse_special=True)
         if len(got) == 1:
             ids.add(int(got[0]))
+    specials = getattr(tokenizer, "special_ids", None) or {}
     if not ids:
-        eos = (getattr(tokenizer, "special_ids", None) or {}).get("eos")
+        eos = specials.get("eos")
         if eos is not None:
             ids.add(int(eos))
+    # Inkling 2's end of turn was not <|im_end|>, so now the GGUF's eos / eot ids end a reply too
+    for key in ("tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id"):
+        if getattr(tokenizer, "pre", None) == "inkling2" and specials.get(key) is not None:
+            ids.add(int(specials[key]))
     return ids

@@ -112,6 +112,7 @@ from serve.server_parts.base import (  # noqa: F401  (moved unchanged, file spli
     STALL_IO_EPS_B,
     V1_V1_ALIASES,
     VISION_START,
+    INKLING_IMAGE,
     _timeout_env,
     engine_frozen,
     fit_floor,
@@ -1032,6 +1033,11 @@ class StrataEngine:
                 if sample is not None and self.proc is proc:
                     self.terminal_batch_sample = {**sample, "observed_monotonic": time.monotonic()}
                 continue                        # control telemetry never enters a request's token stream
+            if line.startswith("INFO ") and self.proc is proc:   # Inkling 2: its figures between requests (experts move)
+                for kv in line.split()[1:]:
+                    k, _, v = kv.partition("=")
+                    self.info[k] = int(v) if v.lstrip("-").isdigit() else v
+                continue
             if line.startswith("PSTAT"):
                 sample = parse_stage_in_flight_sample(line)
                 if sample is not None and self.proc is proc:
@@ -3994,6 +4000,8 @@ class Service:
     def set_family(self, family: str | None) -> None:
         """The model family (None: the Qwen form this server was written for)."""
         self.family = family
+        if family == "inkling2":
+            self._force_text = lambda force: None
         import serve.frontend as _frontend
         _frontend.use_family(family)
 
@@ -5056,8 +5064,10 @@ class Service:
                     if src.startswith(("http://", "https://")) else src
             images = [fetch(src) for src in images]
         if images:
-            pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
-            start = self.tok.encode(VISION_START, parse_special=True)[0]
+            # the template's marker pair: Qwen's <|vision_start|><|image_pad|>, Inkling 2's <|content_image|><|unused_200054|>
+            pad_text, start_text = INKLING_IMAGE if self.family == "inkling2" else (IMAGE_PAD, VISION_START)
+            pad = self.tok.encode(pad_text, parse_special=True)[0]
+            start = self.tok.encode(start_text, parse_special=True)[0]
             # Encode only while the engine is idle: the engine and the image encoder (a separate process) must not
             # run on the GPU at the same time - an encode during a running request left that request stuck at
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
@@ -5073,7 +5083,7 @@ class Service:
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
-            literal = self.tok.encode(IMAGE_PAD, parse_special=False)
+            literal = self.tok.encode(pad_text, parse_special=False)
             out, k = [], 0
             for j, t in enumerate(ids):
                 if t == pad and j > 0 and ids[j - 1] == start:
@@ -5283,6 +5293,8 @@ class Service:
              declared_only=False, deferred=False) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
+        if self.family == "inkling2":                   # its thinking was cut with Qwen's </think>, so now it is not cut
+            thinking, force = False, None
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
         # apps; the request's own fields win over all of them
         card = model_card_sampling(self.model_arch, thinking,
@@ -8511,8 +8523,9 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     svc.max_queue = max_queue
     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
-        svc.model_arch = cfg.get("arch") or "qwen4exp"
-        svc.set_family(None)
+        inkling = tcfg.get("pre") == "inkling2"         # Inkling 2 was read as a Qwen family, so now its tokenizer names it
+        svc.model_arch = "inkling2" if inkling else cfg.get("arch") or "qwen4exp"
+        svc.set_family("inkling2" if inkling else None)
         requested = cfg.get("parallel")
         if requested is None:
             args = cfg.get("args", [])

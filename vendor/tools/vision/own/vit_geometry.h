@@ -2,8 +2,10 @@
 //
 // Nothing about a Qwen tower is a constant in the code: layers, widths, heads, patch and merge sizes, the position grid, the output
 // width, the norm, the activation and the image limits all come from the file.  What the code does know is the list of *operations* a
-// tower may be made of (see supported()): today the Qwen3-VL family ("qwen3vl_merger": LayerNorm, fused QKV, 2D rotary, global
-// attention, a plain tanh-GELU MLP, a 2x2 merger).  A tower of that family with other numbers is a new file, not new code.
+// tower may be made of (see supported()): the Qwen3-VL family ("qwen3vl_merger": LayerNorm, fused QKV, 2D rotary, global
+// attention, a plain tanh-GELU MLP, a 2x2 merger), and on the CPU Inkling 2's ("inkling2v": a class token, separate q/k/v, layer
+// scale, 2D rotary on pairs, an erf-GELU MLP, a 2x2 merge into a two-layer projector).  A tower of a family with other numbers is a
+// new file, not new code.
 #pragma once
 
 #include "gguf_lite.h"
@@ -14,10 +16,12 @@
 namespace strata_vit {
 
 enum class NormKind { LayerNorm, RMSNorm };
+enum class Family { Qwen3VL, Inkling2V };
 enum class ActKind { GeluTanh, GeluErf, Silu, GeluQuick };
 
 struct VitGeometry {
     std::string projector;            // clip.projector_type
+    Family family = Family::Qwen3VL;  // inkling2v: Inkling2V, else Qwen3VL
     int layers = 0;                   // clip.vision.block_count
     int width = 0;                    // clip.vision.embedding_length
     int heads = 0;                    // clip.vision.attention.head_count
@@ -43,7 +47,7 @@ struct VitGeometry {
     int min_tokens = 8;               // the image's token limits (Qwen's preprocessor_config; --min-tokens / --max-tokens override)
     int max_tokens = 4096;
     int merger_in = 0;                // width * merge^2
-    int merger_hidden = 0;            // mm.0's output width
+    int merger_hidden = 0;            // mm.0's output width (inkling2v: mm.1's)
 
     // tokens a patch grid gives: (w / merge) * (h / merge) for a w x h patch grid
     int align() const { return patch * merge; }   // image sides are multiples of this
@@ -54,7 +58,10 @@ struct VitGeometry {
 // have is NOT an error here: from_gguf succeeds and supported() says why not.
 bool vit_geometry_from_gguf(const Gguf& gg, VitGeometry& g, std::string& err);
 
-// True when the operations this geometry needs are all implemented; otherwise `why` says which one is not.
+// True when the operations this geometry needs are all implemented (on every tower: the Qwen3-VL family); otherwise `why` says which one is not.
 bool vit_geometry_supported(const VitGeometry& g, std::string& why);
+
+// As vit_geometry_supported, for the CPU tower (VitCpu), which also reads Inkling 2's tower.
+bool vit_geometry_supported_cpu(const VitGeometry& g, std::string& why);
 
 }  // namespace strata_vit

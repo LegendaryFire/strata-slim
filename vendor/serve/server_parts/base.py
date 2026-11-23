@@ -87,6 +87,8 @@ EFFORT_TEXT = {"low": "Reasoning effort is set to low. Keep your thinking brief 
 
 
 VISION_START = "<|vision_start|>"
+# Inkling 2's image placeholder and the marker before it (its chat template: <|content_image|><|unused_200054|><|end_message|>)
+INKLING_IMAGE = ("<|unused_200054|>", "<|content_image|>")
 
 
 # #606: a reply that repeats one token this many times in a row is ended there ("length"): a model in a loop, or a

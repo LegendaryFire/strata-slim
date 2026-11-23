@@ -110,10 +110,17 @@ class Preparer:
 
         model = first_shard(self.paths.model)
         if gguf_architecture(model) in ("inkling2", "inkling2_loop"):
-            # Inkling 2 has its own engine path: the experts stay in the GGUF, and the drafters and picture reader are Qwen's
+            # Inkling 2 has its own engine path: the experts stay in the GGUF, the drafters are Qwen's; its picture reader
+            # is MMPROJ or the one beside the model, never downloaded (MMPROJ_REPO names Qwen's)
             self.build_tokenizer(model)
+            mmproj = None
+            if self.settings.vision_on:
+                given = self.settings.mmproj
+                mmproj = (given if given.exists() else None) if given else mmproj_near(model_folder)
+                if mmproj is None:
+                    raise SetupError("VISION is on and Inkling 2's mmproj was not found: set MMPROJ to it, or VISION=off")
             log.info("model ready")
-            return model, None
+            return model, mmproj
 
         mmproj = None
         if self.settings.vision_on:

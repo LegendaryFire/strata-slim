@@ -32,6 +32,41 @@ bool shape_is(const Gguf& gg, const std::string& name, std::initializer_list<int
     return true;
 }
 
+// Inkling 2's tower: a class token and its position, the patch embedding without a bias, a pre-norm, per layer LayerNorms, q / k / v
+// and the output with biases, layer scales ls1 / ls2, an erf-GELU MLP; no post-norm; the 2x2 merge into mm.1 (no bias), erf GELU, mm.2
+// (no bias).  The image limits are llama.cpp's for it (1 to 4,096 tokens), the rotary base 10,000.
+bool inkling2v_from_gguf(const Gguf& gg, VitGeometry& g, std::string& err) {
+    const int64_t W = g.width, F = g.ffn;
+    g.family = Family::Inkling2V;
+    g.act = ActKind::GeluErf;
+    g.norm = NormKind::LayerNorm;
+    g.rope_theta = 10000.0f;
+    g.min_tokens = 1;
+    g.max_tokens = 4096;
+    if (!shape_is(gg, "v.patch_embd.weight", {g.patch, g.patch, 3, W}, err) || !shape_is(gg, "v.class_embd", {W}, err) ||
+        !shape_is(gg, "v.class_position_embd.weight", {W}, err) || !shape_is(gg, "v.pre_ln.weight", {W}, err) || !shape_is(gg, "v.pre_ln.bias", {W}, err))
+        return false;
+    const GgufTensorInfo* pos = gg.tensor("v.position_embd.weight");
+    if (!pos || pos->ne.size() != 2 || pos->ne[0] != W) { err = "the vision projector's position table is missing or not [width, rows]"; return false; }
+    g.pos_grid = (int) std::lround(std::sqrt((double) pos->ne[1]));
+    if ((int64_t) g.pos_grid * g.pos_grid != pos->ne[1]) { err = "the position table's rows are not a square grid"; return false; }
+    for (int il = 0; il < g.layers; ++il) {
+        for (const char* n : {"ln1", "ln2"})
+            if (!shape_is(gg, blk(il, n, "weight"), {W}, err) || !shape_is(gg, blk(il, n, "bias"), {W}, err)) return false;
+        for (const char* n : {"ls1", "ls2"})
+            if (!shape_is(gg, blk(il, n, "weight"), {W}, err)) return false;
+        for (const char* n : {"attn_q", "attn_k", "attn_v", "attn_out"})
+            if (!shape_is(gg, blk(il, n, "weight"), {W, W}, err) || !shape_is(gg, blk(il, n, "bias"), {W}, err)) return false;
+        if (!shape_is(gg, blk(il, "ffn_up", "weight"), {W, F}, err) || !shape_is(gg, blk(il, "ffn_up", "bias"), {F}, err)) return false;
+        if (!shape_is(gg, blk(il, "ffn_down", "weight"), {F, W}, err) || !shape_is(gg, blk(il, "ffn_down", "bias"), {W}, err)) return false;
+    }
+    g.merger_in = (int) (W * g.merge * g.merge);
+    const GgufTensorInfo* m1 = gg.tensor("mm.1.weight");
+    if (!m1 || m1->ne.size() != 2 || m1->ne[0] != g.merger_in) { err = "the vision projector's mm.1.weight is missing or not [width * merge^2, hidden]"; return false; }
+    g.merger_hidden = (int) m1->ne[1];
+    return shape_is(gg, "mm.2.weight", {g.merger_hidden, g.out_dim}, err);
+}
+
 }  // namespace
 
 bool vit_geometry_from_gguf(const Gguf& gg, VitGeometry& g, std::string& err) {
@@ -40,7 +75,9 @@ bool vit_geometry_from_gguf(const Gguf& gg, VitGeometry& g, std::string& err) {
     if (!gg.get_str("general.architecture", arch) || arch != "clip") { err = "not an mmproj file (general.architecture is not clip)"; return false; }
     bool has_v = false;
     if (!gg.get_bool("clip.has_vision_encoder", has_v) || !has_v) { err = "the mmproj file has no vision encoder"; return false; }
-    if (!gg.get_str("clip.projector_type", g.projector) || g.projector.empty()) { err = "the mmproj file names no projector type"; return false; }
+    if ((!gg.get_str("clip.projector_type", g.projector) || g.projector.empty()) && !gg.get_str("clip.vision.projector_type", g.projector))
+        g.projector.clear();   // (Inkling 2's file names it under clip.vision)
+    if (g.projector.empty()) { err = "the mmproj file names no projector type"; return false; }
     if (!need_u32(gg, "clip.vision.block_count", g.layers, err) || !need_u32(gg, "clip.vision.embedding_length", g.width, err) ||
         !need_u32(gg, "clip.vision.attention.head_count", g.heads, err) || !need_u32(gg, "clip.vision.feed_forward_length", g.ffn, err) ||
         !need_u32(gg, "clip.vision.patch_size", g.patch, err) || !need_u32(gg, "clip.vision.projection_dim", g.out_dim, err))
@@ -76,6 +113,7 @@ bool vit_geometry_from_gguf(const Gguf& gg, VitGeometry& g, std::string& err) {
     }
 
     const int64_t W = g.width, F = g.ffn;
+    if (g.projector == "inkling2v") return inkling2v_from_gguf(gg, g, err);
     if (!shape_is(gg, "v.patch_embd.weight", {g.patch, g.patch, 3, W}, err) || !shape_is(gg, "v.patch_embd.bias", {W}, err)) return false;
     if (g.patch_taps == 2 && !shape_is(gg, "v.patch_embd.weight.1", {g.patch, g.patch, 3, W}, err)) return false;
     const GgufTensorInfo* pos = gg.tensor("v.position_embd.weight");
@@ -107,7 +145,15 @@ bool vit_geometry_from_gguf(const Gguf& gg, VitGeometry& g, std::string& err) {
     return true;
 }
 
+bool vit_geometry_supported_cpu(const VitGeometry& g, std::string& why) {
+    if (g.family != Family::Inkling2V) return vit_geometry_supported(g, why);
+    if (g.head_dim % 4 != 0) { why = "a head size that is not a multiple of 4 (the 2D rotary turns pairs in each half)"; return false; }
+    if (g.merge != 2) { why = "a merge size other than 2"; return false; }
+    return true;
+}
+
 bool vit_geometry_supported(const VitGeometry& g, std::string& why) {
+    if (g.family == Family::Inkling2V) { why = "Inkling 2's tower is read by the CPU picture reader only"; return false; }
     if (g.projector != "qwen3vl_merger") { why = "projector type " + g.projector + " is not one of this tower's families"; return false; }
     if (g.norm != NormKind::LayerNorm) { why = "RMS norm"; return false; }
     if (g.act != ActKind::GeluTanh) { why = "an activation other than the tanh GELU"; return false; }
