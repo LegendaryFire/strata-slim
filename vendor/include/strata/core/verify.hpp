@@ -229,6 +229,11 @@ public:
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
 
+    /// Is the last window's state change still undone (only `commit` / `pl_commit_async` advances it)?  False for a one-token
+    /// window that advanced the state itself (see commit), and on every stage of a chain.  serve_skip_stopped_window asks this
+    /// before it drops a window nobody will read.
+    bool commit_deferred() const;
+
     // ================================ SEVERAL SEQUENCES IN ONE WINDOW ================================
     //
     // A batch window holds S INDEPENDENT sequences, one token each: row s is slot s, at slot s's own position,
@@ -257,6 +262,10 @@ public:
     bool commit_slot_prefixes(const int* keep, std::string& err);
     /// --batch-mtp: slot rotation makes many row layouts, so bound the captured batch graph pairs (LRU). 0 = unbounded.
     void set_batch_graph_limit(size_t n) { batch_graph_limit_ = n; }
+    /// How many graphs every verifier of the process has instantiated so far (a window, a commit, a batch layout: each on
+    /// its first use, and again after an eviction).  A round timed across a change of this number held a capture, tens
+    /// of milliseconds that are not the round's cost: the pipelined slot groups' draft policy leaves such times out.
+    static uint64_t graphs_made() { return graphs_made_counter().load(std::memory_order_relaxed); }
 
     // ---- The stages of a layer split as a PIPELINE.  A batch window over the slot GROUP
     // [base, base + S) is launched on ONE stage with its commit right behind it on the stage's stream (a batch window
@@ -320,6 +329,10 @@ public:
     /// Waits for the last commit graph when commit() did not (an event recorded after it, not the whole device);
     /// false with `err` when it failed.  Free when nothing is pending.
     bool wait_commit(std::string& err);
+    /// #5188 (--prefill-head-alias): every captured window graph is destroyed, so the next window of each size captures
+    /// again and reads the buffers where they are now (the output head came back at another address).  Refuses (false)
+    /// while a prelaunched window is pending.  `dropped`: how many graphs were destroyed.
+    bool drop_window_graphs(int& dropped, std::string& err);
 
     // ---- PIPELINED WINDOWS (--pipeline-windows, a layer split on two GPUs).  One conversation's windows with the
     // stages overlapped: stage 0 runs window K+1 while stage 1 still runs window K.  The same window as `run`, driven
@@ -518,6 +531,10 @@ private:
     /// again when it is next used.
     bool instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, const std::vector<int>& key, const char* what,
                               std::string& err, int keep_t = -1, unsigned long long flags = 0);
+    static std::atomic<uint64_t>& graphs_made_counter() {   // graphs_made(): one count for the process
+        static std::atomic<uint64_t> n{0};
+        return n;
+    }
     /// Free the graph of the largest window size other than `keep_t` (and the prelaunched one); `evicted`: there was one.
     bool evict_window_graph(int keep_t, bool& evicted, std::string& err);
     bool no_window_eviction_ = false;   ///< capture_all wants every size at once: it must not free one to capture another
@@ -618,7 +635,7 @@ private:
     unsigned long long* trace_h_ = nullptr;
     unsigned long long* trace_m_ = nullptr;
     size_t trace_n_ = 0;
-    static constexpr int kProfPer = 33;              // stamps per layer (32 left the hc-read second
+    static constexpr int kProfPer = 34;              // stamps per layer (32 left the hc-read second
                                       // half's up-stamp at slot 32 = the next layer's slot 0: D8)
     bool prof_on_ = false;
     unsigned long long* prof_ = nullptr;              // device: n_layers * kProfPer + 4 stamps
@@ -691,6 +708,8 @@ private:
     cudaEvent_t tap_ev_ = nullptr;
     float* h_tap_ = nullptr;     float* m_tap_ = nullptr;       ///< the mapped copy of tap_dev_
     std::FILE* tap_file_ = nullptr;
+    bool tap_split_ = false;                      ///< STRATA_TAP_FILE on a layer split - this (first) stage gathers the chain's taps to the host
+    std::vector<float> tap_split_host_;           ///< [max_t][all taps][n_embd]
     void tap_write(int T, const int32_t* tokens, int64_t pos0);
     uint32_t* h_nf_ = nullptr;   uint32_t* m_nf_ = nullptr;     // #879: kVerifyMaxT * kNonfiniteBlocks flags
     int nf_row_ = -1;                     ///< nonfinite_row()

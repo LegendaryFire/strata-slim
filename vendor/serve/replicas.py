@@ -161,8 +161,8 @@ def _mem_available() -> int:
 def shared_arena_plan(cfg: dict, n_replicas: int, *, shm: str = "/dev/shm", platform: str | None = None,
                       environ=None, free_bytes=None, use_memfd: bool | None = None) -> tuple[str | None, str]:
     """(the file for --shared-expert-arena or None, a line for the log).  Opt-in: "replica_shared_arena": true (or
-    STRATA_REPLICA_SHARED_ARENA=1).  Only on Linux (the engine's MAP_SHARED backing), for Qwen's arena (not DeepSeek,
-    not the mapped or budgeted RAM modes, which have no arena), and with room in /dev/shm.  The engine checks the real
+    STRATA_REPLICA_SHARED_ARENA=1).  Only on Linux (the engine's MAP_SHARED backing), for Qwen's arena (not
+    the mapped or budgeted RAM modes, which have no arena), and with room in /dev/shm.  The engine checks the real
     size and reserves it before it loads (a tmpfs that is too small is an error at start, not a bus error later)."""
     environ = os.environ if environ is None else environ
     platform = sys.platform if platform is None else platform
@@ -183,7 +183,7 @@ def shared_arena_plan(cfg: dict, n_replicas: int, *, shm: str = "/dev/shm", plat
         for e in cfg["replicas"]:
             if isinstance(e, dict):
                 args += [str(a) for a in e.get("args") or []]
-    if cfg.get("arch") == "deepseek41" or any(a in args for a in ARENA_INCOMPATIBLE):
+    if any(a in args for a in ARENA_INCOMPATIBLE):
         return None, "shared expert arena: this model/config has no private expert arena to share; each replica as before"
     if use_memfd is None:
         use_memfd = hasattr(os, "memfd_create") and str(cfg.get("replica_shared_arena")).lower() != "devshm"
@@ -437,14 +437,30 @@ class ReplicaEngine:
         c = getattr(self.tl, "cur", None)
         if c is not None:
             return c.progress
-        return next((e.progress for e in self.engines if getattr(e, "progress", None)), None)
+        # #4636: the /metrics thread holds no tl.cur: read it off a replica with a request in flight (a finished one's value is stale)
+        return next((e.progress for k, e in enumerate(self.engines) if self.inflight[k] and getattr(e, "progress", None)), None)
 
     @property
     def prefill_tok_s_mean(self):
         c = getattr(self.tl, "cur", None)
         if c is not None:
             return c.prefill_tok_s_mean
-        return next((e.prefill_tok_s_mean for e in self.engines if getattr(e, "prefill_tok_s_mean", None)), None)
+        return next((e.prefill_tok_s_mean for k, e in enumerate(self.engines)
+                     if self.inflight[k] and getattr(e, "prefill_tok_s_mean", None) is not None), None)
+
+    @property
+    def reused(self):
+        """#4636: the running request's reused prefix: its own replica's, else one with a request in flight (never a finished one's)."""
+        c = getattr(self.tl, "cur", None)
+        if c is not None:
+            return c.reused
+        return next((e.reused for k, e in enumerate(self.engines) if self.inflight[k] and getattr(e, "reused", 0)), 0)
+
+    @property
+    def gen(self):
+        """#4636: the serving replica's engine process generation; the /metrics thread has no serving replica, so none."""
+        c = getattr(self.tl, "cur", None)
+        return c.gen if c is not None else None
 
     def alive(self) -> bool:
         return any(e.alive() for e in self.engines)

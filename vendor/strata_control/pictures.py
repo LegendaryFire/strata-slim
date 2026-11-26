@@ -21,6 +21,11 @@ with ``--output jsonl`` (one JSON line per progress step, a last line ``{"ok": t
 """
 
 from __future__ import annotations
+import sys
+if sys.platform == "win32":
+    # CPython 3.12's WMI helper (_wmi, behind platform.system() / uname()) takes an access violation in a worker thread when WMI refuses the
+    # account (0x80041003) and the caller has already gone (DIAG-WINHOST-0216). Without _wmi, platform uses the registry and the environment.
+    sys.modules["_wmi"] = None
 
 import argparse
 import json
@@ -100,7 +105,8 @@ def family_of(cfg: dict, gguf: Path | None, asked: str | None = None) -> str | N
         return asked.lower() if asked.lower() in PROJECTOR_BY_FAMILY else None
     arch = str(cfg.get("arch") or "").lower()
     names = [str(cfg.get("model_name") or "").lower(), (gguf.name.lower() if gguf else "")]
-    if arch == "deepseek41" or any("deepseek" in n for n in names) or "strata-dsv41" in str(cfg.get("exe") or "").lower():
+    from strata_control import retired
+    if retired.config_reason(cfg) or any("deepseek" in n for n in names):      # never a DeepSeek config (retired.py)
         return None
     if any(n.startswith("qwen3.6") or "qwen3.6-35b" in n for n in names):
         return None
@@ -146,6 +152,7 @@ def places(data: Path | None, gguf: Path | None, named: str | None, projector: P
         out.append(models_root(data) / projector.name)
     if gguf is not None:
         out += [gguf.parent / projector.name, gguf.parent.parent / projector.name]
+        out += renamed_copies(gguf, projector)
     seen: set[str] = set()
     unique = []
     for p in out:
@@ -154,6 +161,21 @@ def places(data: Path | None, gguf: Path | None, named: str | None, projector: P
             seen.add(key)
             unique.append(p)
     return unique
+
+
+def renamed_copies(gguf: Path, projector: Projector) -> list[Path]:
+    """Files in the model's own folder (and the folder above it) under ANOTHER name that have exactly the pinned size: the person's copy of the same
+    picture file (q38-mmproj-BF16.gguf). Only a candidate: ``whole`` takes it only when its SHA-256 is the pinned one, so a reader of another model
+    (other size, or the same size and other bytes) is never used and the pinned file is downloaded as before. Costs a directory listing."""
+    out: list[Path] = []
+    for folder in (gguf.parent, gguf.parent.parent):
+        try:
+            for p in sorted(folder.iterdir()):
+                if p.suffix.lower() == ".gguf" and p.name.lower() != projector.name.lower() and p.is_file() and p.stat().st_size == projector.size:
+                    out.append(p)
+        except OSError:
+            continue
+    return out
 
 
 def _mark(path: Path) -> Path:
@@ -336,7 +358,7 @@ def fetch(config_path: str | Path, *, engine_dir: str | Path, asked: str = "yes"
         out.parent.mkdir(parents=True, exist_ok=True)
         partial = out.with_name(out.name + ".part")
         try:
-            transfer.download(url, partial, size=projector.size, sha256=projector.sha256, cancel=cancel,
+            transfer.download(url, partial, size=projector.size, sha256=projector.sha256, cancel=cancel, what="the picture reader",
                               progress=lambda d, s: report("Downloading the picture files…", d, s))
         except transfer.ChecksumMismatch:
             raise PicturesError("checksum", f"{WORDS['checksum']} Try again.") from None

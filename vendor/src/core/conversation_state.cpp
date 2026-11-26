@@ -1,12 +1,14 @@
 #include "strata/core/conversation_snapshot.hpp"
 #include "conversation_checked.hpp"
 #include "conversation_copy.hpp"
+#include "conversation_trace.hpp"
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <future>
 #include <limits>
@@ -180,6 +182,10 @@ struct CkptAsync {
     int dev = -1;
 };
 CkptAsync& ckpt_async() { static CkptAsync a; return a; }
+std::atomic<void (*)(int)> ckpt_test_hook{nullptr};   // (conversation_checkpoint_test_hook: tests only)
+void ckpt_test_point(int point) {
+    if (void (*h)(int) = ckpt_test_hook.load(std::memory_order_acquire)) h(point);
+}
 // STRATA_CKPT_VRAM_SLOTS=N (with STRATA_CKPT_ASYNC): the last N saved GDN states stay in VRAM (allocated only while
 // more than 1.5 GB stays free); a restore of a checkpoint whose tag a slot holds copies device to device.
 struct VramSlot { void* p = nullptr; size_t n = 0; uint64_t tag = 0, used = 0; int dev = -1; };
@@ -267,15 +273,21 @@ int ckpt_gather_small(ConversationCheckpoint& c, const SessionState& ss, const C
     if (block_pos) std::memcpy(c.block_pos.data(), h + ple + tails + dead, block_pos);
     return 1;
 }
-}  // namespace
-
-void conversation_checkpoint_join(const void* only) {
-    CkptAsync& a = ckpt_async();
-    std::lock_guard<std::mutex> lk(a.mu);
+// the copy in flight (all of them: only == nullptr; else only the one writing `only`) has landed; the caller holds a.mu
+void join_locked(CkptAsync& a, const void* only) {
     if (a.pending.valid() && (only == nullptr || only == a.dst)) {
         const cudaError_t e = a.pending.get();
         if (e != cudaSuccess) std::fprintf(stderr, "strata: STRATA_CKPT_ASYNC: a checkpoint copy failed (%s)\n", cudaGetErrorString(e));
     }
+}
+}  // namespace
+
+void conversation_checkpoint_test_hook(void (*hook)(int point)) { ckpt_test_hook.store(hook, std::memory_order_release); }
+
+void conversation_checkpoint_join(const void* only) {
+    CkptAsync& a = ckpt_async();
+    std::lock_guard<std::mutex> lk(a.mu);
+    join_locked(a, only);
 }
 
 namespace {
@@ -298,12 +310,22 @@ bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const Mo
     static const bool atr = std::getenv("STRATA_PARK_TRACE") != nullptr;
     const bool ready = c.gdn.size() == z.gdn;   // (a pooled checkpoint's pages are in; a fresh vector faults them all)
     const auto r0 = std::chrono::steady_clock::now();
+    const long rf0 = atr ? conversation_trace::thread_minflt() : 0;
     c.gdn.resize(z.gdn); c.ple.resize(ss.ple_hist ? z.ple : 0);
     c.tails.resize(layers * z.tail); c.dead.resize(layers * z.dead); c.block_pos.resize(layers * z.block_pos);
-    if (atr) std::fprintf(stderr, "strata parktrace: save vectors %s, resize %.2f ms\n", ready ? "ready" : "fresh",
-        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - r0).count());
+    if (atr) std::fprintf(stderr, "strata parktrace: save vectors %s, resize %.2f ms, %ld faults, gdn %zu MB at %p (%s)\n", ready ? "ready" : "fresh",
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - r0).count(),
+        conversation_trace::thread_minflt() - rf0, c.gdn.size() >> 20, (const void*) c.gdn.data(), conversation_trace::where(c.gdn.data()));
     if (ckpt_async_on() && c.gdn.size() >= ((size_t) 1 << 20)) {
         CkptAsync& a = ckpt_async();
+        // #6075: one owner from here to the launch.  The staging buffer, its pinned twin, the stream and the VRAM slots
+        // are one set for the process, and a layer split saves its stages' parts on several threads: a save that resized
+        // or refilled the set between its join and its launch freed or overwrote what another stage's copy was about to
+        // read ("invalid resource handle", then a crash).  Under the lock the copy in flight lands first, then the set
+        // is resized, filled and handed to the new copy; the background copy itself takes no lock.
+        std::lock_guard<std::mutex> lk(a.mu);
+        join_locked(a, nullptr);
+        ckpt_test_point(1);
         int dev = 0;
         (void) cudaGetDevice(&dev);
         if (a.stage != nullptr && (a.cap < c.gdn.size() || a.dev != dev)) {
@@ -323,7 +345,9 @@ bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const Mo
         if (slot != nullptr) slot->tag = 0;   // (being rewritten)
         void* dsrc = slot != nullptr ? slot->p : a.stage;
         c.dev_tag = 0;
-        if (dsrc != nullptr && copy(dsrc, ss.gdn_state, c.gdn.size(), error)) {   // device to device: fast
+        // (a VRAM slot without the pinned buffer and stream - their allocation failed - has nowhere to copy to: plain copy)
+        if (dsrc != nullptr && a.host != nullptr && a.stream != nullptr &&
+            copy(dsrc, ss.gdn_state, c.gdn.size(), error)) {   // device to device: fast
             const auto q1 = std::chrono::steady_clock::now();
             if (slot != nullptr) {
                 VramSlots& v = vram_slots();
@@ -337,13 +361,14 @@ bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const Mo
             cudaStream_t st = a.stream;
             if (atr) std::fprintf(stderr, "strata parktrace: async ckpt d2d %.2f ms\n",
                 std::chrono::duration<double, std::milli>(q1 - q0).count());
-            std::lock_guard<std::mutex> lk(a.mu);
+            ckpt_test_point(3);
             // the DMA in 4 MiB pieces, one in flight: a D2H copy queues behind the one before it on the copy engine, and
             // the decode's own small reads would otherwise wait for the whole 100+ MB at the link's ~1.6 GB/s
             a.dst = dst;
             a.pending = std::async(std::launch::async, [dst, host, stage, n, st, dev] {
                 conversation_detail::background_thread_placement();
                 (void) cudaSetDevice(dev);
+                ckpt_test_point(2);
                 cudaEvent_t done = nullptr;
                 cudaError_t e = cudaEventCreateWithFlags(&done, cudaEventDisableTiming | cudaEventBlockingSync);
                 constexpr size_t PIECE = (size_t) 4 << 20;
@@ -391,15 +416,8 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
 
 bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionState& ss,
                                      const ModelGeometry& g, std::string& error) {
-    const VramSlot* hit = nullptr;
-    if (c.dev_tag != 0) {
-        int dev = 0;
-        (void) cudaGetDevice(&dev);
-        for (VramSlot& x : vram_slots().s)
-            if (x.tag == c.dev_tag && x.dev == dev && x.n == c.gdn.size()) { x.used = ++vram_slots().clock; hit = &x; }
-    }
-    if (hit == nullptr) conversation_checkpoint_join(c.gdn.data());
 #if defined(STRATA_GPU_METAL)
+    conversation_checkpoint_join(c.gdn.data());
     (void) g;
     if (!strata::metal_engine::window_checkpoint_restore(c, &ss, error)) return false;
     ss.ple_prev[0] = c.ids.size() >= 2 ? c.ids[c.ids.size() - 2] : -1;
@@ -410,8 +428,26 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
     ConversationStateSizes z;
     if (!conversation_session_sizes(g, ss, z, error)) return false;
     if (!sync(error)) return false;   // the copies below no longer ride the legacy stream's implicit ordering
-    if (!copy(ss.gdn_state, hit != nullptr ? hit->p : (const void*) c.gdn.data(), c.gdn.size(), error) ||
-        !copy(ss.ple_hist, c.ple.data(), c.ple.size(), error)) return false;
+    bool from_slot = false;
+    if (c.dev_tag != 0) {
+        // STRATA_CKPT_VRAM_SLOTS (#6075): looked up and read under the lock a save holds while it takes or refills a slot
+        CkptAsync& a = ckpt_async();
+        std::lock_guard<std::mutex> lk(a.mu);
+        int dev = 0;
+        (void) cudaGetDevice(&dev);
+        for (VramSlot& x : vram_slots().s)
+            if (x.tag == c.dev_tag && x.dev == dev && x.n == c.gdn.size()) {
+                x.used = ++vram_slots().clock;
+                if (!copy(ss.gdn_state, x.p, c.gdn.size(), error)) return false;
+                from_slot = true;
+                break;
+            }
+    }
+    if (!from_slot) {
+        conversation_checkpoint_join(c.gdn.data());
+        if (!copy(ss.gdn_state, c.gdn.data(), c.gdn.size(), error)) return false;
+    }
+    if (!copy(ss.ple_hist, c.ple.data(), c.ple.size(), error)) return false;
     for (size_t j = 0; j < owned_qsa(ss); ++j) {
         const auto& st = owned(ss, j);
         if (!copy(st.idx_tail, c.tails.data() + j * z.tail, z.tail, error) ||
@@ -481,7 +517,16 @@ bool conversation_snapshot_bytes(const ConversationView& view, const SessionStat
     for (uint64_t i = 0; i < qsa + (draft ? 1 : 0); ++i) {
         const auto& st = i == qsa ? *draft : owned(ss, (size_t) i);
         const size_t n = conversation_kv_bytes(st, g, upto, i != qsa);
-        if (!n || !add(bytes, n)) return fail(error, "invalid or overflowing K/V byte estimate");
+        if (!n || !add(bytes, n)) {
+            // #4384: say which part and why - the estimate itself only goes to zero; the capture's check has the reason
+            std::string why;
+            size_t unused = 0;
+            if (!n) (void) conversation_kv_capture_bytes(ConversationKv{}, st, g, upto, i != qsa, unused, why);
+            const std::string what = std::string("invalid or overflowing K/V byte estimate (") +
+                                     (i == qsa ? std::string("the draft part") : "layer " + std::to_string(i)) +
+                                     (why.empty() ? std::string() : ": " + why) + ")";
+            return fail(error, what.c_str());
+        }
     }
     return true;
 }
@@ -513,6 +558,7 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
 
 // (conversation_snapshot.cpp) STRATA_PARK_TRACE: conversation_kv_save's time since the park's begin, by part (ms)
 void conversation_kv_save_trace(double& attrs_ms, double& resize_ms, double& copy_ms);
+long conversation_kv_save_trace_faults();   // (E1) minor faults of the K/V buffer resizes of this park's saves
 
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view,
                                 const SessionState& ss, const ModelGeometry& g,
@@ -541,7 +587,13 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     }
     captured.live.ids = view.ids; captured.live.imgs = view.images;
     const auto p1 = now();
+    const long cf0 = ptr ? conversation_trace::thread_minflt() : 0;
     captured.cvec = view.cvec; captured.checkpoints = conversation_detail::copy_checkpoints_beating(view.checkpoints, storage);
+    const long ck_faults = ptr ? conversation_trace::thread_minflt() - cf0 : 0;
+    if (ptr)   // (E1: where each copied checkpoint's running state went: faults of the whole copy, address, heap or mapping)
+        for (const auto& c : captured.checkpoints)
+            std::fprintf(stderr, "strata parktrace: ckpt copy gdn %zu MB at %p (%s)\n", c.gdn.size() >> 20,
+                         (const void*) c.gdn.data(), conversation_trace::where(c.gdn.data()));
     if (moved != nullptr)
         for (auto& c : *moved) {
             conversation_checkpoint_join(c.gdn.data());
@@ -576,6 +628,7 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     const auto p4 = now();
     struct Abandon { bool on; ~Abandon() { if (on) conversation_park_async_abandon(); } } abandon{staged};
     double kv_max = 0, kv_sum = 0;   // (STRATA_PARK_TRACE: the per-layer save time)
+    const long kf0 = ptr ? conversation_trace::thread_minflt() : 0;
     for (size_t j = 0; j < layers; ++j) {
         const auto k0 = now();
         if (!conversation_kv_save(captured.kv[j], owned(ss, j), g, upto, true, error,
@@ -583,6 +636,7 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
         const double kt = ms(k0, now());
         kv_sum += kt; kv_max = std::max(kv_max, kt);
     }
+    const long kv_faults_total = ptr ? conversation_trace::thread_minflt() - kf0 : 0;
     if (ptr) {
         size_t kvb = 0;
         for (const auto& k : captured.kv) kvb += k.bytes();
@@ -592,6 +646,24 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
                              "begin %.1f ms, K/V %zu MB %.1f ms (layer max %.2f, sum %.2f; attrs %.2f, resize %.2f, copy %.2f)\n",
                      ms(pj, p0), ms(p0, p1), captured.checkpoints.size(), ms(p1, p2), ms(p2, p3), ms(p3, p4), kvb >> 20,
                      ms(p4, now()), kv_max, kv_sum, attrs_ms, resize_ms, copy_ms);
+        static const bool thp_said = [] {
+            std::fprintf(stderr, "strata parktrace: THP enabled %s; defrag %s; page size %ld; sbrk end %p\n",
+                         conversation_trace::sys_line("/sys/kernel/mm/transparent_hugepage/enabled").c_str(),
+                         conversation_trace::sys_line("/sys/kernel/mm/transparent_hugepage/defrag").c_str(),
+                         conversation_trace::page_size(), conversation_trace::brk_end());
+            return true;
+        }();
+        (void) thp_said;
+        // E1: page faults per phase (a 4 KiB first touch = 1, a 2 MiB huge page = 1).  (Not AnonHugePages: reading /proc/self/smaps_rollup
+        // walks the 47 GB expert mapping and costs ~0.5 s a read, which the first E1 job (e1, 11-11) put inside the park's own times.)
+        std::fprintf(stderr, "strata parktrace: faults: checkpoint copies %ld, K/V resize %ld (copy phase included in the layer loop: %ld)\n",
+                     ck_faults, conversation_kv_save_trace_faults(), kv_faults_total);
+        if (!captured.kv.empty()) {
+            const auto& k0 = captured.kv.front();
+            std::fprintf(stderr, "strata parktrace: K/V layer 0 buffers (bytes): k %zu v %zu k_scale %zu v_scale %zu pooled %zu; %zu layers; "
+                                 "segment %zu MiB\n", k0.k.size(), k0.v.size(), k0.k_scale.size(), k0.v_scale.size(), k0.pooled.size(),
+                         captured.kv.size(), ConversationBuffer::segment_bytes >> 20);
+        }
     }
     // The draft's final cell may not have been computed when the output cap was
     // reached. Refresh that page even when the main prefix continued unchanged.
@@ -621,7 +693,7 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
 
 bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
                                    const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
-                                   const QsaState& draft, std::string& error) {
+                                   const QsaState* draft, std::string& error) {
     if (!view_validate(view, ss, g, error) || !sync(error)) return false;
     SavedConversation captured;
     captured.geometry = geometry_key(g);
@@ -633,17 +705,17 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
     conversation_checkpoint_join(captured.live.gdn.data());
     const int64_t upto = (int64_t) view.ids.size();
     const size_t layers = owned_qsa(ss);
-    std::vector<SessionKvSource> out(layers + 1);
+    std::vector<SessionKvSource> out(layers + (draft ? 1 : 0));
     for (size_t j = 0; j < layers; ++j)
         if (!conversation_kv_source(out[j], owned(ss, j), g, upto, true, error)) return false;
-    if (!conversation_kv_source(out.back(), draft, g, upto, false, error)) return false;
+    if (draft && !conversation_kv_source(out.back(), *draft, g, upto, false, error)) return false;
     meta = std::move(captured);
     sources = std::move(out);
     return true;
 }
 
 bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& ss, const ModelGeometry& g,
-                                      const QsaState& draft, uint64_t max_tokens, uint64_t max_checkpoints,
+                                      const QsaState* draft, uint64_t max_tokens, uint64_t max_checkpoints,
                                       std::string& error) {
     ConversationStateSizes z;
     if (!conversation_session_sizes(g, ss, z, error)) return false;
@@ -657,18 +729,20 @@ bool conversation_session_read_limits(SessionReadLimits& limits, const SessionSt
     SessionReadLimits l = limits;   // keeps the caller's admit / progress / max_file_bytes
     l.max_tokens = tokens;
     l.max_checkpoints = max_checkpoints;
-    l.max_kv_layers = layers + 1;
+    l.max_kv_layers = layers + (draft ? 1 : 0);
     l.geometry = geometry_key(g);
     l.layer_range = std::make_pair(ss.layer_lo, ss.layer_hi);
     l.max_state_bytes = {z.gdn, ss.ple_hist ? z.ple : 0, tails, dead, block_pos};
-    l.max_kv_bytes.assign(layers + 1, {});
+    l.max_kv_bytes.assign(l.max_kv_layers, {});
     for (size_t j = 0; j < layers; ++j) {
         const auto& st = owned(ss, j);
         const int64_t upto = (int64_t) std::min<uint64_t>(tokens, (uint64_t) std::max<int64_t>(st.max_cells, 0));
         if (!conversation_kv_part_sizes(st, g, upto, true, l.max_kv_bytes[j], error)) return false;
     }
-    const int64_t dupto = (int64_t) std::min<uint64_t>(tokens, (uint64_t) std::max<int64_t>(draft.max_cells, 0));
-    if (!conversation_kv_part_sizes(draft, g, dupto, false, l.max_kv_bytes.back(), error)) return false;
+    if (draft) {
+        const int64_t dupto = (int64_t) std::min<uint64_t>(tokens, (uint64_t) std::max<int64_t>(draft->max_cells, 0));
+        if (!conversation_kv_part_sizes(*draft, g, dupto, false, l.max_kv_bytes.back(), error)) return false;
+    }
     limits = std::move(l);
     return true;
 }
@@ -707,6 +781,17 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
     if ((draft && !conversation_kv_restore(image.kv.back(), *draft, g, upto, false, error)) ||
         !conversation_checkpoint_restore(image.live, ss, g, error)) return ConversationRestore::transfer_failed;
     return ConversationRestore::restored;
+}
+
+bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                   const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
+                                   const QsaState& draft, std::string& error) {
+    return conversation_snapshot_sources(meta, sources, view, ss, g, &draft, error);
+}
+bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& ss, const ModelGeometry& g,
+                                      const QsaState& draft, uint64_t max_tokens, uint64_t max_checkpoints,
+                                      std::string& error) {
+    return conversation_session_read_limits(limits, ss, g, &draft, max_tokens, max_checkpoints, error);
 }
 
 // the draft layer's K/V included (the stage that owns the draft head, or no layer split)

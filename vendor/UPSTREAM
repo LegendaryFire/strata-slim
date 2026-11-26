@@ -1,5 +1,5 @@
-tag=v0.2.13
-commit=d2f096475817d4666c364c820b0ca830f751cfc5
-date=2026-11-08T23:44:23+01:00
-engine_version=0.1.59
+tag=v0.2.17
+commit=12d491da4a6904eb49aaa6f2f63ec4b1a17582e3
+date=2026-11-20T02:53:46+01:00
+engine_version=0.1.63
 llama_cpp_commit=3cf03257f219afbe7334045ff7c6a06ac68c627d

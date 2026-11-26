@@ -16,6 +16,12 @@ unrelated tensors - and a proxy may cut that to the requested length, so neither
 downloaded catches it (the drafter then accepts nothing, silently).  A range read therefore needs a 206 whose
 Content-Range is the range asked for, and every tensor of the pinned revision is checked against SHA256 below.
 """
+import sys
+if sys.platform == "win32":
+    # CPython 3.12's WMI helper (_wmi, behind platform.system() / uname()) takes an access violation in a worker thread when WMI refuses the
+    # account (0x80041003) and the caller has already gone (DIAG-WINHOST-0216). Without _wmi, platform uses the registry and the environment.
+    sys.modules["_wmi"] = None
+
 import argparse
 import collections
 import concurrent.futures
@@ -30,7 +36,7 @@ import urllib.error
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from strata_control import tls  # noqa: E402
+from strata_control import netpolicy, tls  # noqa: E402
 
 tls.install()       # #3722: the operating system's certificates
 
@@ -51,6 +57,8 @@ if (os.environ.get("STRATA_SOURCE") or "").strip().lower() in ("ms", "modelscope
     REPO = PINNED = MS_ENDPOINT + "/models/Qwen/Qwen3.8-Flash-Next/resolve/master/"
 DTYPE_BYTES = {"BF16": 2, "F16": 2, "F32": 4, "F8_E4M3": 1, "I64": 8, "I32": 4}
 BAD = 3                                             # `verify`'s exit code: a tensor is missing or corrupt
+NO_ANSWER = 4                                       # the server did not answer (the [X] lines say so; setup does not run it again)
+OFFLINE = 5                                         # this computer has no connection at all: setup goes on without the draft layer, the model starts (offline users)
 
 # #327: sha256 of every MTP tensor's bytes at PINNED_REVISION (two independent fetches agree, and 29 of them were read
 # again from that revision; the two expert tensors' first and last 16 MiB), so a mirror that ignored the
@@ -135,14 +143,26 @@ def _final(url):
     return hit[0] if hit and hit[1] > time.monotonic() else url
 
 
+_ANY_BYTES = [False]        # an answer has come in this run: from then on a server that stops answering is retried, not given up at once
+
+
+def _say_waiting(line):
+    print("  %s ..." % line, file=sys.stderr, flush=True)
+
+
 def get(url, start=None, end=None, retries=6):
+    """One range under the network rule (strata_control/netpolicy.py): each try waits at most 12 s, then 30 s, for the server's answer;
+    a server that never answered in this run, or a computer that is offline, stops the fetch at once (NetFailure, with the plain sentence);
+    after that a failed range is tried `retries` times."""
     for attempt in range(retries):
         try:
             used = _final(url)
             req = urllib.request.Request(used, headers={"User-Agent": "strata-mtp-fetch"})
             if start is not None:
                 req.add_header("Range", "bytes=%d-%d" % (start, end))
-            with urllib.request.urlopen(req, timeout=120) as r:
+            answer = netpolicy.open_url(netpolicy.urlopen, req, say=_say_waiting,
+                                        check_memory=not _ANY_BYTES[0])
+            with answer as r:
                 if start is not None:
                     check_range(r.status, r.headers.get("Content-Range"), start, end)
                 data = r.read()
@@ -152,10 +172,13 @@ def get(url, start=None, end=None, retries=6):
             if used == url and landed and landed != url:
                 with _cdn_lock:
                     _cdn[url] = (landed, time.monotonic() + CDN_TTL)
+            _ANY_BYTES[0] = True
             return data
         except Exception as e:  # network errors are retried, then surfaced
             with _cdn_lock:
                 _cdn.pop(url, None)
+            if isinstance(e, netpolicy.NetFailure) and (e.kind == "offline" or not _ANY_BYTES[0]):
+                raise                                   # nothing came in this run, or no connection at all: say so now
             if attempt == retries - 1:
                 raise
             time.sleep(min(2 ** attempt, 16))
@@ -215,13 +238,22 @@ def lock_folder(out, wait=900.0):
 
 
 def exit_with_parent():
-    """STRATA_EXIT_WITH_PARENT=1 (set by setup.py for the tools it runs): end when the process that started this one ends, so a cancelled
-    or killed setup does not leave a download running on its own (#3257: taskkill /T does not reach a grandchild whose parent is gone)."""
-    if (os.environ.get("STRATA_EXIT_WITH_PARENT") or "").strip() != "1":
+    """STRATA_EXIT_WITH_PARENT (set by setup.py to its own process id, and by the desktop shell to 1): end when the process that started
+    this one ends, so a cancelled or killed setup does not leave a download running on its own (#3257: taskkill /T does not reach a
+    grandchild whose parent is gone).  A number is the id to watch.  "1" means "whoever started me", read as our parent id, and is what
+    a spawner with nothing between us and the child should keep using: a venv's python.exe on Windows is a launcher that runs the real
+    interpreter as its own child, so there getppid() names a stub that lives exactly as long as we do, and a spawner that wants to be
+    followed has to say which id it is."""
+    raw = (os.environ.get("STRATA_EXIT_WITH_PARENT") or "").strip()
+    if raw == "1":                                          # "whoever started me": read the sentinel before the digits,
+        parent = os.getppid()                               # else "1" parses as pid 1 and the watch never arms at all
+    elif raw.isdigit():
+        parent = int(raw)
+    else:
         return
-    parent = os.getppid()
-    if parent <= 1:
+    if parent <= 1 or parent == os.getpid():                 # watching our own id would never end, and never fire
         return
+    direct = os.getppid()
     if os.name == "nt":
         import ctypes
         k32 = ctypes.windll.kernel32
@@ -232,7 +264,15 @@ def exit_with_parent():
             return                                           # no access (or already gone): nothing to watch
         gone = lambda: k32.WaitForSingleObject(h, 0) == 0
     else:
-        gone = lambda: os.getppid() != parent
+        def _alive(pid):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True                                  # it exists; it is not ours to signal
+            return True
+        gone = lambda: os.getppid() != direct or not _alive(parent)
 
     def watch():
         while not gone():
@@ -311,7 +351,7 @@ def resolve_repo():
     try:
         req = urllib.request.Request(REPO + "model.safetensors.index.json", method="HEAD",
                                      headers={"User-Agent": "strata-mtp-fetch"})
-        urllib.request.urlopen(req, timeout=120).close()
+        netpolicy.open_url(netpolicy.urlopen, req, say=_say_waiting).close()
     except urllib.error.HTTPError as e:
         if e.code == 404 and "/resolve/%s/" % REVISION in REPO:
             if (os.environ.get("STRATA_ALLOW_UNPINNED") or "").strip() != "1":
@@ -473,11 +513,16 @@ def verify(out):
 
 
 def main():
+    global REPO
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["inventory", "fetch", "verify"])
     ap.add_argument("--out", required=True)
     ap.add_argument("--only")
+    ap.add_argument("--repo", help="the BF16 checkpoint's resolve base URL to read the MTP tensors from (default: the pinned Qwen/Qwen3.8-Flash-Next revision); "
+                                   "a finetune that keeps them in its own repo, e.g. https://huggingface.co/<user>/<finetune>/resolve/main/ - its tensors are not checked against the pinned SHA256")
     a = ap.parse_args()
+    if a.repo:
+        REPO = a.repo if a.repo.endswith("/") else a.repo + "/"
     if a.cmd == "verify":                           # offline: the hashes are the pinned revision's
         bad = verify(a.out)
         for name in bad:
@@ -485,8 +530,13 @@ def main():
         sys.exit(BAD if bad else 0)
     exit_with_parent()
     lock = lock_folder(a.out) if a.cmd == "fetch" else None
-    resolve_repo()
-    inventory(a.out) if a.cmd == "inventory" else fetch(a.out, a.only)
+    try:
+        resolve_repo()
+        inventory(a.out) if a.cmd == "inventory" else fetch(a.out, a.only)
+    except netpolicy.NetFailure as e:                # the server did not answer, or no connection: one plain sentence, not a traceback
+        print("  [X]  " + e.headline("the draft layer"), file=sys.stderr)
+        print("       " + e.next_step(), file=sys.stderr)
+        sys.exit(OFFLINE if e.kind == "offline" else NO_ANSWER)
     if lock:
         lock.close()
 

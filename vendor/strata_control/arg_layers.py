@@ -76,7 +76,7 @@ def layer(cfg: dict, explicit: Mapping[str, Any] | None = None, prev: Mapping[st
           bool_flags: frozenset[str] = tune_knobs.BOOL_FLAGS) -> dict:
     """Put the four sources over each other in ``cfg`` (in place; ``cfg["args"]`` is the generated layer on entry).
     ``explicit``: the launch's own options as ``tune_knobs.apply_to_argv`` changes (value, True for present, None for off).
-    ``prev``: the config this launch wrote last time (or None). ``bool_flags``: the engine's valueless switches (DeepSeek's --mmap-experts takes a word). Returns {"calibrated": bool, "persisted": [...], "explicit": [...]}."""
+    ``prev``: the config this launch wrote last time (or None). ``bool_flags``: the engine's valueless switches. Returns {"calibrated": bool, "persisted": [...], "explicit": [...]}."""
     explicit = dict(explicit or {})
     args = [str(a) for a in cfg.get("args") or []]
     # 3. calibrated values over the generated ones
@@ -106,6 +106,31 @@ def layer(cfg: dict, explicit: Mapping[str, Any] | None = None, prev: Mapping[st
         cfg.pop(EXPLICIT_KEY, None)
     return {"calibrated": bool(rec), "persisted": [user_args.flag_of(g) for g in user_args.groups(mine) if user_args.flag_of(g) and user_args.flag_of(g) not in explicit],
             "explicit": sorted(explicit)}
+
+
+#: the answer of ``sources`` for a flag no layer above "Auto" holds is simply not listed
+SOURCE_LAUNCH, SOURCE_YOURS, SOURCE_CALIBRATED, SOURCE_TUNED = "launch", "yours", "calibrated", "tuned"
+
+
+def sources(cfg: Mapping[str, Any], tuned_flags: Any = ()) -> dict[str, str]:
+    """Where each non-automatic option of a run config's ``"args"`` comes from (#5351): ``"launch"`` (this command line's own values), ``"yours"`` (the person's
+    standing options: ``"user_args"``), ``"calibrated"`` (``engine calibrate --apply-result``), ``"tuned"`` (the active saved tuning, ``tuned_flags``). The
+    same order as ``layer``; an option none of them holds is the generated one and is not listed. Read-only."""
+    flags = [user_args.flag_of(g) for g in user_args.groups(cfg.get("args"))]
+    explicit = {str(f) for f in cfg.get(EXPLICIT_KEY) or []}
+    mine = {user_args.flag_of(g) for g in user_args.groups(cfg.get(user_args.USER_KEY))}
+    rec = cfg.get(CALIBRATED_KEY)
+    calibrated = {str(k) for k in (rec.get("settings") or {})} if isinstance(rec, dict) and _calibration_fits(rec, cfg) else set()
+    tuned = {str(f) for f in tuned_flags}
+    out: dict[str, str] = {}
+    for flag in flags:
+        if not flag or flag in out:
+            continue
+        for key, held in ((SOURCE_LAUNCH, explicit), (SOURCE_YOURS, mine), (SOURCE_CALIBRATED, calibrated), (SOURCE_TUNED, tuned)):
+            if flag in held:
+                out[flag] = key
+                break
+    return out
 
 
 def stamp(cfg: dict) -> None:

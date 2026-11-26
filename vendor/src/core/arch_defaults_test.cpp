@@ -2,13 +2,17 @@
 #include "strata/core/arch_defaults.hpp"
 #include "strata/core/gfx12_platform_defaults.hpp"
 #include "strata/core/sm120_series.hpp"
+#include "strata/core/bw_dense_defaults.hpp"
 #include "strata/core/defaults_026.hpp"
+#include "strata/prefill/pf_fused_override.hpp"
+#include "strata/prefill/own_only_switches.hpp"
 #include "strata/core/spill_gate.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { std::printf("FAIL line %d: %s\n", __LINE__, #c); ++fails; } } while (0)
@@ -265,7 +269,7 @@ int main() {
         // 0.2.8: Strix Halo (gfx1151, integrated) gets the matrix-core prompt set on Windows; the 780M and the 890M are
         // not measured there and stay off
         const bool win_on = m.expect_on && m.integrated && std::string(m.gcn).rfind("gfx1151", 0) == 0;
-        CHECK(igpu_default_env(m.gcn, m.integrated).size() == (win_on ? 8u : 0u));
+        CHECK(igpu_default_env(m.gcn, m.integrated).size() == (win_on ? 9u : 0u));
 #else
         CHECK(igpu_default_env(m.gcn, m.integrated).size() == (want ? 5u : 0u));
 #endif
@@ -276,6 +280,8 @@ int main() {
     for (const char* k : {"STRATA_HIP_WMMA", "STRATA_PF_GEMM", "STRATA_PA_FAST", "STRATA_SELECT_WMMA", "STRATA_HC_UPMIX"}) unset(k);
     CHECK(apply_arch_defaults("gfx1150", true).empty());           // 880M / 890M: no hardware, stays as it was
     for (const char* k : {"STRATA_HIP_WMMA", "STRATA_PF_GEMM", "STRATA_PA_FAST", "STRATA_SELECT_WMMA", "STRATA_HC_UPMIX"}) unset(k);
+    CHECK(std::getenv("STRATA_PF_FUSED") != nullptr);              // the Linux integrated gfx11 class also took the fused prompt experts (silent; igpu_fused_prompt_default)
+    unset("STRATA_PF_FUSED");
 #endif
     // the off switches
     put("STRATA_IGPU_PROMPT_SET", "0");
@@ -299,10 +305,10 @@ int main() {
 #if defined(_WIN32)
             halo_win = std::string(m.gcn).rfind("gfx1151", 0) == 0;
 #endif
-            CHECK(t.size() == (halo_win ? 8u : 5u));
+            CHECK(t.size() == (halo_win ? 9u : 5u));
             std::vector<const char*> want = {"STRATA_HIP_WMMA", "STRATA_PF_GEMM", "STRATA_PA_FAST", "STRATA_HC_UPMIX"};
             want.push_back("STRATA_SELECT_WMMA");
-            if (halo_win) { want.push_back("STRATA_PF_FUSED"); want.push_back("STRATA_PF_F16"); want.push_back("STRATA_PF_DM16"); }
+            if (halo_win) { want.push_back("STRATA_PF_FUSED"); want.push_back("STRATA_PF_F16"); want.push_back("STRATA_PF_DM16"); want.push_back("STRATA_PF_P1A"); }
             for (const char* w : want) {
                 bool found = false;
                 for (const auto& kv : t) found = found || (kv.first == w && kv.second == "1");
@@ -368,20 +374,20 @@ int main() {
     CHECK(!igpu_prompt_set_enabled("gfx1103", true));
     {
         const auto t = igpu_default_env("gfx1151", true);
-        CHECK(t.size() == 8);
+        CHECK(t.size() == 9);
         auto has = [&t](const char* k) {
             for (const auto& kv : t) if (kv.first == k) return kv.second == "1";
             return false;
         };
         CHECK(has("STRATA_HIP_WMMA") && has("STRATA_PF_GEMM") && has("STRATA_PA_FAST") && has("STRATA_HC_UPMIX") &&
-              has("STRATA_PF_FUSED") && has("STRATA_SELECT_WMMA") && has("STRATA_PF_F16") && has("STRATA_PF_DM16"));
+              has("STRATA_PF_FUSED") && has("STRATA_SELECT_WMMA") && has("STRATA_PF_F16") && has("STRATA_PF_DM16") && has("STRATA_PF_P1A"));
         CHECK(igpu_default_env("gfx1151", false).empty());   // a gfx1151 reported as a discrete card
         CHECK(igpu_default_env("gfx1150", true).empty());    // 890M: unchanged
         CHECK(igpu_default_env("gfx1103", true).empty());    // 780M on Windows: unchanged
     }
     {
         const char* halo[] = {"STRATA_HIP_WMMA", "STRATA_PF_GEMM", "STRATA_PA_FAST", "STRATA_HC_UPMIX", "STRATA_PF_FUSED",
-                              "STRATA_SELECT_WMMA", "STRATA_PF_F16", "STRATA_PF_DM16"};
+                              "STRATA_SELECT_WMMA", "STRATA_PF_F16", "STRATA_PF_DM16", "STRATA_PF_P1A"};
         for (const char* k : halo) unset(k);
         const auto set = apply_arch_defaults("gfx1151", true);
         for (const char* k : halo) {
@@ -408,6 +414,95 @@ int main() {
         put("STRATA_GFX1151_DEFAULTS", "0");   // back to the state this block found (the 026 checks below rely on it)
     }
 #endif
+    // the registered arena asks for no transparent huge pages on an integrated gfx11 GPU under Linux (780M, 880M / 890M, Strix Halo),
+    // detected from the device (integrated + arch), with or without the target-feature suffix; never on Windows, never on a discrete card
+    for (const char* g : {"gfx1103", "gfx1150", "gfx1151", "gfx1103:sramecc-:xnack-", "gfx1151:sramecc+:xnack-"}) {
+        CHECK(igpu_arena_no_thp_default(g, true, false));
+        CHECK(!igpu_arena_no_thp_default(g, true, true));     // Windows: unchanged
+        CHECK(!igpu_arena_no_thp_default(g, false, false));   // not integrated
+    }
+    for (const char* g : {"gfx1152", "gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201", "gfx1030", "gfx1036", "gfx11030", "gfx11031", "", "gfx90a"})
+        CHECK(!igpu_arena_no_thp_default(g, true, false));
+    // the wait before READY (kfd_settle.hpp) is for the same class: integrated gfx1103 / gfx1150 / gfx1151 under Linux, nothing else
+    for (const char* g : {"gfx1103", "gfx1150", "gfx1151", "gfx1103:sramecc-:xnack-"}) {
+        CHECK(igpu_kfd_settle_default(g, true, false));
+        CHECK(!igpu_kfd_settle_default(g, true, true));     // Windows
+        CHECK(!igpu_kfd_settle_default(g, false, false));   // not integrated
+    }
+    for (const char* g : {"gfx1100", "gfx1201", "gfx90a", "gfx1030", "gfx1152", ""}) CHECK(!igpu_kfd_settle_default(g, true, false));
+    // the file-cache give-back during and after the expert load (page_cache_drop.hpp): the same class
+    for (const char* g : {"gfx1103", "gfx1150", "gfx1151", "gfx1103:sramecc-:xnack-"}) {
+        CHECK(igpu_cache_drop_default(g, true, false));
+        CHECK(!igpu_cache_drop_default(g, true, true));     // Windows
+        CHECK(!igpu_cache_drop_default(g, false, false));   // not integrated
+    }
+    for (const char* g : {"gfx1100", "gfx1201", "gfx90a", "gfx1030", "gfx1152", ""}) CHECK(!igpu_cache_drop_default(g, true, false));
+    // the fused int8 prompt experts (STRATA_PF_FUSED=1 instead of llama.cpp's MMQ): the same class again, nothing else
+    for (const char* g : {"gfx1103", "gfx1150", "gfx1151", "gfx1103:sramecc-:xnack-", "gfx1151:sramecc+:xnack-"}) {
+        CHECK(igpu_fused_prompt_default(g, true, false));
+        CHECK(!igpu_fused_prompt_default(g, true, true));     // Windows: gfx1151 has it in igpu_default_env, the others unchanged
+        CHECK(!igpu_fused_prompt_default(g, false, false));   // not integrated
+    }
+    for (const char* g : {"gfx1152", "gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201", "gfx1030", "gfx1031", "gfx11030", "", "gfx90a"})
+        CHECK(!igpu_fused_prompt_default(g, true, false));
+#if !defined(_WIN32)
+    {   // apply: nothing set -> STRATA_PF_FUSED=1 on the class, =0 (the way back) and =1 as the user set them are kept, other devices get nothing
+        unset("STRATA_PF_FUSED");
+        apply_arch_defaults("gfx1100", false);
+        CHECK(std::getenv("STRATA_PF_FUSED") == nullptr);       // discrete
+        apply_arch_defaults("gfx1103", false);
+        CHECK(std::getenv("STRATA_PF_FUSED") == nullptr);       // a mixed box (iGPU + dGPU)
+        apply_arch_defaults("gfx1201", false);
+        CHECK(std::getenv("STRATA_PF_FUSED") == nullptr);
+        apply_arch_defaults("gfx1152", true);
+        CHECK(std::getenv("STRATA_PF_FUSED") == nullptr);
+        apply_arch_defaults("gfx1103", true);
+        CHECK(std::getenv("STRATA_PF_FUSED") != nullptr && std::string(std::getenv("STRATA_PF_FUSED")) == "1");
+        put("STRATA_PF_FUSED", "0");
+        apply_arch_defaults("gfx1150", true);
+        CHECK(std::string(std::getenv("STRATA_PF_FUSED")) == "0");   // the way back is kept
+        unset("STRATA_PF_FUSED");
+        apply_arch_defaults("gfx1150", true);
+        CHECK(std::getenv("STRATA_PF_FUSED") != nullptr && std::string(std::getenv("STRATA_PF_FUSED")) == "1");
+        unset("STRATA_PF_FUSED");
+        for (const char* k : {"STRATA_HIP_WMMA", "STRATA_PF_GEMM", "STRATA_PA_FAST", "STRATA_SELECT_WMMA", "STRATA_HC_UPMIX"}) unset(k);
+    }
+#endif
+    // STRATA_HIP_PROMPT_F16 (gemm.cu prompt_f16): "1" = on anywhere, any other set value = off (the way back), unset = on for the Linux integrated 780M and
+    // (#5151) for a discrete RX 6000 card (gfx1030 / gfx1031 / gfx1032, Linux and Windows)
+    for (const char* g : {"gfx1030", "gfx1031", "gfx1032", "gfx1031:xnack-"}) {
+        CHECK(prompt_f16_resolve(nullptr, g, false, false));
+        CHECK(prompt_f16_resolve(nullptr, g, false, true));     // Windows too
+        CHECK(!prompt_f16_resolve(nullptr, g, true, false));    // an integrated part of that name: not the measured class
+        CHECK(!prompt_f16_resolve("0", g, false, false));       // the way back
+        CHECK(!prompt_f16_resolve("", g, false, false));
+        CHECK(prompt_f16_resolve("1", g, false, false));
+    }
+    for (const char* g : {"gfx1103", "gfx1103:sramecc-:xnack-"}) {
+        CHECK(prompt_f16_resolve(nullptr, g, true, false));
+        CHECK(!prompt_f16_resolve(nullptr, g, true, true));     // Windows
+        CHECK(!prompt_f16_resolve(nullptr, g, false, false));   // a discrete card of that name / a mixed report
+        CHECK(!prompt_f16_resolve("0", g, true, false));        // the way back
+        CHECK(!prompt_f16_resolve("", g, true, false));
+        CHECK(prompt_f16_resolve("1", g, true, false));
+    }
+    for (const char* g : {"gfx1150", "gfx1151", "gfx1152", "gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201", "gfx1034", "gfx1035", "gfx1036", "gfx10300", "gfx11030", "", "gfx90a"}) {
+        CHECK(!prompt_f16_resolve(nullptr, g, true, false));    // unchanged: opt-in
+        CHECK(!prompt_f16_resolve(nullptr, g, false, false));
+        CHECK(prompt_f16_resolve("1", g, false, false));        // =1 still turns it on anywhere
+        CHECK(!prompt_f16_resolve("0", g, true, false));
+    }
+    CHECK(!prompt_f16_resolve(nullptr, nullptr, true, false));
+    // STRATA_NO_ARENA_THP: unset = the device rule decides; "0" = ask for the huge pages (also on such a device); any other value = skip them
+    CHECK(arena_skip_thp_request(nullptr, false, true));      // integrated gfx11, nothing set: skipped
+    CHECK(!arena_skip_thp_request(nullptr, false, false));    // any other device, nothing set: requested (as before)
+    CHECK(!arena_skip_thp_request("0", false, true));         // the user asks for them on the integrated gfx11
+    CHECK(!arena_skip_thp_request("0", false, false));
+    CHECK(arena_skip_thp_request("1", false, false));         // =1 skips on any device (as before)
+    CHECK(arena_skip_thp_request("1", false, true));
+    CHECK(arena_skip_thp_request("", false, false));          // set but empty: skipped, as before
+    CHECK(arena_skip_thp_request(nullptr, true, false));      // THP "always": never requested (#771)
+    CHECK(arena_skip_thp_request("0", true, true));
     // 021-minipc: UMA mode is NOT a default (slower, resets not fixed): off with nothing asked; the logic below runs with on=true
     CHECK(!kIgpuUmaArenaDefaultOn);
     CHECK(!igpu_uma_arena_default("gfx1103", true, false));
@@ -447,12 +542,28 @@ int main() {
         CHECK(route_prior_default(false, false, 8.0 * GiB, true) == 0.0f);
         // an explicit STRATA_ROUTE_PRIOR=1.5 wins over 026 as well
         CHECK(route_prior_resolve("1.5", false, false, 12.0 * GiB, true) == 1.5f);
+        // the window warm-up (#6171): on by default, off while the route prior is on (the dummy token's paged-in experts bend the first request), the variable decides when set
+        CHECK(window_warm_on(nullptr, 0.0f));
+        CHECK(!window_warm_on(nullptr, 1.5f));
+        CHECK(window_warm_on(nullptr, route_prior_resolve(nullptr, false, false, 12.0 * GiB)));   // nothing set: the prior is off, the warm-up stays
+        CHECK(!window_warm_on(nullptr, route_prior_resolve("1.5", false, false, 12.0 * GiB)));
+        CHECK(window_warm_on(nullptr, route_prior_resolve("0", false, false, 12.0 * GiB)));
+        CHECK(!window_warm_on("0", 0.0f) && !window_warm_on("0", 1.5f));
+        CHECK(window_warm_on("1", 1.5f) && window_warm_on("1", 0.0f));
         // the wide HC up read: on for a 12.0 card on CUDA, off under 026, off in HIP, off on sm_86 / sm_121
         CHECK(gr_up_wide_default(false, 12, 0));
         CHECK(!gr_up_wide_default(false, 12, 0, true));
         CHECK(!gr_up_wide_default(true, 12, 0));
         CHECK(!gr_up_wide_default(false, 8, 6));
-        CHECK(!gr_up_wide_default(false, 12, 1));
+        CHECK(gr_up_wide_default(false, 12, 1) == kGb10GrUpWide);          // GB10: the BW-7 constant (the 12.0 rule is the line above)
+        // BW-7: the 12.0 set on a GB10 (sm_121): per-switch constants, STRATA_SM121_PERF (unset here) and STRATA_DEFAULTS=026 turn them off; 12.0 and the rest unchanged
+        CHECK(sm12x_default_v(12, 0, false, false) && sm12x_default_v(12, 0, true, false));
+        CHECK(!sm12x_default_v(12, 1, false, false));
+        CHECK(sm12x_default_v(12, 1, true, false));
+        CHECK(!sm12x_default_v(12, 1, true, true));
+        CHECK(!sm12x_default_v(8, 6, true, false) && !sm12x_default_v(10, 0, true, false) && !sm12x_default_v(7, 5, true, false));
+        CHECK(small_unr_default(12, 0) == 3 && small_unr_default(12, 1) == (kGb10SmallUnr ? 3 : 0) && small_unr_default(8, 6) == 0);
+        CHECK(gr_v3_pf_default(12, 0) == 133 && gr_v3_pf_default(12, 1) == (kGb10GrV3Pf ? 133 : 0) && gr_v3_pf_default(8, 6) == 0);
         // #3453: the sm_89 MMVQ-IL tables: on by default for compute capability 8.9 only, off under 026 and in HIP; "1" and "0" win
         CHECK(mmvq_il_89_default(false, 89));
         CHECK(!mmvq_il_89_default(false, 86) && !mmvq_il_89_default(false, 80) && !mmvq_il_89_default(false, 90) &&
@@ -543,7 +654,9 @@ int main() {
         CHECK(!gr_v3_default(false, 8, 6, false, 15.7 * GiB));              // 2x RTX A4000 (sm_86): measured -3.0% / -5.9%
         CHECK(!gr_v3_default(false, 8, 6, false, 72.0 * GiB));              // any sm_86
         CHECK(!gr_v3_default(false, 8, 9, false, 24.0 * GiB));              // sm_89
-        CHECK(!gr_v3_default(false, 12, 1, false, 128.0 * GiB));            // sm_121 (DGX Spark class): not 12.0
+        CHECK(gr_v3_default(false, 12, 1, true, 128.0 * GiB) == kGb10GrV3);  // sm_121 (DGX Spark class, integrated): the BW-7 constant; never on without it
+        CHECK(!gr_v3_default(false, 12, 1, true, 128.0 * GiB, true));       // STRATA_DEFAULTS=026 turns it off there too
+        CHECK(!gr_v3_default(false, 12, 0, true, 128.0 * GiB));             // an integrated 12.0 part: still off (unchanged)
         CHECK(!gr_v3_default(false, 12, 0, true, 128.0 * GiB));             // integrated
         CHECK(!gr_v3_default(true, 12, 0, false, 32.0 * GiB));              // a HIP build: gfx1201 reports 12.0 too
         CHECK(!gr_v3_default(false, 6, 0, false, 16.0 * GiB));              // P100
@@ -584,6 +697,52 @@ int main() {
         CHECK(sc(2048, false, 1, true, false, false, true).fused_off);      // STRATA_PREFILL_LAYER_MAJOR named: the walk is theirs ...
         CHECK(!sc(2048, false, 1, true, false, false, true).layer_major);   // ... the expert path still follows the rule
         CHECK(!sc(2048, false, 1, true, false, true, true).any());          // both named: nothing changes
+    }
+    {
+        using namespace strata;
+        // the small-card path over the card sizes of the measured grid (RTX A4000 held to N MiB free, IQ2_XS, no MTP; default chunk the rule sees):
+        // where it fires, and what it does with the fused kernels (on, unless STRATA_PF_SMALL_FUSED=0)
+        struct Row { long long mib, dflt; bool fires; };
+        const Row rows[] = {{7000, 2048, true}, {8000, 4096, true}, {8500, 5120, true}, {9000, 6144, true}, {9500, 7168, true},
+                            {10000, 8192, false}, {12000, 12288, false}, {16376, 20480, false}};
+        for (const Row& r : rows) {
+            const SmallCardPromptPath pp = small_card_prompt_path(r.dflt, false, 1, true, false, false, false);
+            CHECK(pp.any() == r.fires);
+            CHECK(pp.fused_off == r.fires && pp.layer_major == r.fires);
+            if (pp.fused_off) {
+                CHECK(prefill::small_card_kernels_on(nullptr));                      // unset: the native fused kernels run in MMQ's buffer layout
+                CHECK(prefill::small_card_kernels_on(""));
+                CHECK(prefill::small_card_kernels_on("1"));
+                CHECK(!prefill::small_card_kernels_on("0"));                         // the way back: MMQ's kernels, as before
+            }
+            const int ov = pp.fused_off ? (prefill::small_card_kernels_on(nullptr) ? prefill::kPfFusedKernelsOnly : 0) : -1;
+            // STRATA_PF_FUSED as the fused kernels' rule reads it: unset reads as 1 on the small-card path only
+            CHECK(prefill::pf_fused_env_effective(-1, ov) == (r.fires ? 1 : -1));
+            CHECK(prefill::pf_fused_env_effective(0, ov) == 0);             // "0" stays off
+            CHECK(prefill::pf_fused_env_effective(1, ov) == 1);
+        }
+        CHECK(prefill::pf_fused_env_effective(-1, 0) == -1);                // the way back (override 0): the variable as it is
+        CHECK(prefill::pf_fused_env_effective(-1, -1) == -1);               // nothing decided
+        CHECK(small_card_prompt_path(2048, false, 1, true, false, true, false).any() == false);   // STRATA_PF_FUSED named by hand: the user's path, no rule
+        CHECK(small_card_prompt_path(2048, true, 1, true, false, false, false).any() == false);   // HIP: unchanged
+    }
+    {
+        using namespace strata;
+        // a build without MMQ sets STRATA_PF_FUSED=1 itself before main: the rule reads "named by the user" (prefill::own_only_user_named), not "non-empty"
+        const std::vector<std::string> by_build = {"STRATA_PF_FUSED", "STRATA_PF_FUSED_Q50"};   // what the build's initialiser recorded
+        const std::vector<std::string> none;                                                    // the user named it first (or a build with MMQ)
+        const auto fused_named = [](const std::vector<std::string>& rec) { return prefill::own_only_user_named("STRATA_PF_FUSED", "1", rec); };
+        const auto pp = [&](long long dflt, const std::vector<std::string>& rec) { return small_card_prompt_path(dflt, false, 1, true, false, fused_named(rec), false); };
+        CHECK(pp(2048, by_build).any());                                     // the build's own value: the small-card rule runs (RTX 3060 Ti, default chunk 2,048)
+        CHECK(pp(2048, by_build).fused_off && pp(2048, by_build).layer_major);
+        CHECK(!pp(2048, none).any());                                        // the same text from the user: theirs, the rule steps aside
+        CHECK(!small_card_prompt_path(2048, false, 1, true, false, prefill::own_only_user_named("STRATA_PF_FUSED", "0", none), false).any());   // "0" from the user too
+        for (long long dflt : {8192LL, 12288LL, 20480LL}) CHECK(!pp(dflt, by_build).any());   // a card whose default chunk is 8,192 or more: unchanged either way
+        CHECK(!small_card_prompt_path(2048, true, 1, true, false, false, false).any());       // HIP: unchanged
+        CHECK(!small_card_prompt_path(2048, false, 1, true, true, false, false).any());       // STRATA_DEFAULTS=026: unchanged
+        // the user named the walk's own variable: the expert path still follows the rule, the walk stays theirs
+        CHECK(small_card_prompt_path(2048, false, 1, true, false, fused_named(by_build), true).fused_off);
+        CHECK(!small_card_prompt_path(2048, false, 1, true, false, fused_named(by_build), true).layer_major);
     }
     {
         using namespace strata;

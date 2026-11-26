@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1
 # strata-slim: the Strata engine, its API server and model prep (download, pack, MTP), nothing else.
 #
-#   docker build -t strata-slim:0.2.13 .                                     # RTX 30 (sm_86), 4 compile jobs
-#   docker build -t strata-slim:0.2.13 --build-arg CUDA_ARCHITECTURES="86;89" --build-arg BUILD_JOBS=8 .
-#   docker build -t strata-slim:0.2.13-patched --build-arg PATCHES=all .    # with the local fixes (patches/README.md)
+#   docker build -t strata-slim:0.2.17 .                                     # RTX 30 (sm_86), 4 compile jobs
+#   docker build -t strata-slim:0.2.17 --build-arg CUDA_ARCHITECTURES="86;89" --build-arg BUILD_JOBS=8 .
+#   docker build -t strata-slim:0.2.17-patched --build-arg PATCHES=all .    # with the local fixes (patches/README.md)
 #
 # CUDA_ARCHITECTURES: 86 = RTX 30, 89 = RTX 40, 120 = RTX 50 (the last one also gets PTX). BUILD_JOBS: each nvcc job
 # can take several GB of RAM; raise it when the machine has the memory free.
@@ -24,6 +24,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 RUN python3 -m venv /tools
 WORKDIR /src
+# upstream (since v0.2.16) splits engine/ and terminal/, and some sources reach across as ../engine/ or ../terminal/; vendor/
+# is one flat tree, so both are /src
+RUN ln -s /src /engine && ln -s /src /terminal
 COPY vendor/requirements-build.txt /src/requirements-build.txt
 RUN /tools/bin/pip install --no-cache-dir -r requirements-build.txt
 
@@ -78,7 +81,10 @@ cmake -G Ninja -S . -B build $ccache \
     -DSTRATA_Q6K_EXPERTS=ON \
     -DSTRATA_MMQ_KQUANTS=ON \
     -DSTRATA_GGML_DIR=/opt/llama.cpp
-cmake --build build --target strata strata_kq -j "$BUILD_JOBS"
+# strata_kq was always built, but it only exists with -DSTRATA_MMQ=ON since v0.2.15, so now only when it's there
+targets=strata
+if cmake --build build --target strata_kq -- -n >/dev/null 2>&1; then targets="strata strata_kq"; fi
+cmake --build build --target $targets -j "$BUILD_JOBS"
 
 if [ "$BUILD_VISION" = "1" ]; then
     cmake -G Ninja -S tools/vision -B build-vision $ccache \

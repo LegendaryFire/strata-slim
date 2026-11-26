@@ -3,6 +3,7 @@
 #include "strata/core/conversation_cache.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/platform/aux_cpus.hpp"
+#include "strata/platform/home_cpus.hpp"
 
 #include <cuda_runtime.h>
 
@@ -19,7 +20,14 @@
 #include <sched.h>
 #endif
 
-namespace strata::core { void conversation_checkpoint_join(const void* only); }
+namespace strata::core {
+void conversation_checkpoint_join(const void* only);
+/// Tests only (#6075): `hook(point)` runs at fixed points of an asynchronous checkpoint save (STRATA_CKPT_ASYNC), so a
+/// test can force two savers on two threads into one order: 1 = the save is about to take the staging buffer, 2 = a
+/// background copy is about to read it, 3 = the save has filled it and is about to start that copy.  nullptr (the
+/// default, and always outside tests): nothing runs.
+void conversation_checkpoint_test_hook(void (*hook)(int point));
+}
 namespace strata::core::conversation_detail {
 
 /// The private copy streams and ordering events (below) belong to a thread, but a thread can be short-lived: the layer
@@ -124,13 +132,12 @@ inline long test_copy_fail_at() {
 /// First thing a background copy thread does (STRATA_CKPT_ASYNC, STRATA_PARK_ASYNC): a thread the host creates
 /// inherits the host's one CPU (strata/platform/aux_cpus.hpp), where its memcpys would take turns with the decode.
 /// Wide first: the mask the aux placement keeps as this thread's own is the one restore() puts back (a request with
-/// aux_cpus=0), and the host's one CPU must not be it.  No output depends on where a thread runs.
+/// aux_cpus=0), and the host's one CPU must not be it.  Wide means the process's own CPU set from the start-up
+/// (strata/platform/home_cpus.hpp: every CPU unless the engine placed itself on the card's NUMA node).  No output
+/// depends on where a thread runs.
 inline void background_thread_placement() {
 #if defined(__linux__)
-    cpu_set_t all;
-    CPU_ZERO(&all);
-    for (int c = 0; c < CPU_SETSIZE; ++c) CPU_SET(c, &all);
-    (void) sched_setaffinity(0, sizeof all, &all);   // the kernel keeps the CPUs the process may use
+    strata::platform::widen_to_home();               // the kernel keeps the CPUs the cgroup allows
     strata::aux_cpus::pin_current_thread();          // (a no-op while the feature is off)
 #endif
 }
@@ -190,6 +197,7 @@ inline ConversationCheckpoint copy_checkpoint_beating(const ConversationCheckpoi
     o.block_pos = copy_beating(c.block_pos);
     o.used = c.used;
     o.pinned = c.pinned;
+    o.plan = c.plan;
     o.stage_parts.reserve(c.stage_parts.size());
     for (const auto& part : c.stage_parts) o.stage_parts.push_back(copy_checkpoint_beating(part));
     return o;
@@ -221,6 +229,7 @@ inline void copy_checkpoint_into(ConversationCheckpoint& o, const ConversationCh
     assign_beating(o.block_pos, c.block_pos);
     o.used = c.used;
     o.pinned = c.pinned;
+    o.plan = c.plan;
     o.stage_parts.clear();
     for (const auto& part : c.stage_parts) o.stage_parts.push_back(copy_checkpoint_beating(part));
 }

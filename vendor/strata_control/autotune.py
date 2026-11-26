@@ -37,7 +37,11 @@ EARLY_DROP = 0.05                  # a candidate this much slower than its own r
 STAGE_GAP_NOISY = 0.04             # an A/A gap above this: the machine is noisy (6.5)
 
 
-STAGNANT_WAIT_S = 60.0          # free memory that has not grown by STAGNANT_MIB after this long is not going to
+#: #5078 (text approved by the coordinator): appended to "Your current settings could not be measured: ..." when the graphics card ran out of memory
+GRAPHICS_MEMORY_HINT = ("The graphics card ran out of memory. Other programs, such as the desktop, may be using part of it. "
+                        "Close them, or leave more room and tune again with --goal room:2048.")
+
+STAGNANT_WAIT_S = 60.0         # free memory that has not grown by STAGNANT_MIB after this long is not going to
 STAGNANT_MIB = 512
 
 
@@ -66,6 +70,7 @@ class Options:
     busy_pct: float = 25.0
     wait_busy_s: float = 300.0
     check_busy: bool = True
+    concurrency: int = 1              # #4821 (opt-in): more than 1 judges every setting on this many requests decoding at once
 
     def resolved(self) -> "Options":
         o = Options(**self.__dict__)
@@ -98,6 +103,7 @@ class ArmReport:
 
 @dataclass
 class TuneResult:
+    concurrency: int = 1               # the number of requests at once the tune judged on (1: one request at a time, as always)
     outcome: str = "default_confirmed"   # improved | default_confirmed | inconclusive | base_failed | cancelled
     #: what a screen shows, one of: faster | already_fastest | busy_pc | failed | stopped  (see `finalize`)
     code: str = "already_fastest"
@@ -147,6 +153,8 @@ def metric(run: dict[str, Any] | RunResult, use: str) -> float | None:
     d = get("decode_tok_s")
     if not d:
         return None
+    if get("load_tok_s"):                     # #4821: a tune run with --concurrency judges on all the requests' tokens per second
+        return float(get("load_tok_s"))
     if use == "coding":
         p = get("pp_long_tok_s") or get("pp_tok_s")
         if p:
@@ -203,7 +211,7 @@ class Tuner:
         self.clock = clock
         self.sleep = sleep
         self.system = system or session.system
-        self.result = TuneResult(mode=self.o.mode)
+        self.result = TuneResult(mode=self.o.mode, concurrency=max(1, int(self.o.concurrency or 1)))
         self.started = 0.0
         self.run_times: list[float] = []
         self.planned_runs = 0
@@ -383,7 +391,8 @@ class Tuner:
         elif self.o.use == "coding" and self.o.mode == "thorough":
             long_tokens = min(28000, int(0.8 * self.ctx.context_tokens))
         return RequestSet(warmups=2 if self.o.mode == "thorough" else 1, decodes=5, decode_tokens=200,
-                          pp_tokens=4096 if self.ctx.context_tokens >= 6000 else 1024, long_tokens=long_tokens)
+                          pp_tokens=4096 if self.ctx.context_tokens >= 6000 else 1024, long_tokens=long_tokens,
+                          clients=max(1, int(self.o.concurrency or 1)))
 
     def _run_stages(self) -> None:
         r, o = self.result, self.o
@@ -413,6 +422,8 @@ class Tuner:
             r.outcome = "base_failed"
             r.reason_code = "start_failed"
             r.message = "Your current settings could not be measured: " + (base1.reason or base1.status)
+            if base1.status == "OOM" and self.ctx.backend in ("cuda", "hip") and self.ctx.family == "flash-next":
+                r.message += " " + GRAPHICS_MEMORY_HINT      # #5078: a graphics-memory failure points at the reserve, not at RAM
             return
         r.base = base1.to_dict()
         r.facts = dict(base1.facts)
@@ -424,18 +435,9 @@ class Tuner:
         r.classes = tune_knobs.machine_classes(self.ctx)
 
         # ---- stage 2: plan the candidates for this machine; how many depends on the time chosen
-        planned, skipped = tune_knobs.plan_arms(self.ctx, mode=o.mode, history_bad=self.history_bad)
+        planned, skipped = plan_candidates(self.ctx, o, history_bad=self.history_bad, left_s=o.budget_s - self._elapsed(), avg_run_s=self._avg_run())
         r.skipped = skipped
         per_arm = o.rounds or 2
-        if o.mode == "thorough":
-            n_arms = len(planned)
-        else:
-            left = int((o.budget_s - self._elapsed()) / max(1.0, self._avg_run()))
-            fixed = (per_arm - 1) + 1                      # extra base rounds, the final base
-            n_arms = min(len(planned), max(0, (left - fixed) // per_arm))
-        for p in planned[n_arms:]:
-            skipped.append({"id": p.arm.id, "label": p.arm.label, "reason": "left out to stay inside the time you chose"})
-        planned = planned[:n_arms]
         arms = [ArmReport(p.arm.id, p.arm.label, dict(p.args), dict(p.env), p.arm.answer) for p in planned]
         by_id = {a.id: a for a in arms}
         by_use = {p.arm.id: ("prompt" if p.arm.metric == "prompt" else o.use) for p in planned}
@@ -534,6 +536,7 @@ class Tuner:
         r.noise = {"aa_gap": round(aa, 4), "drift": round(drift, 4), "spread": round(spread, 4),
                    "base_runs": [round(x, 2) for x in mb], "noisy": spread > STAGE_GAP_NOISY}
         threshold = accept_threshold(o.margin, aa, drift)
+        r.noise["threshold_pct"] = round((threshold - 1.0) * 100.0, 1)      # the bar a setting had to clear (shown by `strata tune report`)
 
         # ---- evaluate the candidates
         winners: list[ArmReport] = []
@@ -687,8 +690,12 @@ class Tuner:
             c_runs = [c for _, c in final_pairs]
             r.chosen = {"decode_tok_s": round(statistics.median([c.decode_tok_s for c in c_runs if c.decode_tok_s]), 2)
                         if any(c.decode_tok_s for c in c_runs) else None,
-                        "pp_tok_s": round(statistics.median([c.pp_long_tok_s or c.pp_tok_s for c in c_runs if c.pp_long_tok_s or c.pp_tok_s]), 1)
+                        # #5324: the 4K prompt's speed is what a recheck measures again, so it is the one kept as pp4k; the long prompt's
+                        # (a 96K prompt of the quick tune) is kept apart, never in its place
+                        "pp_tok_s": round(statistics.median([c.pp_tok_s for c in c_runs if c.pp_tok_s]), 1)
                         if any(c.pp_tok_s for c in c_runs) else None,
+                        "pp_long_tok_s": round(statistics.median([c.pp_long_tok_s for c in c_runs if c.pp_long_tok_s]), 1)
+                        if any(c.pp_long_tok_s for c in c_runs) else None,
                         "rss_peak_mib": max([c.rss_peak_mib for c in c_runs if c.rss_peak_mib] or [None]) if any(c.rss_peak_mib for c in c_runs) else None,
                         "vram_used_mib": max([c.vram_used_mib for c in c_runs if c.vram_used_mib] or [None]) if any(c.vram_used_mib for c in c_runs) else None}
         elif r.outcome == "improved" and per_request_chosen:
@@ -828,6 +835,37 @@ class Tuner:
 
 # --------------------------------------------------------------------------- building a tuner from a run configuration
 
+def plan_candidates(ctx: tune_knobs.Context, o: Options, *, history_bad: set[str] | None = None, left_s: float | None = None,
+                    avg_run_s: float = 150.0) -> tuple[list[tune_knobs.PlannedArm], list[dict[str, str]]]:
+    """The candidates a tune measures, in order, and the ones it leaves out with the reason: the machine's (tune_knobs.plan_arms), then, in the quick
+    tune, only as many as fit the time left (``left_s``, at ``avg_run_s`` an engine run). The run (Tuner) and `strata tune auto --plan` (#5232) both
+    use this one function, so the preview lists what the run then measures."""
+    planned, skipped = tune_knobs.plan_arms(ctx, mode=o.mode, history_bad=history_bad)
+    per_arm = o.rounds or 2
+    if o.mode == "thorough":
+        n_arms = len(planned)
+    else:
+        left = int(((o.budget_s or 1200.0) if left_s is None else left_s) / max(1.0, avg_run_s))
+        fixed = (per_arm - 1) + 1                          # extra base rounds, the final base
+        n_arms = min(len(planned), max(0, (left - fixed) // per_arm))
+    for p in planned[n_arms:]:
+        skipped.append({"id": p.arm.id, "label": p.arm.label, "reason": "left out to stay inside the time you chose"})
+    return planned[:n_arms], skipped
+
+
+def preview(ctx: tune_knobs.Context, o: Options, *, history_bad: set[str] | None = None, avg_run_s: float = 150.0) -> dict[str, Any]:
+    """`strata tune auto --plan` (#5232): what the tune would try and leave out, the engine runs and the time, before anything starts. The time left for the
+    candidates is the run's own: the budget less the first run (your current settings). The first run's measurements are not known yet (a setting that
+    depends on them is planned from the configuration alone)."""
+    o = o.resolved()
+    planned, skipped = plan_candidates(ctx, o, history_bad=history_bad, left_s=o.budget_s - avg_run_s, avg_run_s=avg_run_s)
+    per_arm = o.rounds or 2
+    runs = 1 + per_arm * (len(planned) + 1) - 1 + 1 + (o.confirm_pairs or 0) * 2 if planned else 1
+    return {"mode": o.mode, "try": [{"id": p.arm.id, "label": p.arm.label} for p in planned], "left_out": list(skipped),
+            "engine_runs": runs, "run_minutes": round(avg_run_s / 60.0, 1), "minutes": round(runs * avg_run_s / 60.0),
+            "budget_minutes": round(o.budget_s / 60.0)}
+
+
 def split_args(argv: list[str]) -> list[str]:
     return [str(a) for a in argv]
 
@@ -938,6 +976,10 @@ def recheck(session: Session, base_args: list[str], preset: dict[str, Any], *, c
         out["measured"] = {"decode_tok_s": run.decode_tok_s, "pp4k_tok_s": run.pp_tok_s, "rss_peak_mib": run.rss_peak_mib,
                            "vram_peak_mib": run.vram_used_mib}
         sd, sp = stored.get("decode_tok_s"), stored.get("pp4k_tok_s")
+        if "pp_long_tok_s" not in stored:
+            # #5324: a preset saved before the long prompt's speed had a key of its own may hold that speed (a 96K prompt) as pp4k: a 4K
+            # recheck cannot be compared with it, so its prompt speed is not judged (answers and memory still are); a new tune writes both
+            sp = None
         problems: list[str] = []
         if sd and run.decode_tok_s and run.decode_tok_s < 0.95 * sd:
             problems.append(f"answers are {100 * (1 - run.decode_tok_s / sd):.0f}% slower than when it was saved")

@@ -15,6 +15,9 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 
 #include <cwchar>
@@ -23,6 +26,15 @@
 #endif
 
 namespace strata::platform {
+
+/// #5742: the commit an allocation can still get on Windows, from what is left now (ullAvailPageFile) and what the page
+/// files may still grow by (commit_growth below).  Windows grows a page file on demand up to its maximum, so a page file
+/// set to 8 GB initial and 32 GB maximum is not an 8 GB one: counting only what was left clamped --resident-budget-gib
+/// 24 to 17.42 GiB and turned the automatic conversation cache off on a 40 GB machine, where a page file set to start
+/// larger (the same maximum) did neither.  Saturates instead of wrapping.
+inline uint64_t commit_available(uint64_t avail_now, uint64_t growth) {
+    return growth > UINT64_MAX - avail_now ? UINT64_MAX : avail_now + growth;
+}
 
 /// The bytes Windows' page files may still grow by: a page file Windows manages (PagingFiles "?:\pagefile.sys", or a
 /// file's sizes "0 0") up to 3x the RAM Windows sees (4 GiB at least) and an eighth of its volume, a set one up to

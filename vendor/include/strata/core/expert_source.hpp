@@ -85,15 +85,21 @@ struct HostMemory {
     uint64_t available = 0;
     uint64_t cgroup_limit = ~uint64_t{0};
     uint64_t commit = ~uint64_t{0};   ///< available Windows commit capacity; ~0 when not reported
+    const char* why = nullptr;        ///< when host_available_memory is false: what it could not read (a static text, for the log line)
 };
 
 /// Linux reads `meminfo`, `self_cgroup` and the cgroup tree under `cgroup_root` (the parameters are for tests; the
-/// defaults are the real files).  cgroup v2 as before (an unreadable limit of a group that has one fails); cgroup v1's
-/// memory controller (`<root>/memory/<path>`: memory.limit_in_bytes - memory.usage_in_bytes); no cgroup line at all is
-/// MemAvailable alone.  False when the RAM cannot be determined.
+/// defaults are the real files).  cgroup v2: a group whose memory.max exists but cannot be read fails; a group without a
+/// memory.max has no memory controller and no limit of its own (its parents are read), and a "0::" path that is not in
+/// this namespace's mount reads the mount's root as the process's own group (#5196); cgroup v1's
+/// memory controller (`<root>/memory/<path>`: memory.limit_in_bytes - memory.usage_in_bytes, the group's clean file pages
+/// credited: arena_cgroup_room_v1); no cgroup line at all is
+/// MemAvailable alone.  False when the RAM cannot be determined.  #5519: MemAvailable plus the ZFS ARC's share above its floor
+/// (`zfs_arcstats`; no ZFS: nothing), which MemAvailable leaves out though ZFS gives it back.
 bool host_available_memory(HostMemory& m, const std::string& meminfo = "/proc/meminfo",
                            const std::string& self_cgroup = "/proc/self/cgroup",
-                           const std::string& cgroup_root = "/sys/fs/cgroup");
+                           const std::string& cgroup_root = "/sys/fs/cgroup",
+                           const std::string& zfs_arcstats = "/proc/spl/kstat/zfs/arcstats");
 
 /// #4051: wait for the RAM an arena needs to come back.  An engine that was still exiting (or a program that was ending)
 /// holds memory a few seconds longer than its process; loading into that shortfall sent a 60 GiB host into reclaim for
@@ -108,6 +114,12 @@ bool wait_for_ram(uint64_t need, double max_wait_s, double step_s, double note_s
 /// Bound a resident budget by RAM and commit capacity after headroom; leave 256 MiB more when clamping.
 /// Pass UINT64_MAX for commit when the platform does not report it.
 uint64_t clamp_resident_budget(uint64_t requested, uint64_t physical, uint64_t commit, uint64_t headroom);
+
+/// #3725: under WDDM every page-locked, mapped host buffer counts against the GPU's shared (non-local) segment, on each
+/// CUDA device it is mapped into, and the segment is about half the RAM; the commit capacity does not show that limit.
+/// `segment_left` is the room the tightest GPU has left (budget - usage), `reserve` what the engine maps after the
+/// complement (the lend ring, the hand-off and staging buffers).  The budget, cut to what is left of the segment.
+uint64_t clamp_budget_to_shared_segment(uint64_t budget, uint64_t segment_left, uint64_t reserve);
 
 /// #1250: one cudaHostAlloc of the whole page-locked complement has no way back when the kernel does not give the
 /// pages as fast as the driver takes them (the process is OOM-killed, even with MemAvailable high: clean file cache
@@ -402,6 +414,7 @@ struct GpuPlanSink {
     /// holds the arena's device alias.
     int pcie_mode = 0;
     int32_t cpu_jobs = 0;   ///< host only: the distinct experts the pool computes for the layer just published
+    float* hit_out_dev = nullptr;   ///< device address of this group's hit_out buffer on the primary GPU (P2P peer scatter)
 };
 
 /// Verifier::set_pcie_balance: a verify window's costs, fitted to each layer's measured times (ms, least squares with
@@ -699,7 +712,7 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 /// Plan v0.3 P6: the pool for a verify window of `n_tok` tokens.  `x_f` is (n_tok, n_embd), `ids` (n_tok, k) and
 /// `out` (n_tok * k, n_embd).  Each distinct missed expert is computed once for all the tokens routed to it;
 /// resident experts' rows are zeroed (the GPU adds them).  Requires `host_res` (the token-graph residency).
-/// STRATA_ROUTE_TAIL_SKIP rank (0: off).  Unset in the environment: 0 until the serve start-up sets the default.
+/// STRATA_ROUTE_TAIL_SKIP rank (0: off).  Unset in the environment: 0, on every backend (tail_skip_default.hpp).
 int tail_skip_rank();
 void set_tail_skip_rank(int r);
 
@@ -789,6 +802,9 @@ public:
     void stage_lend_regions(std::vector<std::vector<std::pair<int32_t, int32_t>>> regions) {
         stage_lend_regions_ = std::move(regions);
     }
+    /// The budget passed to `pin_cache_complement` is the automatic RAM copy's (the engine chose it because the expert
+    /// arena did not fit), not --resident-budget-gib: the line printed when it is cut names no flag.  Set BEFORE it.
+    void budget_is_automatic(bool automatic) { budget_automatic_ = automatic; }
     void close();
 
     bool mapped() const { return base_ != nullptr; }
@@ -910,6 +926,16 @@ public:
     /// 32 measured 2.35 GB/s with experts.bin mapped and 3.57 GB/s without.  After this every file read goes through
     /// read_direct (mapped_blob answers nullptr).  Returns whether the view was closed; `why` says why not.
     bool drop_mapping(std::string& why);
+    /// A GPU that shares the system RAM (cudaDevAttrIntegrated: the DGX Spark's GB10) and holds every expert in its cache
+    /// reads nothing from the files again, and the pages the start read from them are a second copy of the cache's bytes.
+    /// CUDA counts only the RAM the kernel has free (MemFree, not the page cache it could reclaim), so with those pages
+    /// kept a second CUDA program (the picture reader) found no room.  Gives them back, expert by expert:
+    /// madvise(MADV_DONTNEED) on the blob's pages in this source's mappings, then posix_fadvise(DONTNEED) on the same
+    /// file range (clean pages, no root needed; only whole pages inside the blob, a page shared with a neighbour stays).
+    /// `keep(layer, expert)` true keeps that expert's pages (the experts of the slots the prompt path borrows: their
+    /// refill reads them again).  The mappings stay; a later read faults the bytes in from the file.  Returns the bytes
+    /// released (0: nothing, or not Linux).
+    uint64_t drop_cached_pages(const std::function<bool(int64_t, int64_t)>& keep);
     /// Windows, experts.bin, a file tier that reads through the file cache (--resident-experts): the startup reads -
     /// the GPU cache's fill from the profile and the RAM copy (pin_cache_complement) - go unbuffered (read_direct)
     /// with the view closed meanwhile.  Through the mapping they put the file's pages in the working set beside the
@@ -1093,6 +1119,20 @@ private:
     bool open_direct(std::string& why);
     /// Windows: experts.bin mapped again as `open` maps it (begin/end_startup_unbuffered).
     bool map_view(std::string& why);
+    /// NAN879-LAB diagnostic, opt-in (STRATA_BLOB_VERIFY=1): after read_direct assembles a blob, the
+    /// same byte ranges are re-read through a plain buffered handle (an independent channel) and memcmp'd.
+    /// A difference can only mean the unbuffered path delivered wrong bytes; it is logged loudly with the
+    /// shard, offsets and a hexdump. Off by default: the default path only checks one bool.
+    void verify_blob(int64_t layer, int64_t expert, const uint8_t* dst) const;
+    void open_verify_handles();
+    std::atomic<bool> verify_on_{false};
+    mutable std::atomic<uint64_t> verify_blob_n_{0};
+    mutable std::atomic<uint64_t> verify_bad_n_{0};
+    mutable std::atomic<uint64_t> verify_bad_logged_{0};
+    mutable std::atomic<uint64_t> verify_channel_n_{0};   ///< the buffered channel itself disagreed with itself
+    mutable std::atomic<uint64_t> verify_arb_n_{0};       ///< v3: three-way mmap arbitrations performed
+    std::chrono::steady_clock::time_point verify_t0_{};   ///< when verification was armed (for the startup delay)
+    int64_t verify_delay_ms_ = 0;                         ///< STRATA_BLOB_VERIFY_DELAY_SEC: hold verification off for the startup fill
     std::vector<std::string> paths_;          ///< the mapped files, as maps_
     std::vector<void*> pdirect_;              ///< open_prompt_direct: O_DIRECT fds for copy_blobs only
     std::vector<void*> direct_;               ///< #286: per file, an unbuffered handle (Windows) or O_DIRECT fd (Linux)
@@ -1239,7 +1279,8 @@ private:
     uint64_t complement_locked_ = 0;          ///< bytes held in the working set (pin refused)
     int64_t complement_lent_slots_ = 0;
     std::vector<std::vector<std::pair<int32_t, int32_t>>> stage_lend_regions_;  ///< a split: each stage's lend region
-    std::vector<const uint8_t*> override_;    ///< staged exchanges: an evicted expert read from its exchange buffer
+    bool budget_automatic_ = false;           ///< budget_is_automatic
+    std::vector<const uint8_t*> override_;   ///< staged exchanges: an evicted expert read from its exchange buffer
     struct Exchange { size_t in, out; int64_t q; uint64_t bytes; };
     std::vector<Exchange> staged_;
     std::atomic<ForesightSwap*> fs_swap_{nullptr};   ///< set_foresight_swap

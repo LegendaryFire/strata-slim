@@ -1,6 +1,8 @@
 // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
 #include "strata/core/mtp.hpp"
+#include "strata/core/mtp_head_rule.hpp"
 #include "strata/core/pin_budget.hpp"
+#include "strata/core/per_device_flag.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/spec_prob.hpp"
@@ -46,8 +48,34 @@
 #include <vector>
 #include "strata/platform/cpu_relax.hpp"
 
-#ifdef STRATA_NATIVE_EXPERTS
-#include "ggml.h"   // --mtp-q4: the head rows' and projections' formats, dequantized and requantized at load
+// --mtp-q4: the head rows' and projections' formats, dequantized and requantized at load: with the Strata quant layer (STRATA_OWN_CPU_QUANT) or, as
+// before, with ggml-base
+#if defined(STRATA_OWN_CPU_QUANT)
+#include "strata/quant/act.hpp"
+#include "strata/quant/dequant.hpp"
+#define STRATA_MTP_Q4 1
+#elif defined(STRATA_NATIVE_EXPERTS)
+#include "ggml.h"
+#define STRATA_MTP_Q4 1
+#endif
+
+#ifdef STRATA_MTP_Q4
+namespace {
+#if defined(STRATA_OWN_CPU_QUANT)
+bool mtp_to_float(int type, const void* src, float* dst, int64_t n) {
+    return strata::quant::dequant_row((strata::quant::Type) type, src, dst, n);
+}
+void mtp_quant_q4_0(const float* x, void* dst, int64_t n) { strata::quant::quantize_q4_0_ref(x, dst, n); }
+#else
+bool mtp_to_float(int type, const void* src, float* dst, int64_t n) {
+    const auto* t = ggml_get_type_traits((ggml_type) type);
+    if (t == nullptr || t->to_float == nullptr) return false;
+    t->to_float(src, dst, n);
+    return true;
+}
+void mtp_quant_q4_0(const float* x, void* dst, int64_t n) { ggml_quantize_chunk(GGML_TYPE_Q4_0, x, dst, 0, 1, n, nullptr); }
+#endif
+}  // namespace
 #endif
 
 #if defined(STRATA_GPU_METAL)
@@ -205,7 +233,7 @@ const void* MtpDrafter::wq(const char* name, int& type) const {
 
 // --mtp-q4: every Q8_0 tensor of dense.bin as Q4_0 (ggml's reference quantizer), in one device buffer
 bool MtpDrafter::make_q4_dense(const std::vector<uint8_t>& blob, std::string& err) {
-#ifdef STRATA_NATIVE_EXPERTS
+#ifdef STRATA_MTP_Q4
     uint64_t total = 0;
     std::vector<std::pair<const Tensor*, uint64_t>> plan;
     for (const auto& t : tensors_) {
@@ -215,14 +243,12 @@ bool MtpDrafter::make_q4_dense(const std::vector<uint8_t>& blob, std::string& er
     }
     std::vector<uint8_t> host((size_t) total);
     std::vector<float> row;
-    const auto* q8t = ggml_get_type_traits(GGML_TYPE_Q8_0);
     for (const auto& [t, off] : plan) {
         row.resize((size_t) t->cols);
         const uint64_t in_row = (uint64_t) (t->cols / 32) * 34, out_row = (uint64_t) (t->cols / 32) * 18;
         for (int64_t r = 0; r < t->rows; ++r) {
-            q8t->to_float(blob.data() + t->off + (uint64_t) r * in_row, row.data(), t->cols);
-            ggml_quantize_chunk(GGML_TYPE_Q4_0, row.data(), host.data() + off + (uint64_t) r * out_row, 0, 1, t->cols,
-                                nullptr);
+            if (!mtp_to_float(GGML_Q8_0, blob.data() + t->off + (uint64_t) r * in_row, row.data(), t->cols)) { err = "mtp: --mtp-q4 cannot read a Q8_0 projection"; return false; }
+            mtp_quant_q4_0(row.data(), host.data() + off + (uint64_t) r * out_row, t->cols);
         }
         q4_off_.push_back({t->name, off});
     }
@@ -240,19 +266,18 @@ bool MtpDrafter::make_q4_dense(const std::vector<uint8_t>& blob, std::string& er
 
 // --mtp-q4: the draft head's subset rows as Q4_0 (dequantized from the main head's format)
 bool MtpDrafter::make_q4_head(std::string& err) {
-#ifdef STRATA_NATIVE_EXPERTS
+#ifdef STRATA_MTP_Q4
     const int64_t N = g_->n_embd;
-    const auto* tt = ggml_get_type_traits((ggml_type) head_->type());
-    if (tt == nullptr || tt->to_float == nullptr || N % 32 != 0) { err = "mtp: --mtp-q4 cannot read the head's format"; return false; }
+    if (N % 32 != 0) { err = "mtp: --mtp-q4 cannot read the head's format"; return false; }
     const size_t in_row = head_->row_bytes(), out_row = (size_t) (N / 32) * 18;
     std::vector<uint8_t> src((size_t) n_dvocab_ * in_row), dst((size_t) n_dvocab_ * out_row);
     if (cudaMemcpy(src.data(), dhead_, src.size(), cudaMemcpyDeviceToHost) != cudaSuccess) { err = "mtp: reading the draft head"; return false; }
     std::vector<float> row((size_t) N);
     for (int64_t r = 0; r < n_dvocab_; ++r) {
-        tt->to_float(src.data() + (size_t) r * in_row, row.data(), N);
-        ggml_quantize_chunk(GGML_TYPE_Q4_0, row.data(), dst.data() + (size_t) r * out_row, 0, 1, N, nullptr);
+        if (!mtp_to_float(head_->type(), src.data() + (size_t) r * in_row, row.data(), N)) { err = "mtp: --mtp-q4 cannot read the head's format"; return false; }
+        mtp_quant_q4_0(row.data(), dst.data() + (size_t) r * out_row, N);
     }
-    // the Q4_0 rows replace the subset in place (they are smaller)
+    // the Q4_0 rows replace the subset in place (the buffer holds the wider of the two rows: bind, mtp_draft_head_row_cap)
     if (cudaMemcpy(dhead_, dst.data(), dst.size(), cudaMemcpyHostToDevice) != cudaSuccess) { err = "mtp: writing the draft head"; return false; }
     dhead_type_ = GGML_Q4_0;
     std::fprintf(stderr, "strata mtp: --mtp-q4: draft head over %lld tokens as Q4_0 (%.1f MiB read per step, was %.1f)\n",
@@ -490,13 +515,16 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     // it (the commit is only needed by the next window, and now runs beside the draft).  R9700, UD-Q4_K_XL: draft wall
     // 5.8 -> 3.5 ms a window (notes-latency.md).
     {
-        static const bool hip_prio = [] {
-            if (const char* v = std::getenv("STRATA_MTP_HIP_PRIO"); v != nullptr && *v != 0) return std::atoi(v) != 0;
-            int dev = 0;
-            cudaDeviceProp prop{};
-            return cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&prop, dev) == cudaSuccess &&
-                   strata::kernels::gfx_arch_is_gfx12(prop.gcnArchName);
-        }();
+        static strata::core::PerDeviceFlag<> gfx12_dev;   // per card (#4431): the drafter of each stage asks for its own card
+        const char* prio_env = std::getenv("STRATA_MTP_HIP_PRIO");
+        int prio_dev = 0;
+        if (cudaGetDevice(&prio_dev) != cudaSuccess) (void) cudaGetLastError();
+        const bool hip_prio = (prio_env != nullptr && *prio_env != 0)
+            ? std::atoi(prio_env) != 0
+            : gfx12_dev.get(prio_dev, [](int d) {
+                  cudaDeviceProp prop{};
+                  return cudaGetDeviceProperties(&prop, d) == cudaSuccess && strata::kernels::gfx_arch_is_gfx12(prop.gcnArchName);
+              });
         int lo = 0, hi = 0;
         if (hip_prio && hipDeviceGetStreamPriorityRange(&lo, &hi) == hipSuccess)
             prio = hipStreamCreateWithPriority(&cs_, hipStreamNonBlocking, hi) == hipSuccess;
@@ -798,8 +826,10 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
         if (read_file(vocab_file(), raw) && raw.size() >= 4 && raw.size() % 4 == 0) {
             n_dvocab_ = (int64_t) (raw.size() / 4);
             const int64_t row_bytes = (int64_t) head->row_bytes();   // a vocabulary row of the native head
+            // #5841: --mtp-q4 head/all rewrites the subset as Q4_0 rows in place; a head in IQ4_XS has the narrower row, so the buffer takes the wider one
+            const int64_t head_cap = strata::core::mtp_draft_head_row_cap(row_bytes, g_->n_embd, q4_head_);
             if (cudaMalloc((void**) &dvocab_, raw.size()) != cudaSuccess ||
-                cudaMalloc((void**) &dhead_, (size_t) (n_dvocab_ * row_bytes)) != cudaSuccess) {
+                cudaMalloc((void**) &dhead_, (size_t) (n_dvocab_ * head_cap)) != cudaSuccess) {
                 err = "mtp: the draft head does not fit";
                 draft_head_hint(n_dvocab_, row_bytes);
                 return false;
@@ -836,7 +866,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                 strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
             }
             cudaDeviceSynchronize();
-            vram_ += (uint64_t) (n_dvocab_ * row_bytes) + raw.size();
+            vram_ += (uint64_t) (n_dvocab_ * head_cap) + raw.size();
             std::fprintf(stderr, "strata mtp: draft head over %lld tokens (%.1f MiB)\n", (long long) n_dvocab_,
                          (double) (n_dvocab_ * row_bytes) / 1048576.0);
             dhead_type_ = head->type();
@@ -857,6 +887,13 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                 std::fprintf(stderr, "strata mtp: the draft head on the Pascal Q8_0 GEMV (STRATA_MTP_Q8_SM60=1)\n");
             }
         }
+    }
+    if (q4_head_ && dhead_ == nullptr) {
+        // (#4333: a warning, not a refusal - the setup config of some machines passes --mtp-q4 all, and a pack without a subset
+        // used to start; drafting then runs over the full head, as it always did)
+        std::fprintf(stderr, "strata mtp: --mtp-q4 head/all has no effect: it requantizes the draft head's subset, and none is installed "
+                             "(rt/draft_vocab.bin or --mtp-draft-vocab FILE is absent or empty, or STRATA_MTP_FULL_HEAD=1 excludes it); "
+                             "drafting runs over the full head. Install a subset (tools/draft_vocab.py) to use it\n");
     }
     if (coupled_draft_env() && cparams_ == nullptr && !setup_coupled(err)) return false;
     return true;
@@ -1972,7 +2009,8 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
         put(t, p + t);
     }
     put(2 * max_t_ - 1, p + a);                                      // output 0's cell
-    for (int j = 1; j < n_out; ++j) put(max_t_ + j - 1, p + a + j);  // every step's cell, staged at once
+    // every step's cell, staged at once: the ones launched now and the ones chain_extend may add
+    for (int j = 1; j < max_t_ - 1; ++j) put(max_t_ + j - 1, p + a + j);
     for (int j = 0; j < 16; ++j) h_force_[j] = j < n_force ? force[j] : -1;
     h_row_[0] = a;
     h_row_[1] = 0;
@@ -1995,6 +2033,30 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
     chain_n_ = n_out;
     ms_draft += ms_since(t0);
     ++rounds;
+    return true;
+}
+
+bool MtpDrafter::chain_extend(int n_out, std::string& err) {
+    const OnDevice on_device(device_);
+    if (chain_n_ < 1 || n_out <= chain_n_) return true;
+    if (!decode_ready(err)) return false;
+    if (n_out > max_t_ - 1 || chain_early_ != chain_n_) { err = "mtp: chain arguments out of range"; return false; }
+    for (int j = chain_n_; j < n_out; ++j)
+        if (step_exec_[j] == nullptr) { err = "mtp: chain graphs not prepared"; return false; }
+    const Clock::time_point t0 = Clock::now();
+    if (!chain_live_) steps_seen_ = chain_n_;   // an ended chain's outputs are all in chain_tok_ (chain_poll)
+    bool ok = true;
+    for (int j = chain_n_; ok && j < n_out; ++j)
+        ok = cudaGraphLaunch(step_exec_[j], cs_) == cudaSuccess && cudaEventRecord(ev_step_[j], cs_) == cudaSuccess;
+    if (!ok || cudaEventRecord(ev_chain_, cs_) != cudaSuccess) {
+        err = std::string("mtp chain: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    (void) cudaStreamQuery(cs_);   // WDDM: submit now
+    chain_early_ = n_out;
+    chain_live_ = true;
+    chain_n_ = n_out;
+    ms_draft += ms_since(t0);
     return true;
 }
 

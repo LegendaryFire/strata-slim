@@ -116,7 +116,7 @@ def start_of(p):
     if os.path.exists("/proc/self/stat"):          # Linux, and that PID has no /proc entry any more
         return None
     try:
-        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(p)], capture_output=True, text=True, timeout=5).stdout.strip()
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(p)], capture_output=True, stdin=subprocess.DEVNULL, text=True, timeout=5).stdout.strip()
     except Exception:
         return None
     return None if not out else "p:" + out
@@ -171,7 +171,7 @@ def _start_token(pid: int) -> str:
             if os.path.exists("/proc/self/stat"):
                 return ""
     try:
-        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, stdin=subprocess.DEVNULL, text=True,
                              timeout=5).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -290,12 +290,11 @@ def popen(args, role: str = "engine", **kw) -> subprocess.Popen:
         parent, then = os.getpid(), kw.pop("preexec_fn", None)
         kw["preexec_fn"] = _die_with_parent(parent, then)
         child = _the_anchor().call(lambda: subprocess.Popen(args, **kw))
+    elif how == "job":
+        child = winjob.start_contained(args, **kw)   # in the job before it runs, so nothing it starts slips out
     else:
         child = subprocess.Popen(args, **kw)
-        if how == "job":
-            winjob.contain(child)
-        else:
-            _watch(child)
+        _watch(child)
     if isinstance(child, _REAL_POPEN):
         with _children_lock:
             _children.add(child)

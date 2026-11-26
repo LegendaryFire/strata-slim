@@ -14,8 +14,14 @@ child is still there.
 """
 
 from __future__ import annotations
+import sys
+if sys.platform == "win32":
+    # CPython 3.12's WMI helper (_wmi, behind platform.system() / uname()) takes an access violation in a worker thread when WMI refuses the
+    # account (0x80041003) and the caller has already gone (DIAG-WINHOST-0216). Without _wmi, platform uses the registry and the environment.
+    sys.modules["_wmi"] = None
 
 from strata_control.private_files import private_mkdir as _private_mkdir
+from strata_control.childenv import arena_env, limit_own_arenas, quiet_crash_env
 import argparse
 import errno
 import hashlib
@@ -47,6 +53,27 @@ MAX_MESSAGE = 64 * 1024
 ROOT = Path(__file__).resolve().parents[1]
 WINDOWS = os.name == "nt"
 _STARTED_HOSTS: dict[str, subprocess.Popen] = {}
+
+#: what a person reads when the helper process that owns the engine is gone (T21); the launch adds the next step (strata_cli/launch/runner.py)
+HELPER_GONE = "The helper program that runs this model stopped by itself, or does not answer."
+
+
+def _note_host_gone(name: str, exc: ProfileError) -> None:
+    """The start lost its host: put the reason into the host log (it is empty when the host died without a word) - what the launcher saw, and the
+    host's exit code when this process started it. Never raises."""
+    if HELPER_GONE not in str(exc):
+        return
+    try:
+        proc = _STARTED_HOSTS.get(name)
+        code = proc.poll() if proc is not None else None
+        seen = (f"the host process {proc.pid} ended with exit code {code}" if code is not None else
+                f"the host process {proc.pid} was still running" if proc is not None else "the host process is not one this launcher started")
+        _, _, log_path = _paths(name)
+        with open(log_path, "a", encoding="utf-8") as stream:
+            stream.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} [strata runtime] profile {name}: the launcher lost the host while the model started "
+                         f"({seen}; its address did not answer). No other line before this one means the host ended without writing one.\n")
+    except Exception:                                   # noqa: BLE001 - a note in a log never changes the outcome
+        pass
 
 
 def _is_private(details: os.stat_result, path: Path) -> bool:
@@ -212,11 +239,16 @@ def _paths(name: str) -> tuple[Path, Path, Path]:
     return directory / f"{name}.json", address, directory / f"{name}.host.log"
 
 
-def _read_state(name: str) -> dict | None:
+def _read_state(name: str, pending_ok: bool = False) -> dict | None:
+    """The owner's state file, or None when there is none. `pending_ok` (a start waiting for the owner it just launched): an empty or half-written
+    file is that owner still writing its state (it creates the file as its lease, then writes it), so it reads as not there yet instead of
+    unreadable (#5601: the test start of an update failed on a 0-byte read that was 191 bytes 100 ms later)."""
     path, socket_path, _ = _paths(_name(name))
     try:
         details = path.lstat()
     except FileNotFoundError:
+        return None
+    if pending_ok and stat.S_ISREG(details.st_mode) and details.st_size == 0:
         return None
     if not stat.S_ISREG(details.st_mode) or not _is_private(details, path) or details.st_size > 16 * 1024:
         raise ProfileError("runtime state file is not private or is invalid", 5)
@@ -225,6 +257,8 @@ def _read_state(name: str) -> dict | None:
     except FileNotFoundError:
         return None                 # the owner left between the look and the read: there is no state any more
     except (OSError, UnicodeError, ValueError):
+        if pending_ok:
+            return None
         raise ProfileError("runtime state file is unreadable", 5) from None
     # POSIX: the address is the one derived from the profile. Windows: the port is chosen when the owner binds, so
     # the state file carries it, and the only address a client may be sent to is a loopback port.
@@ -424,7 +458,7 @@ def _rpc(name: str, command: str, *, timeout: float = 5, params: dict | None = N
     try:
         client = owner_transport.connect(state["socket"], timeout=timeout)
     except OSError:      # nothing listens there any more (a lost owner), or it did not answer in time
-        raise ProfileError("runtime control is unavailable; inspect the private host log", 3) from None
+        raise ProfileError(HELPER_GONE, 3) from None
     try:
         try:
             client.sendall(raw)
@@ -439,7 +473,7 @@ def _rpc(name: str, command: str, *, timeout: float = 5, params: dict | None = N
         except socket.timeout:
             raise ProfileError("runtime operation wait expired; inspect runtime status", 8) from None
         except OSError:
-            raise ProfileError("runtime control is unavailable; inspect the private host log", 3) from None
+            raise ProfileError(HELPER_GONE, 3) from None
     finally:
         client.close()
     if len(answer) > MAX_MESSAGE:
@@ -529,16 +563,16 @@ def _check_start_candidate(name: str, expected_profile_revision: str | None,
 
 def _repair_config_paths(name: str) -> tuple[str | None, str | None]:
     """Before a start: every path of the saved run configs that names a version folder of Strata's own that an update removed (the Control bundle
-    that ran setup: cwd, --expert-profile; an engine package: the picture reader, library folders; the DeepSeek package) is pointed at the current
+    that ran setup: cwd, --expert-profile; an engine package: the picture reader, library folders) is pointed at the current
     version and written once (strata_control/cfg_paths.py; the same resolver the config reader applies in memory).  One line of what it did goes to
     the profile's host log.  Returns (the profile's own run config digest before, after) when it changed that file, for a caller that planned the
     start on the old digest.  A path that exists in no current version stops the start with the file named."""
     try:
-        from strata_control import cfg_paths, dsv41_paths
+        from strata_control import cfg_paths
         profile, _ = profiles.load(name)
         own = Path(profile["source_config"])
         before = hashlib.sha256(own.read_bytes()).hexdigest()
-        configs = [own, *[c for c in dsv41_paths.saved_configs() if c != own]]
+        configs = [own, *[c for c in cfg_paths.saved_configs() if c != own]]
         notes, problems = cfg_paths.repair(configs)
         if notes:
             _, _, log_path = _paths(name)
@@ -557,37 +591,74 @@ def _repair_config_paths(name: str) -> tuple[str | None, str | None]:
         return None, None
 
 
-def _repair_dsv41_paths(name: str) -> None:
-    """Before a start: a saved profile that runs the DeepSeek engine from an engine-dsv41/ folder an update has replaced is pointed at the newest
-    installed package of its own kind (every saved profile's run config, so the next start of another one is repaired too).  Local only: it never
-    looks at the feed and fetches nothing - engine updates are the explicit `strata update` / the app's "Update engine".  Never fails a start;
-    one line of what it did goes to the profile's host log."""
+def _refuse_deepseek(name: str) -> None:
+    """Before a start: a saved profile whose run config is a DeepSeek one stops here with the plain refusal (the model's folder and size
+    when they can be read; strata_control/retired.py).  Nothing is written, no process is started; a local, bounded check."""
+    from strata_control import retired
     try:
-        from strata_control import dsv41_paths
         profile, _ = profiles.load(name)
-        configs = [Path(profile["source_config"]), *[c for c in dsv41_paths.saved_configs() if c != Path(profile["source_config"])]]
-        notes = dsv41_paths.repair_missing(configs)
-        if notes:
-            _, _, log_path = _paths(name)
-            if log_path.parent.is_dir():
-                with open(log_path, "ab") as stream:
-                    for note in notes:
-                        stream.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} engine: {note}\n".encode("utf-8"))
-    except Exception:                                    # noqa: BLE001 - a start never fails because of this
-        pass
+        source = profile.get("source_config")
+    except Exception:                                    # noqa: BLE001 - the usual checks below say what is wrong with the profile
+        return
+    cfg = retired.read_config(source)
+    if retired.config_reason(cfg) or retired.config_file_reason(source):
+        raise ProfileError(retired.refusal(cfg, retired.title(cfg, source)), 6)
 
 
 CHILD_EXIT_GRACE = 10.0     # seconds a host whose server ended on its own keeps answering "failed" (a waiting client reads why), then leaves (#4574 #4824)
 DIE_WITH_MISSES = 3         # consecutive looks, a second apart, at a process that cannot be found before the owner calls it gone (#4973)
 STATUS_RPC_TIMEOUT = 10.0   # seconds one status question may take; a busy owner is asked again until the start's wait is over (#5177)
 VERIFY_BUDGET = 180.0       # seconds an engine that says it is up may take to answer its first token, whatever is left of the load wait (#5177 #5059)
-MAX_START_WAIT = 1800     # seconds a start may wait for the model: a 250 GB DeepSeek set on a slow disk needs more than 10 minutes (#3949)
+STOP_KILL_GRACE = 8.0       # seconds past shutdown_timeout the host waits for its server to end before it kills the tree (Host._stop_child)
+STOP_REAP_WAIT = 10.0       # seconds it then waits for the killed tree to be gone
+MAX_START_WAIT = 1800     # seconds a start may wait for the model: a 250 GB set on a slow disk needs more than 10 minutes (#3949)
+
+
+#: #5400: words in a failed start that say the model did not fit (a refusal of this PC, not a broken engine): no fallback to the previous engine.
+_NO_ROOM = re.compile(r"out of memory|not enough (?:free |graphics |gpu |video )?memory|cudaErrorMemoryAllocation|CUDA_ERROR_OUT_OF_MEMORY|"
+                      r"hipErrorOutOfMemory|cannot allocate memory|MemoryError|address already in use|port .* (?:in use|busy)", re.I)
 
 
 def start(name: str, *, wait: float = 300, shutdown_timeout: float = 30,
           expected_profile_revision: str | None = None,
           expected_source_sha256: str | None = None,
           die_with_pid: int | None = None, on_status=None) -> dict:
+    """Start the saved profile under a new owner host (see _start_once). #5400: an engine the last update switched to without loading the model
+    (memory was short then) is proven by this start: ready clears that; a failure of the engine itself goes back to the previous engine and starts
+    once more, within the same wait. Never a loop: one switch back, and only for that engine."""
+    began = time.monotonic()
+    kw = dict(shutdown_timeout=shutdown_timeout, expected_profile_revision=expected_profile_revision,
+              expected_source_sha256=expected_source_sha256, die_with_pid=die_with_pid, on_status=on_status)
+    result = _start_once(name, wait=wait, **kw)
+    try:
+        from strata_control import updater
+    except Exception:                                   # noqa: BLE001
+        return result
+    if result.get("state") == "ready":
+        updater.mark_proven()
+        return result
+    if result.get("state") != "failed" or wait == 0 or _NO_ROOM.search(f"{result.get('error', '')}\n{result.get('log_tail', '')}"):
+        return result
+    if updater.unproven_in_use() is None:
+        return result
+    try:
+        stop(name, timeout=60)                          # the failed start's host, so nothing serves while the engine is switched
+    except Exception:                                   # noqa: BLE001 - a host that already left
+        pass
+    back = updater.fall_back_from_unproven()
+    if back is None:
+        return result
+    left = max(30.0, wait - (time.monotonic() - began))
+    again = _start_once(name, wait=min(left, MAX_START_WAIT), **kw)
+    again["engine_fallback"] = back
+    again["note"] = back["message"]
+    return again
+
+
+def _start_once(name: str, *, wait: float = 300, shutdown_timeout: float = 30,
+                expected_profile_revision: str | None = None,
+                expected_source_sha256: str | None = None,
+                die_with_pid: int | None = None, on_status=None) -> dict:
     """Start the saved profile under a new owner host.
 
     ``on_status`` (optional) is called with each status answer while the start waits (about every 0.2 s; the caller throttles), so a
@@ -612,10 +683,10 @@ def start(name: str, *, wait: float = 300, shutdown_timeout: float = 30,
     if expected_source_sha256 is not None and (not isinstance(expected_source_sha256, str) or
             not re.fullmatch(r"[0-9a-f]{64}", expected_source_sha256)):
         raise ProfileError("expected source digest must be 64 lowercase hex characters")
+    _refuse_deepseek(name)                             # before anything is written or started (strata_control/retired.py)
     changed_from, changed_to = _repair_config_paths(name)
     if changed_from is not None and expected_source_sha256 == changed_from:
         expected_source_sha256 = changed_to              # (the caller planned on the file as it was; Strata rewrote it, the caller did not)
-    _repair_dsv41_paths(name)
     plan, _ = _check_start_candidate(name, expected_profile_revision, expected_source_sha256)
     on_status = _progress(on_status, {"ok": True, "profile": name, "state": "starting", "phase": "checking_engine"})
     _engine_preflight(plan)                # hashes every engine file (1.4 GB or more): minutes on a slow disk, no owner exists yet
@@ -645,12 +716,12 @@ def start(name: str, *, wait: float = 300, shutdown_timeout: float = 30,
                       if WINDOWS else {"start_new_session": True})
             proc = subprocess.Popen(command,
                                     cwd=ROOT, stdin=subprocess.DEVNULL, stdout=stream,
-                                    stderr=subprocess.STDOUT, close_fds=True, **detach)
+                                    stderr=subprocess.STDOUT, close_fds=True, env=arena_env(os.environ.copy()), **detach)
         _STARTED_HOSTS[name] = proc
         deadline = time.monotonic() + max(5.0, wait)
-        while _read_state(name) is None and proc.poll() is None and time.monotonic() < deadline:
+        while _read_state(name, pending_ok=True) is None and proc.poll() is None and time.monotonic() < deadline:
             time.sleep(0.05)
-        if _read_state(name) is None:
+        if _read_state(name, pending_ok=True) is None:
             if proc.poll() is not None:
                 _STARTED_HOSTS.pop(name, None)
             raise ProfileError("runtime host failed to start; inspect " + str(log_path), 6)
@@ -677,6 +748,7 @@ def _await_start(name: str, wait: float, on_status=None) -> dict:
             # missed answer is not a failed start: keep asking until the wait is over, as long as the owner is still alive. A lost
             # owner (its lease is free, or nothing listens any more) is a failure now.
             if exc.exit_code not in (3, 8) or not _owner_alive(name):
+                _note_host_gone(name, exc)
                 raise
             result = {**result, "state": "starting", "phase": result.get("phase") or "owner_not_answering"}
             time.sleep(0.2)
@@ -780,6 +852,12 @@ def _stop_lost(name: str) -> dict | None:
             "ended": outcome["ended"], "leftover_unverified": outcome["unverifiable"],
             "exit_code": 6 if stuck else 0,
             **({"error": "leftover_process_not_ended"} if stuck else {})}
+
+
+def recover_lost(name: str) -> dict | None:
+    """Clear the record of a managed runtime whose owner host is gone (what `stop` does for a lost host). None, and nothing touched, when the
+    owner is alive: this never asks a running owner to stop."""
+    return _stop_lost(_name(name))
 
 
 def cleanup(profile: str | None = None) -> dict:
@@ -891,6 +969,7 @@ class Host:
         self.probe_key: tuple[int, str] | None = None
         self.probe_result: dict | None = None
         self.rollback_snapshots: set[Path] = set()
+        self.last_teardown_s: float | None = None   # what the last stop of a running server took here (informational, never a bound: #5956)
 
     def _mark_child(self, phase: str, *, pid: int | None = None, ready: Path | None = None) -> None:
         payload = {"host_token": self.token, "phase": phase}
@@ -974,7 +1053,7 @@ class Host:
                        "--owner-fd", "0" if WINDOWS else str(reader)]
         attestation_key = secrets.token_bytes(32)
         expected_attestation = launch_identity.attestation(attestation_key, source_bytes, server_args)
-        child_env = os.environ.copy()
+        child_env = arena_env(quiet_crash_env(os.environ.copy()))   # no debugger on a user's machine for the server's engine and reader; glibc arenas capped (childenv)
         child_env["STRATA_OWNER_ATTEST_KEY"] = attestation_key.hex()
         child_env["STRATA_NO_ACQUIRE"] = "1"      # a managed server never installs or downloads (acquisition.py)
         child_env["STRATA_RUNTIME_PROFILE"] = self.name   # the records of its engine say which profile they belong to
@@ -1122,17 +1201,22 @@ class Host:
             if self.ready_path is not None:
                 self.ready_path.unlink(missing_ok=True)
             return {"ok": True, "state": "stopped", "exit_code": child.returncode if child else 0}
+        began = time.monotonic()
         if WINDOWS:
             self._close_owner_pipe()             # EOF on the server's stdin: it drains and stops (no SIGTERM here)
         else:
             child.send_signal(signal.SIGTERM)
         try:
-            code = child.wait(timeout=self.shutdown_timeout + 8)
+            code = child.wait(timeout=self.shutdown_timeout + STOP_KILL_GRACE)
         except subprocess.TimeoutExpired:
             self._kill_child_tree()
-            child.wait(timeout=10)
+            try:
+                child.wait(timeout=STOP_REAP_WAIT)
+            finally:
+                self.last_teardown_s = round(time.monotonic() - began, 1)
             self._close_owner_pipe()
             return {"ok": False, "state": "failed", "error": "server_stop_deadline_expired", "exit_code": 8}
+        self.last_teardown_s = round(time.monotonic() - began, 1)
         self._close_owner_pipe()
         if self.ready_path is not None:
             self.ready_path.unlink(missing_ok=True)
@@ -1289,6 +1373,12 @@ class Host:
                 "changed": switched or migrated or self.args != candidate_args or
                            self.revision != plan["profile_revision"],
                 "shutdown_timeout": self.shutdown_timeout,
+                # #5956: the stop phase's own worst case (the drain, then the kill and the reap: Host._stop_child) and, apart from it, what the last
+                # stop here took. last_teardown_s is informational: a fast stop says nothing about the next one, so no client may wait less than
+                # the limit. A restart's whole budget is teardown_limit_s + its startup wait, and on a failed load another
+                # teardown_limit_s + startup wait for the rollback (docs/MANAGEMENT_PROTOCOL.md).
+                "teardown_limit_s": round(self.shutdown_timeout + STOP_KILL_GRACE + STOP_REAP_WAIT, 1),
+                "last_teardown_s": self.last_teardown_s,
                 "would_drain": False, "would_start": False}
 
     def _handle(self, request: dict) -> dict:
@@ -1558,6 +1648,13 @@ class Host:
 
 
 def main(argv: list[str] | None = None) -> int:
+    quiet_crash_env()                                   # the host's children inherit it (strata_control/childenv.py)
+    try:                                                # a native death (an access violation) names its Python line in the host log (stderr is that file)
+        import faulthandler
+        faulthandler.enable(all_threads=True)
+    except Exception:                                   # noqa: BLE001 - no stderr to write to: nothing to arm
+        pass
+    limit_own_arenas()                                  # a host started by hand has no MALLOC_ARENA_MAX from its starter
     parser = argparse.ArgumentParser(prog="strata-runtime-host")
     parser.add_argument("--host", required=True)
     parser.add_argument("--shutdown-timeout", type=float, default=30)

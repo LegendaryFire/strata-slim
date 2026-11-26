@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 namespace strata::program::split_rules {
@@ -34,6 +35,15 @@ inline int64_t smallest_stage(const std::vector<int64_t>& cuts, int64_t n_layers
 /// True when some stage owns fewer than kMinStageLayers layers.
 inline bool has_tiny_stage(const std::vector<int64_t>& cuts, int64_t n_layers) {
     return smallest_stage(cuts, n_layers) < kMinStageLayers;
+}
+
+// ---- the trim's credit in the auto search (PR #4522).  At the moment the search runs, CUDA0 holds the dense weights of ALL layers
+// (its arena is built before the split is known) and gives back everything outside its own layers when it reloads trimmed, so its room
+// for experts may count what the trim frees.  A later stage's weights are not loaded yet: its free memory has no full copy in it, and the
+// search already prices its trimmed weights (carve_bytes), so crediting it the same bytes again counts them twice and hands its cache room
+// it does not have.
+inline int64_t trim_credit(int stage, int64_t freed_by_trim) {
+    return stage == 0 && freed_by_trim > 0 ? freed_by_trim : 0;
 }
 
 // ---- #2644: the #1616 floor must not starve a card.  On an asymmetric pair (RTX 4060 Ti 16 GB + RTX 3060 12 GB, 48
@@ -134,6 +144,16 @@ inline size_t pick_with_headroom(const std::vector<Placement>& c, double tol) {
 // below that the probe's noise and the formula's fit are the larger effects.
 
 constexpr double kLinkScaleMin = 4.0;
+
+/// STRATA_SPLIT_LINK_MIN (BW-MG, opt-in): the gap (the fastest stage's link / this stage's) from which the miss term is scaled; unset, empty or anything that is not a number >= 1 keeps kLinkScaleMin.
+/// 2x RTX 5090 on a PCIe 4.0 x8 + x2 board (14.1 and 3.6 GB/s probed, a gap of 3.92): auto K=24 reads a 4K prompt in 5,950 ms against 4,270 on the x8 card alone; with the gap read as 3 the split
+/// puts fewer layers on the x2 card (RESULTS-BW-E.md).
+inline double link_scale_min_resolve(const char* env) {
+    if (env == nullptr || env[0] == '\0') return kLinkScaleMin;
+    char* end = nullptr;
+    const double v = std::strtod(env, &end);
+    return end != env && v >= 1.0 ? v : kLinkScaleMin;
+}
 
 /// Per stage: the factor on its miss term, from the probed H2D GB/s of each stage (<= 0: not probed -> 1.0).
 inline std::vector<double> link_miss_scale(const std::vector<double>& gbps, double min_ratio = kLinkScaleMin) {

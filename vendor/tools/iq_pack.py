@@ -38,6 +38,11 @@ weights. Experts, native attention projections, token embeddings, a Q2_0/Q8_0 PL
 table stay unchanged.
 """
 from __future__ import annotations
+import sys
+if sys.platform == "win32":
+    # CPython 3.12's WMI helper (_wmi, behind platform.system() / uname()) takes an access violation in a worker thread when WMI refuses the
+    # account (0x80041003) and the caller has already gone (DIAG-WINHOST-0216). Without _wmi, platform uses the registry and the environment.
+    sys.modules["_wmi"] = None
 
 import argparse
 import hashlib
@@ -102,23 +107,22 @@ def needs_bf16(name: str, type_name: str) -> bool:
 
 
 def dequantize(raw: np.ndarray, type_name: str) -> np.ndarray:
-    """The tensor's values as float32 (float types exactly, quantized ones through gguf-py's dequantizer)."""
+    """The tensor's values as float32 (float types exactly, quantized ones through tools/strata_quants.py)."""
     if type_name == "F32":
         return raw.view(np.float32)
     if type_name == "F16":
         return raw.view(np.float16).astype(np.float32)
     if type_name == "BF16":
         return (raw.view(np.uint16).astype(np.uint32) << 16).view(np.float32)
-    from _paths import add_gguf_py
-    add_gguf_py()
-    from gguf import GGMLQuantizationType as Q, quants
-    return quants.dequantize(raw, Q[type_name]).astype(np.float32).reshape(-1)
+    from _paths import gguf_lib
+    gguf = gguf_lib()
+    return gguf.quants.dequantize(raw, gguf.GGMLQuantizationType[type_name]).astype(np.float32).reshape(-1)
 
 
 def bf16_bytes(raw: np.ndarray, type_name: str) -> bytes:
-    from _paths import add_gguf_py
-    add_gguf_py()
-    from gguf import GGMLQuantizationType as Q, quants
+    from _paths import gguf_lib
+    gguf = gguf_lib()
+    Q, quants = gguf.GGMLQuantizationType, gguf.quants
     values = quants.dequantize(raw, Q[type_name])
     if not np.isfinite(values).all():
         raise ValueError("cannot convert non-finite weights to BF16")
@@ -605,6 +609,10 @@ def main() -> int:
     a = ap.parse_args()
     if a.compat_bf16 and a.base:
         ap.error("--compat-bf16 cannot reuse --base dense weights")
+    # setup.py runs this with STRATA_EXIT_WITH_PARENT=1: when setup is cancelled or killed (the app quit during "Prepare and load") the packer ends
+    # with it instead of writing on for minutes. What it had written is the resumable part (experts.bin.tmp + its sidecar, dense.bin.tmp).
+    from exit_with_parent import exit_with_parent
+    exit_with_parent()
     # HF snapshot files are symlinks to hash-named blobs. Keep the shard filename for discovery: .absolute(), not
     # .resolve(), which would follow the link to the blob and lose the -0000N-of-0000M name.
     src = pathlib.Path(a.gguf).absolute()

@@ -193,7 +193,14 @@ Invoke-Checked $cmake (@("-S", $Src, "-B", $engineBuild) + $cudaDefinitions + @(
     "-DSTRATA_MMQ_KQUANTS=ON",
     "-DSTRATA_GGML_DIR=$(CMakePath $llama)"
 ))
-Build-Target $engineBuild @("strata", "strata_kq")
+# strata_kq was always built, but it only exists with -DSTRATA_MMQ=ON since v0.2.15, so now only when it's there
+$engineTargets = @("strata")
+& $cmake --build $engineBuild --target strata_kq -- -n *> $null
+$kqTargetExists = $LASTEXITCODE -eq 0
+if ($kqTargetExists) {
+    $engineTargets += "strata_kq"
+}
+Build-Target $engineBuild $engineTargets
 
 $visionBuild = Join-Path $Work "build-vision"
 if (-not $NoVision) {

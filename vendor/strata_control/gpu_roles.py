@@ -14,7 +14,7 @@ Pure functions, no I/O.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from strata_control import gpu_fit
 
@@ -252,6 +252,30 @@ def roles_from_text(text: str, cards: list[dict]) -> dict[int, str]:
     return normalize(full, cards)
 
 
+def speed_stage_order(order: list[int], speeds: dict[int, float], vram_mib: "dict[int, int] | Callable[[], dict[int, int] | None] | None" = None) -> tuple[list[int], str, tuple[int, int] | None]:
+    """THE decision of the card order of an automatic layer split (#1352, #1576, #1760), shared by the start (serve/server.py ordered_gpus) and the plan
+    (`from_legacy`, strata launch --plan): the same function, so the plan can never name a different Main card than the run.
+    `order`: the cards as the config lists them.  `speeds`: {index: multiprocessors x max clock}, every card of `order`.  `vram_mib`: {index: MiB}, or a function
+    that returns it (asked only when a reorder is on the table; None / missing cards: no VRAM check).
+    Returns (order, why, vram) with why:
+      "same"       the speeds are within 5% of each other (#1760): the config's order is kept;
+      "kept"       the order is already speed order: nothing to change;
+      "kept-vram"  the faster card has less total VRAM than the card the config ends on (#1576): the config's order is kept; vram = (that card's MiB, the config's last card's MiB);
+      "faster-last" the cards are put in speed order, the faster card LAST (it runs the head, the draft layer and the verify; a prompt chunk waits on it)."""
+    gl = list(order)
+    if len(gl) < 2:
+        return gl, "same", None
+    if max(speeds[i] for i in gl) < SAME_SPEED * min(speeds[i] for i in gl):
+        return gl, "same", None     # #1760: cards within 5% of each other are the same card (two 5070 Ti read 1.2% apart on the clock): keep the order
+    out = sorted(gl, key=lambda i: speeds[i])
+    if out == gl:
+        return gl, "kept", None
+    vram = vram_mib() if callable(vram_mib) else vram_mib
+    if vram is not None and all(i in vram for i in gl) and vram[out[-1]] < vram[gl[-1]]:
+        return gl, "kept-vram", (vram[out[-1]], vram[gl[-1]])
+    return out, "faster-last", None
+
+
 def from_legacy(gpu: Any, cards: list[dict], gpu_order: str | None = None, speed_order: bool = True) -> dict[int, str]:
     """Roles of an old "gpu" setting, for display: the LAST card of the engine's order is Main, earlier ones are Helpers, unlisted cards are Off.
     `gpu` None / "" / []: the recommendation (nothing was chosen)."""
@@ -264,9 +288,11 @@ def from_legacy(gpu: Any, cards: list[dict], gpu_order: str | None = None, speed
     items = [i for i in items if i in cs]
     if not items:
         return dict(recommend(cards)["roles"])
-    if len(items) > 1 and gpu_order != "as_given" and speed_order:
-        if max(_speed(cs[i]) for i in items) >= SAME_SPEED * max(1e-9, min(_speed(cs[i]) for i in items)) and all(_speed(cs[i]) for i in items):
-            items = sorted(items, key=lambda i: _speed(cs[i]))       # the engine puts the faster card last (#1352)
+    if len(items) > 1 and gpu_order != "as_given" and speed_order and all(_speed(cs[i]) for i in items):
+        # the engine's own decision (serve/server.py ordered_gpus calls the same function): the faster card last (#1352), unless the speeds are within 5% (#1760)
+        # or the faster card has less VRAM than the one the list ends on (#1576)
+        vram = {i: int(_mem(cs[i]) * 1024) for i in items} if all(_mem(cs[i]) for i in items) else None
+        items = speed_stage_order(items, {i: _speed(cs[i]) for i in items}, vram)[0]
     roles = {i: "off" for i in cs}
     for i in items[:-1]:
         roles[i] = "helper"
@@ -348,9 +374,15 @@ def sentence(cards: list[dict], vendor: str | None = None) -> str:
         return f"Strata will use your {short_name(m)}."
     helpers = [byi[i] for i, r in rec["roles"].items() if r == "helper"]
     why = {"same": "the cards are alike", "memory": "it has more memory", "faster": "it is faster", "only": "it is the only card"}[rec["why"]]
-    s = f"{short_name(m)} is Main: {why}."
-    if helpers:
-        s += " " + " and ".join(short_name(h) for h in helpers) + (" help." if len(helpers) > 1 else " helps.")
+    if helpers and rec["why"] == "same" and all(short_name(h) == short_name(m) for h in helpers):
+        # 0217 item 12: "RTX A4000 is Main: the cards are alike. RTX A4000 helps." named one card three times and told nothing; the cards are the same, so say that
+        n = len(helpers) + 1
+        s = (f"Both cards are {short_name(m)}, so they are alike: one is Main and the other helps." if n == 2 else
+             f"All {n} cards are {short_name(m)}, so they are alike: one is Main and the others help.")
+    else:
+        s = f"{short_name(m)} is Main: {why}."
+        if helpers:
+            s += " " + " and ".join(short_name(h) for h in helpers) + (" help." if len(helpers) > 1 else " helps.")
     for i, r in rec["roles"].items():
         if r == "off":
             code = rec["reasons"][i]
@@ -508,7 +540,9 @@ def nvidia_speeds(timeout: float = 20.0) -> dict[int, float]:
         env = dict(os.environ)
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         env.pop("CUDA_VISIBLE_DEVICES", None)
-        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, errors="replace", timeout=timeout, env=env)
+        # stdin=DEVNULL (A9, measured): inside the app's MCP server (stdin and stdout are pipes to the host) this child ran into its 20 s limit with the parent's stdin and its answer was thrown away;
+        # with no stdin it takes 0.05 s. It made the app's first read of the PC take 25 s instead of 4.
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, errors="replace", timeout=timeout, env=env, stdin=subprocess.DEVNULL)
         out = {}
         for line in r.stdout.splitlines():
             i, sm, khz = (int(x) for x in line.split())

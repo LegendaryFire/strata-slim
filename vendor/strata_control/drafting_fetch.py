@@ -32,7 +32,37 @@ class DraftingError(RuntimeError):
 
 
 class OfflineError(DraftingError):
-    """The download address did not answer (no internet, or a host that is down). Setup skips this one silently: the model keeps the MTP (strata-offline-users)."""
+    """The download address did not answer (no internet, or a host that is down). Setup skips this one silently: the model keeps the MTP (strata-offline-users).
+    `files_note`: when known, the exact file(s) to copy in by hand, by name and size (offline_files_note); the message itself stays the one the app's texts carry."""
+    files_note: str = ""
+
+
+def _mb(size: int) -> str:
+    return f"{size / 1e6:.0f} MB"
+
+
+def offline_files_phrase(*, tuned: bool = False, variant: str | None = None, engine_reads_q4: bool | None = None) -> str:
+    """The file(s) that make the drafter work without internet, by name and size: "this file: NAME (340 MB)" or "one of these files: A (522 MB), or the smaller B (340 MB)"."""
+    if tuned:
+        pin = drafting.tuned_pack(variant)
+        files = [(pin.name, pin.size)]
+    else:
+        files = [(drafting.PACK_NAME, drafting.PACK_BYTES)]
+        if (drafting.engine_has_selector_q4() if engine_reads_q4 is None else engine_reads_q4):
+            files.append((drafting.CONVERTED_NAME, drafting.CONVERTED_BYTES))
+    if len(files) == 1:
+        return f"this file: {files[0][0]} ({_mb(files[0][1])})"
+    return f"one of these files: {files[0][0]} ({_mb(files[0][1])}), or the smaller {files[1][0]} ({_mb(files[1][1])})"
+
+
+def offline_files_note(data_dir: str | Path | None, *, tuned: bool = False, variant: str | None = None, engine_reads_q4: bool | None = None) -> str:
+    """D1 (0.2.16 retest): what to put in place when the computer cannot download the drafter, by file name and size.  Without internet the drafter works from
+    ONE of two files copied into the model data folder's dflash2 folder (from another computer's Strata): the Q4_0 pack, or - for an engine that reads it
+    (CUDA, AMD, Metal) - the smaller prepared file.  A set with a tuned drafter has its own file (`tuned`, `variant`).  Plain words, no jargon.
+    The Save screen and the launch line say the same (0217 item 9: Save said "both .pack files")."""
+    folder = (Path(data_dir) / drafting.FOLDER) if data_dir else Path(drafting.FOLDER)
+    what = offline_files_phrase(tuned=tuned, variant=variant, engine_reads_q4=engine_reads_q4)
+    return f"To use it without internet, copy {what} into the folder {folder} (from a computer that has it) and start again."
 
 
 def plan(data_dir: str | Path, engine: str | os.PathLike[str] | None = None, *, model_name: str | None = None, backend: str | None = None, archs=None,
@@ -182,21 +212,41 @@ def _feed_source(feed: str | None = None) -> str:
     return os.environ.get(update_cmd.ENV_FEED) or update_cmd.default_feed()
 
 
+def _accepted_sequence(components: str | Path | None = None) -> tuple[int | None, Path | None]:
+    """(the last feed sequence this computer accepted, the file that remembers it): what `strata update` refuses to go below
+    (updater.open_feed, ``<components>/.updates/state.json``). (None, None) when nothing was accepted yet or the file cannot be read."""
+    try:
+        from strata_cli import update_cmd
+        from strata_control import engine_component as ec, updater
+        root = Path(components) if components else update_cmd.default_components_dir(ec)
+        state = updater.State(root)
+        value = (state.data.get("feed") or {}).get("sequence")
+        return (int(value), state.path) if isinstance(value, int) and not isinstance(value, bool) else (None, None)
+    except Exception:                                     # noqa: BLE001 - a state file that cannot be read accepts nothing, as for the update
+        return None, None
+
+
 def tuned_from_feed(*, feed: str | None = None, backend: str | None = None, size: int | None = None, sha256: str | None = None, name: str | None = None,
-                    variant: str | None = None) -> tuple[str, int, str] | None:
+                    variant: str | None = None, components: str | Path | None = None) -> tuple[str, int, str] | None:
     """(address, size, sha256) of the tuned drafter as the signed feed lists it (member ``drafters``), or None: the feed cannot be read (offline, the host is down: silent), has no
     such entry for this engine family, or lists other bytes than the ones this Strata was measured with (pinned size and SHA-256: then it is another drafter, not ours).
-    A feed that does not verify is DraftingError: a bad signature, an expired feed. A build that trusts no key (a source checkout from before the keys) is silent."""
-    from strata_control import signing
+    A feed that does not verify is DraftingError: a bad signature, an expired feed, or a feed older than the one `strata update` already accepted on this computer
+    (the update's own rule, updater.open_feed: a replayed older feed could name a drafter file the newer one no longer lists). Only the update moves the
+    accepted sequence; this lookup reads it. A build that trusts no key (a source checkout from before the keys) is silent."""
+    from strata_control import signing, updater
     pin = drafting.tuned_pack(variant)
     want_size = pin.size if size is None else size
     want_sha = pin.sha256 if sha256 is None else sha256
     want_name = name or pin.name
     source = _feed_source(feed)
+    last, state_file = _accepted_sequence(components)
     try:
-        loaded = feedmod.fetch(source, signing.load_trusted_keys(), timeout=FEED_TIMEOUT, channel="stable")
+        loaded = feedmod.fetch(source, signing.load_trusted_keys(), timeout=FEED_TIMEOUT, channel="stable", last_sequence=last)
+    except feedmod.FeedDowngrade as exc:
+        words = updater.downgrade_words(exc.sequence, exc.accepted, state_file) if state_file is not None else str(exc)
+        raise DraftingError(f"The update feed could not be trusted: {words}") from None
     except feedmod.FeedError as exc:
-        if exc.exit_code == 6 or "trusts no update key" in str(exc):
+        if isinstance(exc, feedmod.FeedUnreachable) or exc.exit_code == 6 or "trusts no update key" in str(exc):
             return None
         raise DraftingError(f"The update feed could not be trusted: {exc}") from None
     for entry in loaded.drafters:
@@ -205,6 +255,20 @@ def tuned_from_feed(*, feed: str | None = None, backend: str | None = None, size
                 return None
             return loaded.url(entry.url), entry.size, entry.sha256
     return None
+
+
+def tuned_offered(*, feed: str | None = None, backend: str | None = None, variant: str | None = None, components: str | Path | None = None) -> bool | None:
+    """Does the signed feed list the tuned drafter for this engine family (the same question ensure_tuned asks before it downloads)? True: it does, so the launch fetches that
+    small file. False: the feed answers but lists none (a test feed, an older release), so the launch fetches the standard drafter. None: not known (offline, the host is down, a feed
+    that does not verify): the launch says what happened itself. Reads the feed once; nothing is written. Used by the plan, so it lists the size the launch really downloads (0217 item 3)."""
+    from strata_control import signing
+    pin = drafting.tuned_pack(variant)
+    last, _state = _accepted_sequence(components)
+    try:
+        loaded = feedmod.fetch(_feed_source(feed), signing.load_trusted_keys(), timeout=FEED_TIMEOUT, channel="stable", last_sequence=last)
+    except Exception:                                     # noqa: BLE001 - not known is not "no": the plan keeps the tuned size until the feed answers
+        return None
+    return any(e.name == pin.name and (backend or drafting.TUNED_BACKEND) in e.backends and e.size == pin.size and e.sha256 == pin.sha256 for e in loaded.drafters)
 
 
 def _reachable(location: str) -> bool:
@@ -259,8 +323,10 @@ def ensure_tuned(data_dir: str | Path, *, progress: Progress | None = None, canc
     out.parent.mkdir(parents=True, exist_ok=True)
     partial = out.with_name(out.name + ".part")
     try:
-        transfer.download(location, partial, size=want_size, sha256=want_sha, cancel=cancel,
+        transfer.download(location, partial, size=want_size, sha256=want_sha, cancel=cancel, what="the tuned DFlash2 drafter",
                           progress=lambda d, _s: report("Downloading the tuned DFlash2 drafter…", d, want_size))
+    except transfer.Unreachable as exc:
+        raise DraftingError(str(exc)) from None          # the network rule's sentence: the host, what to check, what still works
     except transfer.ChecksumMismatch:
         raise DraftingError("The tuned DFlash2 drafter did not pass the safety check, so it was deleted.") from None
     except transfer.Cancelled:
@@ -324,8 +390,10 @@ def ensure(data_dir: str | Path, *, progress: Progress | None = None, cancel: th
     src = folder / "src"
     spec = tuple(files if files is not None else drafting.FILES)
     have = _present([src, *(_hub_snapshots() if files is None else [])], spec)       # already here and checked: used where it is, never fetched again
-    if len(have) < len(spec) and not online(base_url or drafting.BASE_URL):
-        raise OfflineError("There is no internet connection, so the DFlash2 drafter can't be downloaded now.")
+    if len(have) < len(spec) and not online(base_url or drafting.base_url()):
+        offline = OfflineError("There is no internet connection, so the DFlash2 drafter can't be downloaded now.")
+        offline.files_note = offline_files_note(data_dir)
+        raise offline
     src.mkdir(parents=True, exist_ok=True)
     total = sum(size for _n, size, _h in spec)
     done_before = 0
@@ -334,8 +402,10 @@ def ensure(data_dir: str | Path, *, progress: Progress | None = None, cancel: th
             base = done_before
             partial = src / (name + ".part")
             try:
-                transfer.download((base_url or drafting.BASE_URL) + name, partial, size=size, sha256=sha, cancel=cancel,
+                transfer.download((base_url or drafting.base_url()) + name, partial, size=size, sha256=sha, cancel=cancel, what="the DFlash2 drafter",
                                   progress=lambda d, _s, base=base: report("Downloading the DFlash2 drafter…", base + d, total))
+            except transfer.Unreachable as exc:
+                raise DraftingError(str(exc)) from None  # the network rule's sentence: the host, what to check, what still works
             except transfer.ChecksumMismatch:
                 raise DraftingError("The downloaded DFlash2 file did not pass the safety check, so it was deleted. Try again; if it keeps "
                                     "happening, use MTP for now.") from None

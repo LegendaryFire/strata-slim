@@ -21,6 +21,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent      # the project root: manifest.txt, vendor/, .upstream/
 UPSTREAM_URL = os.environ.get("UPSTREAM_URL") or "https://github.com/Niko1221/Strata.git"
+# upstream's folders since v0.2.16 and where they go in vendor/: one flat tree as before, so the Dockerfiles and patches
+# keep their paths
+FLATTEN = (("engine/", ""), ("terminal/", ""), ("tools/packaging/", "packaging/"))
 
 log = logging.getLogger(__name__)
 
@@ -87,14 +90,20 @@ def extract(tag: str) -> None:
     archive = subprocess.Popen(["git", "-C", str(src), "archive", "--format=tar", commit, "--", *specs],
                                stdout=subprocess.PIPE)
     with tarfile.open(fileobj=archive.stdout, mode="r|") as tar:
-        tar.extractall(new, filter="tar")
+        for member in tar:
+            for old, flat in FLATTEN:
+                if member.name.startswith(old):
+                    member.name = flat + member.name[len(old):]
+                    break
+            if member.name.strip("/"):
+                tar.extract(member, new, filter="tar")
     if archive.wait() != 0:
         raise ExtractError("git archive failed")
 
     # the config keys the server reads (cfg.get("key") / cfg["key"] in serve/): launch.py warns about a CONFIG_<KEY>
     # not among them
     keys = set()
-    for py in Path(new, "serve").glob("*.py"):
+    for py in Path(new, "serve").rglob("*.py"):   # serve/server_parts/ too (since v0.2.16)
         keys.update(re.findall(r'cfg(?:\.get\(|\[)"([a-z_][a-z0-9_]*)"', py.read_text(encoding="utf-8")))
     Path(new, ".config-keys").write_text("".join(f"{k}\n" for k in sorted(keys)))
 

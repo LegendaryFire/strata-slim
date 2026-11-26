@@ -50,9 +50,6 @@ BOOL_FLAGS = frozenset({"--kv-grow", "--trim-stage-weights", "--no-host-worker",
                         "--resident-experts", "--prompt-cache-tail", "--vram-elastic", "--split-skip-if-fits",
                         "--resident-cpu-experts", "--no-hit-poke", "--expert-cache-per-layer", "--batch-mtp"})
 
-#: Flags of BOOL_FLAGS that strata-dsv41 (DeepSeek) reads with a word: ``--mmap-experts on|off|auto`` (src/dsv41/ds4_main.cpp). A bare one there takes the
-#: next argument as its word, or stops the engine ("--mmap-experts needs a value") when it is last. Qwen's engine takes it as a bare switch (#5027).
-DSV41_WORD_FLAGS = frozenset({"--mmap-experts"})
 
 
 # --------------------------------------------------------------------------- the arms
@@ -401,6 +398,19 @@ class PlannedArm:
     env: dict[str, str | None]
 
 
+def arm_flags() -> set[str]:
+    """Every flag any arm can put on the engine's command line.
+
+    `tuning.engine_flag_inventory` probes the ones the engine's `--help` does not list, and it
+    needs to know which those could be. The arms know, so they say: a flag that is supported but
+    undocumented must not turn into a silently skipped arm.
+    """
+    out: set[str] = set()
+    for arm in ARMS:
+        out.update(arm.requires_flags())
+    return out
+
+
 def plan_arms(ctx: Context, *, mode: str = "quick", history_bad: set[str] | None = None) -> tuple[list[PlannedArm], list[dict[str, str]]]:
     """The candidates for this machine in the order they are tried, and the ones left out with the reason.
 
@@ -504,7 +514,7 @@ def signature(args: dict[str, Any], env: dict[str, str | None] | None = None) ->
 
 def apply_to_argv(argv: Sequence[str], args: dict[str, Any], bool_flags: frozenset[str] = BOOL_FLAGS) -> list[str]:
     """The user's argv with the candidate's settings put on top (Rule 3: a boolean is present or absent).
-    `bool_flags`: the engine's flags that take no value (strata-dsv41 gives --mmap-experts a word, see DSV41_WORD_FLAGS)."""
+    `bool_flags`: the engine's flags that take no value."""
     out = list(argv)
     for flag, value in args.items():
         i = 0

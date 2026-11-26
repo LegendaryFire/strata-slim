@@ -369,16 +369,39 @@ def footprint(cfg: dict, config: Path | None = None) -> Footprint:
     return fp
 
 
+def _models_chain(first: Path) -> tuple[Path, list[Path]]:
+    """#3528: the data folder for a model under the ``models`` dir ``first``, and the ``models`` dirs from ``first`` up to that data folder.
+    One ``models`` level is the plain layout: its parent is the data folder.  Several in a row (``Strata-data/models/models/...``, a nest an
+    earlier Terminal left, one level per install) are one: the innermost level whose parent shows the data folder's own layout (a ``packs`` or
+    ``mtp`` folder) is it, so a data folder that is itself called ``models`` keeps working; with no such sign, the outermost."""
+    chain = [first]
+    while chain[-1].parent != chain[-1] and chain[-1].parent.name.lower() == "models" and len(chain) < 512:
+        chain.append(chain[-1].parent)
+    if len(chain) == 1:
+        return first.parent, chain
+    for i, models in enumerate(chain):
+        data = models.parent
+        if (data / "packs").is_dir() or (data / "mtp").is_dir():
+            return data, chain[:i + 1]
+    return chain[-1].parent, chain
+
+
 def data_dir_of(fp: Footprint) -> Path | None:
-    """The data folder an installed model lives in: the parent of its ``packs`` folder, else the one holding ``models``."""
+    """The data folder an installed model lives in: the parent of its ``packs`` folder, else the one holding ``models`` (a nest of
+    ``models`` dirs counts as one, ``_models_chain``).  A ready-made pack downloaded into ``models/<owner>--<repo>/pack`` sits under
+    ``models``, so its data folder is the one holding ``models``."""
     if fp.pack is not None:
+        if fp.pack.parent.name.lower() != "packs":
+            for parent in fp.pack.parents:
+                if parent.name.lower() == "models":
+                    return _models_chain(parent)[0]
         return fp.pack.parent.parent
     if fp.mtp is not None and fp.mtp.name.lower() == "rt":
         return fp.mtp.parent.parent
     for w in fp.weights:
         for parent in w.parents:
             if parent.name.lower() == "models":
-                return parent.parent
+                return _models_chain(parent)[0]
     return None
 
 
@@ -405,6 +428,51 @@ def mtp_layer_in(*folders: "str | os.PathLike[str] | None") -> Path | None:
     return None
 
 
+def in_hf_cache(path: str | os.PathLike[str], environ=None) -> bool:
+    """Whether `path` is inside a Hugging Face cache (a `models--<org>--<name>` folder with its snapshots/ and blobs/, or the cache folder
+    itself: HF_HUB_CACHE, HF_HOME/hub, ~/.cache/huggingface). Strata never writes there: the cache is the hub library's, and a
+    file added beside a snapshot's links confuses it."""
+    environ = os.environ if environ is None else environ
+    p = Path(path).expanduser()
+    try:
+        p = p.resolve()
+    except OSError:
+        pass
+    if any(part.lower().startswith("models--") for part in p.parts):
+        return True
+    roots = [environ.get("HF_HUB_CACHE"), environ.get("HUGGINGFACE_HUB_CACHE"), environ.get("HF_HOME"),
+             str(Path("~/.cache/huggingface").expanduser())]
+    for r in roots:
+        if not r:
+            continue
+        try:
+            root = Path(r).expanduser().resolve()
+        except OSError:
+            continue
+        if p == root or root in p.parents:
+            return True
+    try:
+        return p.is_dir() and any(c.name.lower().startswith("models--") for c in p.iterdir())     # a cache folder of another name
+    except OSError:
+        return False
+
+
+def writable_beside(gguf: Path | None) -> Path | None:
+    """The data folder guessed from where the person's own model file sits (`prepared_beside`'s "data_dir": the folder above a `models`
+    folder), only when Strata may keep its own files there: it can write to it and neither it nor its models/ is inside a Hugging Face
+    cache. None: use the data folder every command agrees on instead (the model files are still used where they are)."""
+    if gguf is None:
+        return None
+    found = prepared_beside(gguf)["data_dir"]
+    if found is None:
+        return None
+    found = Path(found)
+    if in_hf_cache(found) or in_hf_cache(found / "models"):
+        return None
+    from strata_control import folders
+    return None if folders.problem(str(found)) else found
+
+
 def prepared_beside(gguf: Path, data_dirs: Iterable[str | os.PathLike[str] | None] = ()) -> dict:
     """What was already prepared for a model file that sits in ``<data>/Models/<tag>/`` (or ``<data>/models/<tag>/``): its pack, the draft
     layer and the picture reader, found by the layout setup and the desktop app both use. Reads only; absent items are None.
@@ -417,14 +485,15 @@ def prepared_beside(gguf: Path, data_dirs: Iterable[str | os.PathLike[str] | Non
     out: dict = {"data_dir": None, "pack": None, "mtp": None, "mmproj": None}
     for parent in folder.parents:
         if parent.name.lower() == "models":
-            data = parent.parent
+            data, levels = _models_chain(parent)                # #3528: a nest of models dirs is one
             out["data_dir"] = data
-            tag = folder.name.lower() if folder != parent else ""
+            tag = folder.name.lower() if folder not in levels else ""
             if tag and (data / "packs" / tag).is_dir():
                 out["pack"] = data / "packs" / tag
             if (data / "mtp" / "rt" / "experts.bin").is_file():
                 out["mtp"] = data / "mtp" / "rt"
-            for cand in sorted(parent.glob("mmproj*.gguf")) + sorted(folder.glob("mmproj*.gguf")):
+            # the picture reader in any models level of the nest (innermost first, as before), then beside the model
+            for cand in [c for level in levels for c in sorted(level.glob("mmproj*.gguf"))] + sorted(folder.glob("mmproj*.gguf")):
                 out["mmproj"] = cand
                 break
             break

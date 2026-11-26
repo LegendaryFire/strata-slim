@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1
 # strata-slim for AMD Radeon (RDNA, the HIP backend): the same engine, server and model prep as ./Dockerfile.
 #
-#   docker build -f Dockerfile.rocm -t strata-slim:0.2.13-rocm .                         # RDNA3 + RDNA4, 4 compile jobs
-#   docker build -f Dockerfile.rocm -t strata-slim:0.2.13-rocm --build-arg HIP_ARCHITECTURES=gfx1201 --build-arg BUILD_JOBS=8 .
-#   docker build -f Dockerfile.rocm -t strata-slim:0.2.13-patched-rocm --build-arg PATCHES=all .   # with the local fixes
+#   docker build -f Dockerfile.rocm -t strata-slim:0.2.17-rocm .                         # RDNA3 + RDNA4, 4 compile jobs
+#   docker build -f Dockerfile.rocm -t strata-slim:0.2.17-rocm --build-arg HIP_ARCHITECTURES=gfx1201 --build-arg BUILD_JOBS=8 .
+#   docker build -f Dockerfile.rocm -t strata-slim:0.2.17-patched-rocm --build-arg PATCHES=all .   # with the local fixes
 #
 # HIP_ARCHITECTURES (upstream's table, cmake/hip_backend.cmake and docs/AMD_HIP.md):
 #   gfx1100 RX 7900 XT/XTX, gfx1201 RX 9070/9070 XT and Radeon AI PRO R9700   (tested by upstream's maintainers)
@@ -33,6 +33,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 RUN python3 -m venv /tools
 WORKDIR /src
+# upstream (since v0.2.16) splits engine/ and terminal/, and some sources reach across as ../engine/ or ../terminal/; vendor/
+# is one flat tree, so both are /src
+RUN ln -s /src /engine && ln -s /src /terminal
 COPY vendor/requirements-build.txt /src/requirements-build.txt
 RUN /tools/bin/pip install --no-cache-dir -r requirements-build.txt
 

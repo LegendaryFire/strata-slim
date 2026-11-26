@@ -124,6 +124,7 @@ def config_for(inp: SetupInputs, lib) -> SetupConfig:
     fam = inp.fam
     family = inp.family
     gpu = inp.gpu
+    gpu_uma = bool((gpu or {}).get("uma"))
     hip = inp.hip
     in_budget = inp.in_budget
     lib_dirs = inp.lib_dirs
@@ -226,13 +227,15 @@ def config_for(inp: SetupInputs, lib) -> SetupConfig:
         resident = False                               # an engine from before --resident-experts would refuse it
         ok(f"low-RAM mode: engine {meta.get('version')} has no resident variant yet; the experts are read through "
            "the OS file cache (run setup again after the next engine update)")
+    work_budget, work_asked = None, None               # the app's "Leave 20% for my work" number (the old rule), written beside the budget (setup.work_budget_key)
     if low_ram and ready:
         # NVFP4 (68 GB of experts) on a PC whose RAM does not hold them: the RAM-budget mode, as Unsloth's files - the
-        # most-used experts outside VRAM pinned within RAM less 24 GB, the rest read from experts.bin.  Mapped
+        # most-used experts outside VRAM pinned within RAM less 17 GB (24 on a unified-memory GPU), the rest read from experts.bin.  Mapped
         # (--mmap-experts) on a 64 GB Windows PC, the experts it read stayed in the engine's working set: free RAM
         # fell to 0.6 GB on the RTX 5070 PC (2026-10-13), where the budget mode kept 22 GB free
-        rb = resident_budget_gib(model, ram)
+        rb = resident_budget_gib(model, ram, uma=gpu_uma)
         args += ["--resident-budget-gib", str(rb)]
+        work_budget = resident_budget_gib(model, ram, uma=gpu_uma, work=True)
         ok(f"low-RAM mode: {rb} GiB of {model}'s experts kept in RAM (the most used), the rest read from the pack's "
            "experts.bin on the SSD as needed")
     elif low_ram:   # the experts from the pack's experts.bin: the ones the GPU does not hold copied into RAM, or mapped
@@ -313,11 +316,11 @@ def config_for(inp: SetupInputs, lib) -> SetupConfig:
         if q4_split:                                   # #498: no budget to take it out of
             pass
         elif budget is not None and a.resident_budget_gib is None:   # its RAM comes out of the experts' budget
-            budget = resident_budget_gib(model, ram, kv_ram_gb)
+            budget = resident_budget_gib(model, ram, kv_ram_gb, gpu_uma)
             ok(f"RAM budget: {budget} GiB (less the KV cache's RAM)")
-        elif budget is not None and budget > resident_budget_gib(model, ram, kv_ram_gb):
+        elif budget is not None and budget > resident_budget_gib(model, ram, kv_ram_gb, gpu_uma):
             warn(f"the KV cache's {kv_ram_gb:.1f} GB of RAM come on top of your {budget:g} GiB RAM budget (setup "
-                 f"would take them out of it: {resident_budget_gib(model, ram, kv_ram_gb)} GiB); kept as you chose")
+                 f"would take them out of it: {resident_budget_gib(model, ram, kv_ram_gb, gpu_uma)} GiB); kept as you chose")
     elif ctx >= 65536:   # #620: say why, so a regenerated config that lost --kv-resident is not a surprise
         ok(f"KV streaming off: it needs ~{stream_need:.0f} GB of RAM for {model} (its experts, the room beside them "
            f"and the {kv_ram_gb:.1f} GB cache), and this PC has {ram:.0f}; the KV cache stays in VRAM (fewer cached experts). --kv-streaming on "
@@ -326,6 +329,8 @@ def config_for(inp: SetupInputs, lib) -> SetupConfig:
         warn("--kv-streaming on: a context under 64K is not streamed (the attention's window holds all of it): off")
     if budget is not None and not q4_split:   # UD-Q4_K_XL: the experts read from the GGUF in place, the most-used N
         args += ["--resident-budget-gib", f"{budget:g}"]   # GiB kept in RAM (#498: a layer split had no budget)
+        work_budget = resident_budget_gib(model, ram, kv_ram_gb if "--kv-resident" in args else 0.0, gpu_uma, work=True)
+        work_asked = a.resident_budget_gib
         if gpu.get("uma") and "--expert-cache" in args:
             # #1715: the cache and the budget draw on the same RAM: a number that leaves the OS its room, not `auto`
             slots = uma_expert_cache(model, ram, budget, kv_ram_gb if "--kv-resident" in args else 0.0)
@@ -427,6 +432,7 @@ def config_for(inp: SetupInputs, lib) -> SetupConfig:
            "lib_dirs": lib_dirs, "port": port}
     if cuda_tk == 12:                                  # the experimental CUDA 12 engine (engine-cuda12/)
         cfg["cuda"] = 12
+    lib.work_budget_key(cfg, work_budget, work_asked)  # "ui_budget_work_gib": the number "Leave 20% for my work" swaps in for args' budget (none: the app leaves the budget alone)
     if (uenv := unsloth_default_env(family, model, hip, in_budget, str(gpu.get("arch") or ""))):
         cfg["env"] = uenv
     if hip:
@@ -439,7 +445,7 @@ def config_for(inp: SetupInputs, lib) -> SetupConfig:
         else:
             table = hipblaslt_table(gpu["arch"], lib_dirs, meta.get("hipblaslt_version"), [eng / "tuning"])
             if table:
-                cfg["env"] = {"STRATA_HIPBLASLT_TUNING": str(table)}
+                cfg.setdefault("env", {})["STRATA_HIPBLASLT_TUNING"] = str(table)
         if GFX1103_OPT_IN and gfx_arch_is(gpu["arch"], "gfx1103") and not WIN:
             # the 780M's KFD queues are evicted (a GPU reset) while transparent huge pages move the pinned expert arena
             cfg.setdefault("env", {})["STRATA_NO_ARENA_THP"] = "1"
@@ -529,6 +535,8 @@ def config_for(inp: SetupInputs, lib) -> SetupConfig:
         if a.mtp == "off":
             cfg["mtp"] = False
             removed = draft_layer.apply(cfg)
+            if getattr(a, "feed_no_drafter", False):
+                cfg["drafting"] = "off"                # a feed model with no draft layer (its entry says drafter: none): no drafter at any start, Auto or not
             ok("the draft layer (MTP) is off for this model" + (f" ({' '.join(removed)} left out)" if removed else "") +
                ": less graphics memory and RAM, slower words per second. `--mtp on` turns it back on")
         else:
@@ -540,7 +548,7 @@ def config_for(inp: SetupInputs, lib) -> SetupConfig:
         if a.parallel >= 2:
             cfg["parallel"] = a.parallel
             for i, line in enumerate(parallel_note(a.parallel, [g.get("vram_gb", 0.0) for g in chosen],
-                                                   MODELS[model]["arena_gb"], ctx, kv, streaming)):
+                                                   MODELS[model]["arena_gb"], ctx, kv, streaming, ram)):
                 (ok if i == 0 else warn)(line)
         else:
             cfg["parallel"] = 1
@@ -580,95 +588,3 @@ def config_for(inp: SetupInputs, lib) -> SetupConfig:
             continue
         say("  " + line)
     return SetupConfig(cfg=cfg, cfg_path=cfg_path, cal=cal, args=args, ctx=ctx, kv=kv, resident=resident)
-
-
-@dataclass
-class Dsv41Inputs:
-    a: Any = None
-    cards: Any = None
-    ctx: Any = None
-    cuda_tk: Any = None
-    ds_vision: Any = None
-    exe: Any = None
-    fam: Any = None
-    hip: Any = None
-    lib_dirs: Any = None
-    mac: Any = None
-    md: Any = None
-    named: Any = None
-    pack: Any = None
-    plan: Any = None
-    port: Any = None
-    ram: Any = None
-    tag: Any = None
-
-
-@dataclass
-class Dsv41Config:
-    cfg: dict
-    cfg_path: Path
-
-
-def dsv41_config_for(inp: Dsv41Inputs, lib) -> Dsv41Config:
-    """DeepSeek-V4.1-Flash: the run config `install_dsv41()` writes (the same kind of move as `config_for`)."""
-    a = inp.a
-    cards = inp.cards
-    ctx = inp.ctx
-    cuda_tk = inp.cuda_tk
-    ds_vision = inp.ds_vision
-    exe = inp.exe
-    fam = inp.fam
-    hip = inp.hip
-    lib_dirs = inp.lib_dirs
-    mac = inp.mac
-    md = inp.md
-    named = inp.named
-    pack = inp.pack
-    plan = inp.plan
-    port = inp.port
-    ram = inp.ram
-    tag = inp.tag
-    ROOT = lib.ROOT
-    dsv41_config_env = lib.dsv41_config_env
-    dsv41_prefill_chunk_args = lib.dsv41_prefill_chunk_args
-    dsv41_vision_reserve_args = lib.dsv41_vision_reserve_args
-    home = lib.home
-    # ---- the moved lines (unchanged)
-    # --dspark auto, never off: "off" still LOADS the drafter, and its 7 GB of experts take the graphics memory (found 2026-10-23);
-    # auto keeps it unloaded when the experts are far larger than the card.  The RAM store sizes itself (--ssd-cache auto is the
-    # engine's default), and <pack>/expert-profile.bin is read from the pack folder without a flag.  The layer-major chunked prompt
-    # is the engine's own default (1024 on a single card whose cards hold most of the experts; its own choice for several); on a
-    # unified-memory APU the chunk is written out instead (dsv41_prefill_chunk_args: 8,192 reads 11-15% faster there).
-    # --dspark-conf 0.65: the drafts' confidence floor (H100 replay, DSPARK-DEFAULTS.md: within 0.01-0.02 of the per-class best,
-    # never below 0.3).  The engine has no flag for the draft block (3 in the same table): it reads the block size from the pack,
-    # so only the floor is written.
-    # A Mac (0.2.7.1): the drafter is not loaded at all (--dspark none). It was exact there but not faster (15.1 and 11.0 tokens/s against 15.3
-    # without it on the M5 Max), and the engine's "auto" would load it on a 128 GB Mac: its 7 GB of experts take memory the trunk's experts need.
-    args = ["--pack", str(pack), "--max-context", str(ctx), "--eos", "1", "--vision", ds_vision, "--dspark", "none" if mac else "auto",
-            *(["--dspark-conf", "0.65"] if md.get("recipe") in ("ista", "coder") and not mac else []), *dsv41_prefill_chunk_args(cards, ram),
-            *plan["args"], *dsv41_vision_reserve_args(ds_vision, mac, plan)]
-    env = dsv41_config_env(cards)
-    cfg = {"exe": str(exe), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
-           "model_name": fam["name"], "arch": fam["arch"], "log": str(home() / f"strata-{tag.lower()}.log"),
-           "lib_dirs": lib_dirs, "port": port, "engine_ready_s": 3600,      # 300+ GB read from the files: a slow disk needs its time
-           **({"env": env} if env else {})}
-    if cuda_tk == 12:
-        cfg["cuda"] = 12
-    if hip:
-        cfg["backend"] = "hip"
-    if mac:
-        cfg["backend"] = "metal"
-    idx = [c["index"] for c in cards]
-    if len(idx) > 1 or a.gpu is not None or a.gpus:      # (a.gpu is also setup's own pick: one card pinned when several devices are in the PC)
-        cfg["gpu"] = idx if len(idx) > 1 else idx[0]
-        cfg["gpus_asked"] = True
-        if hip:                                          # who chose them (strata_control/gpu_pick.py): the person, or setup itself
-            cfg["gpus_by"] = "person" if named else "setup"
-    if a.host:
-        cfg["host"] = a.host
-    if a.api_key:
-        cfg["api_key"] = a.api_key
-    if a.browser is not None:
-        cfg["open_browser"] = a.browser
-    cfg_path = home() / f"strata-{tag.lower()}.json"
-    return Dsv41Config(cfg=cfg, cfg_path=cfg_path)

@@ -20,11 +20,11 @@ or AMD, name a model, run `docker compose up -d`, and it downloads, checks, pack
 ## Docker Compose
 
 Images are published for NVIDIA (`cuda`: RTX 30, 40 and 50) and AMD (`rocm`: RX 7000 and 9000). Each release is
-also tagged with its version, such as `0.2.13-1-cuda`, for pinning.
+also tagged with its version, such as `0.2.17-1-cuda`, for pinning.
 
 The [patches](patches/README.md) are optional performance fixes, which the aim is to get into upstream Strata. The
 default images don't include them; only the `-patched` images do: `cuda-patched` and `rocm-patched` (pinned:
-`0.2.13-1-cuda-patched`).
+`0.2.17-1-cuda-patched`).
 
 `docker-compose.yml`:
 
@@ -175,6 +175,76 @@ Use the same `-CudaArchitectures` values as the Docker build. The result is `bui
 To run it, copy `example.env` to `.env` in that folder, edit it, and run `start.bat`. The models, logs and config go
 into that folder, and the server only listens on this PC (`127.0.0.1`). Set `MODELS_DIR` to keep the models somewhere
 else, and `HOST=0.0.0.0` with an `API_KEY` to open it to your network.
+
+## Generating the settings for your machine
+
+`configure.py` prints a base set of settings for the GPUs and RAM it finds, with upstream setup's rules: every
+variable already set, ready to paste into `.env` or any environment. Run it on the host, before the first start (it
+needs only Python 3.11+, nothing to install):
+
+```sh
+python3 configure.py                     # print the settings
+python3 configure.py --output .env       # and write them to .env (--force replaces an existing one)
+python3 configure.py --gpus 0,1 --vision cpu --context 256k
+```
+
+It first measures the VRAM each card already uses (the desktop, other programs), before anything is loaded, and
+prints what it found: each GPU with its idle VRAM and PCIe link (e.g. `PCIe 4.0 x8 (card: 4.0 x16)` for a card in a
+slot narrower than it), and the RAM with how much of it is available. It sets the reserve and the context from it. With several cards it sets `GPUS`, `CONFIG_LAYER_SPLIT=auto` and
+`STRATA_STAGE_TRIM=1`; it turns on KV streaming and the RAM budget of Unsloth's experts where the RAM calls for
+them. A running strata engine's VRAM is left out of the measurement on NVIDIA; on AMD, stop it first.
+
+With Docker and no config yet, run it in a throwaway container instead, from any folder: the script is downloaded
+from this repository and piped in. It only reads: nothing is loaded or started.
+
+```sh
+# NVIDIA
+curl -fsSL https://raw.githubusercontent.com/LegendaryFire/strata-slim/main/configure.py |
+  docker run --rm -i --gpus all --entrypoint python ghcr.io/legendaryfire/strata-slim:cuda -
+
+# AMD
+curl -fsSL https://raw.githubusercontent.com/LegendaryFire/strata-slim/main/configure.py |
+  docker run --rm -i --device /dev/kfd --device /dev/dri --entrypoint python ghcr.io/legendaryfire/strata-slim:rocm -
+```
+
+Options go after the `-` (`- --help` lists them). The settings go to stdout and the report to stderr, so `> .env` at
+the end saves only the settings. For example, Unsloth's `UD-Q2_0` with pictures read on the CPU, saved to `.env`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/LegendaryFire/strata-slim/main/configure.py |
+  docker run --rm -i --gpus all --entrypoint python ghcr.io/legendaryfire/strata-slim:cuda - --quant UD-Q2_0 --vision cpu > .env
+```
+
+With a server already running, run it in that container instead, so its own VRAM is not counted as used:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/LegendaryFire/strata-slim/main/configure.py |
+  docker exec -i strata-slim python -
+```
+
+`--quant` picks the model; its repository follows from it. The default is ISTA-DASLab's `Q2_0`.
+
+| Who made it | Quant | Size |
+|---|---|---|
+| ISTA-DASLab | `Q2_0` | 66.4 GB |
+| ISTA-DASLab | `IQ2_XS` | 68.0 GB |
+| ISTA-DASLab | `IQ3_XXS` | 75.8 GB |
+| ISTA-DASLab | `IQ3_S` | 83.6 GB |
+| Unsloth | `UD-IQ1_M` | 68.0 GB |
+| Unsloth | `UD-Q2_0` | 70.5 GB |
+| Unsloth | `UD-IQ2_XS` | 75.8 GB |
+| Unsloth | `UD-Q2_K_XL` | 79.6 GB |
+| Unsloth | `UD-IQ3_XXS` | 83.6 GB |
+| Unsloth | `UD-Q3_K_XL` | 89.5 GB |
+| Unsloth | `UD-IQ4_XS` | 93.7 GB |
+| Unsloth | `UD-Q4_K_XL` | 111.3 GB |
+| Unsloth | `UD-Q5_K_XL` | 158.3 GB |
+| Unsloth | `UD-Q6_K_XL` | 169.2 GB |
+| Unsloth | `Q8_0` | 188.2 GB |
+| AgentionAI | `Gyro-S-TQ1_0` | 58.5 GB |
+| AgentionAI | `Gyro-M-TQ2_0` | 92.0 GB |
+
+The size is the download; the pack built from it needs about as much disk again.
 
 ## Common settings
 

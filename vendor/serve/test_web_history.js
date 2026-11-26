@@ -47,6 +47,73 @@ const cases = {
     assert.equal(clean[1].text, "a1", "the text stays");
     assert.deepEqual(convo()[0].files, [{kind: "file", name: "n.txt", text: "notes"}], "a copy: the screen keeps its contents");
   },
+  clean_keeps_a_thumbnail_next_to_the_name() {
+    const withThumb = convo();
+    withThumb[0].images[0].thumb = "data:image/jpeg;base64,Kw==";
+    const clean = H.cleanMessages(withThumb);
+    assert.deepEqual(clean[0].images, [{name: "a.png", thumb: "data:image/jpeg;base64,Kw=="}], "the preview rides along, not the original");
+    assert.ok(!JSON.stringify(clean).includes("data:image/png"), "the full data URL is still dropped");
+    assert.deepEqual(H.cleanMessages(convo())[0].images, [{name: "a.png"}], "a record saved before thumbnails still cleans to the name alone");
+  },
+  import_parses_a_saved_export_back() {
+    // the shape the composer's "Save this chat as Markdown" writes (app.js): `## You` then `## <model>`,
+    // thinking and tool calls as <details> blocks
+    const md = "## You\n\nwhat is two plus two?\n\n## Qwen-Flash-Next\n\n" +
+      "<details><summary>Thinking</summary>\n\nsecret thoughts\n\n</details>\n\n" +
+      "<details><summary>Tool fs / read (error)</summary>\n\n```json\n{}\n```\n\n```\nboom\n```\n\n</details>\n\nIt is 4.\n";
+    const c = H.parseChatMarkdown(md, 5000, 0.5);
+    assert.equal(c.messages.length, 2);
+    assert.equal(c.messages[0].role, "user"); assert.equal(c.messages[0].text, "what is two plus two?");
+    assert.equal(c.messages[1].role, "assistant"); assert.equal(c.messages[1].text, "It is 4.");
+    assert.ok(!JSON.stringify(c.messages).includes("secret thoughts"), "thinking is dropped, as the store would");
+    assert.equal(c.time, 5000, "no timestamps in the file: the time it came back");
+    assert.ok(c.id && typeof c.id === "string", "a real chat record");
+  },
+  import_is_faithful_and_picky() {
+    assert.equal(H.parseChatMarkdown(""), null, "empty");
+    assert.equal(H.parseChatMarkdown("just some text, no turns"), null);
+    assert.equal(H.parseChatMarkdown(null), null);
+    // any '## ' line starts a turn (stated limitation): a question with its own '## ' line is read as a turn of its own
+    const quoted = H.parseChatMarkdown("## You\n\nmy notes:\n\n## heading inside the question\n\nmore text\n");
+    assert.deepEqual(quoted.messages.map((m) => m.role), ["user", "assistant"], "a '## ' line starts a turn");
+    // a '## You' in an answer's text is read as a new turn: known shape, the export never writes it there
+    const two = H.parseChatMarkdown("## You\n\nq\n\n## Model\n\npartial\n\n## You\n\na\n");
+    assert.deepEqual(two.messages.map((m) => m.role), ["user", "assistant", "user"]);
+    // blank turns are skipped
+    const blank = H.parseChatMarkdown("## You\n\n\n\n## Model\n\nanswer\n");
+    assert.deepEqual(blank.messages.map((m) => m.role), ["assistant"]);
+  },
+  import_keeps_code_and_sections_inside_a_turn() {
+    // a fenced block is code: C's '##' token paste and a quoted outline are not turns
+    const fenced = H.parseChatMarkdown("## You\n\nsee this:\n\n```c\n#define PASTE(a, b) a ## b\n```\n\n## Model\n\n```md\n## Summary\n```\n\ndone\n");
+    assert.deepEqual(fenced.messages.map((m) => m.role), ["user", "assistant"]);
+    assert.ok(fenced.messages[0].text.includes("a ## b"), "the fence stays in the question");
+    assert.deepEqual(fenced.messages[1].text.split("\n")[0], "```md", "the answer's fenced heading stays in the answer");
+    assert.ok(fenced.messages[1].text.endsWith("done"));
+    // an outline in the answer is the answer's text, not turns: the answer heading is the name the file repeats
+    const md = "## You\n\nq1\n\n## Model\n\n## Summary\n\nfast\n\n## Risks\n\nnone\n\n## You\n\nq2\n\n## Model\n\nok\n";
+    const c = H.parseChatMarkdown(md, 7, 0.5);
+    assert.deepEqual(c.messages.map((m) => m.role), ["user", "assistant", "user", "assistant"]);
+    assert.equal(c.messages[1].text, "## Summary\n\nfast\n\n## Risks\n\nnone", "sections stay whole");
+    // one question whose own headings tie with the model's name (read the first), the text is still all there
+    const tie = H.parseChatMarkdown("## You\n\ncompare:\n## A\nfast\n## B\nsafe\n\n## Model\n\nA is faster.\n");
+    const all = tie.messages.map((m) => m.text).join("\n");
+    for (const part of ["compare:", "fast", "safe", "A is faster."]) assert.ok(all.includes(part), `kept: ${part}`);
+  },
+  import_keeps_details_that_are_not_the_export() {
+    // the export writes thinking and tool calls as <details> blocks; those are dropped because the store keeps none of
+    // it. A <details> a message wrote itself is content: an HTML sample in a fenced block, an answer explaining the tag.
+    const sample = "## You\n\nhow do I fold this?\n\n## Model\n\nLike this:\n\n```html\n<details><summary>More</summary>\n\nhidden\n\n</details>\n```\n\nDone.\n";
+    const a = H.parseChatMarkdown(sample, 1, 0.5);
+    assert.ok(a.messages[1].text.includes("<details><summary>More</summary>"), "the answer's own HTML sample stays");
+    const own = "## You\n\nq\n\n## Model\n\n<details><summary>Notes</summary>\n\nkeep me\n\n</details>\n\ndone\n";
+    const b = H.parseChatMarkdown(own, 1, 0.5);
+    assert.ok(b.messages[1].text.includes("keep me"), "an answer's own details block stays");
+    // and the export's own blocks are still dropped, even with thinking that mentions the tag
+    const exportrd = "## You\n\nq\n\n## Model\n\n<details><summary>Thinking</summary>\n\nuse <details> here\n\n</details>\n\nanswer\n";
+    const c = H.parseChatMarkdown(exportrd, 1, 0.5);
+    assert.equal(c.messages[1].text, "answer", "thinking is still dropped");
+  },
   rewind_a_question() {
     const m = convo();
     const plan = H.rewind(m, 2);
@@ -211,6 +278,90 @@ Object.assign(cases, {
     const a = mk({abort: "DataError"}, {c0: chat("c0")});
     await a.store.start();
     assert.deepEqual(await a.store.all(), [], "no hang, no records");
+  },
+});
+
+// #5998 review: the preview never holds the picture back and never breaks the attachment; a stored preview is checked.
+const JPEG = "data:image/jpeg;base64,/9j/AAAA";
+/** A fake page Image and canvas: `img` says how the picture decodes, `canvas` how drawing and export go. */
+function thumbDeps({img = "load", w = 4000, h = 3000, ctx = "ok", out = JPEG} = {}) {
+  const made = {canvas: null};
+  return {
+    made,
+    makeImage: () => {
+      const im = {naturalWidth: w, naturalHeight: h, onload: null, onerror: null};
+      Object.defineProperty(im, "src", {set() { if (img === "load") setTimeout(() => im.onload(), 1); else if (img === "error") setTimeout(() => im.onerror(), 1); else if (img === "throw") throw new Error("bad src"); }});
+      return im;
+    },
+    makeCanvas: () => {
+      const c = {width: 0, height: 0,
+        getContext: () => { if (ctx === "throw") throw new Error("no 2d"); return ctx === "null" ? null : {drawImage() { if (ctx === "drawthrow") throw new Error("tainted"); }}; },
+        toDataURL: () => { if (out === "throw") throw new Error("SecurityError"); return out; }};
+      made.canvas = c;
+      return c;
+    },
+  };
+}
+Object.assign(cases, {
+  async thumb_is_made_small_and_as_jpeg() {
+    const d = thumbDeps();
+    assert.equal(await H.makeThumb("data:image/png;base64,AAA", d), JPEG);
+    assert.deepEqual([d.made.canvas.width, d.made.canvas.height], [480, 360], "long side 480");
+    const small = thumbDeps({w: 100, h: 50});
+    await H.makeThumb("x", small);
+    assert.deepEqual([small.made.canvas.width, small.made.canvas.height], [100, 50], "never enlarged");
+  },
+  async thumb_failures_give_no_preview_and_never_reject() {
+    for (const [what, opts] of [["decode error", {img: "error"}], ["src throws", {img: "throw"}], ["no 2D context", {ctx: "null"}],
+                                ["getContext throws", {ctx: "throw"}], ["draw throws", {ctx: "drawthrow"}], ["export throws", {out: "throw"}],
+                                ["export is not a JPEG", {out: "data:image/png;base64,AAAA"}], ["export too big", {out: "data:image/jpeg;base64," + "A".repeat(H.THUMB_MAX_CHARS)}],
+                                ["no size", {w: 0, h: 0}]]) {
+      assert.equal(await H.makeThumb("data:image/png;base64,AAA", thumbDeps(opts)), null, what);
+    }
+    const t0 = Date.now();
+    assert.equal(await H.makeThumb("x", thumbDeps({img: "never"}), 50), null, "a picture that never loads gives up");
+    assert.ok(Date.now() - t0 < 2000);
+  },
+  stored_previews_are_checked() {
+    const m = (thumb) => [user("q", {images: [{name: "a.png", url: "data:image/png;base64,AAA", thumb}]})];
+    assert.deepEqual(H.cleanMessages(m(JPEG))[0].images, [{name: "a.png", thumb: JPEG}]);
+    for (const bad of ["javascript:alert(1)", "data:image/png;base64,AAAA", "data:image/svg+xml;base64,PHN2Zz4=", "data:image/jpeg;base64,<b>", 42, null,
+                       "data:image/jpeg;base64," + "A".repeat(H.THUMB_MAX_CHARS)]) {
+      assert.deepEqual(H.cleanMessages(m(bad))[0].images, [{name: "a.png"}], String(bad).slice(0, 40));
+    }
+  },
+  // #5508: Stop stays a plain stop; a reply it left with thinking and no answer can be finished on request, once
+  finish_from_thinking_only_where_stop_left_no_answer() {
+    const stopped = () => bot("", {reasoning: "2 + 2 is 4", stopped: true});
+    const ok = [user("q"), stopped()];
+    assert.equal(H.canFinishFromThinking(ok, ok[1]), true, "a stopped reply with thinking and no answer");
+    assert.equal(H.canFinishFromThinking(ok, ok[1], true), false, "not while something runs");
+    for (const [extra, why] of [[{text: "partial"}, "it has answer text"], [{reasoning: ""}, "it has no thinking"], [{stopped: false}, "it was not stopped"],
+                                [{interrupted: true}, "an interjection cut it"], [{error: "x"}, "it failed"], [{tools: [tool]}, "it called tools"],
+                                [{fromThinking: true}, "it was finished this way already"]]) {
+      const m = [user("q"), {...stopped(), ...extra}];
+      assert.equal(H.canFinishFromThinking(m, m[1]), false, why);
+    }
+    const older = [user("q"), stopped(), user("q2"), bot("a2")];
+    assert.equal(H.canFinishFromThinking(older, older[1]), false, "only the last reply");
+    const turn = H.finishTurn("I worked out that 2 + 2 is 4");
+    assert.equal(turn.role, "user");
+    assert.match(turn.content, /I worked out that 2 \+ 2 is 4/);
+    assert.match(turn.content, /Do not reason again\.$/);
+    const long = H.finishTurn("a".repeat(H.FINISH_CHARS) + "THE END");
+    assert.ok(long.content.includes("THE END") && long.content.includes("…"), "a long thinking keeps its end");
+    assert.ok(long.content.length < H.FINISH_CHARS + 400, "and no more than FINISH_CHARS of it");
+    const app = require("node:fs").readFileSync(path.join(__dirname, "web", "app.js"), "utf8");
+    assert.match(app, /\$\("stop-btn"\)\.onclick = \(\) => \{ if \(busy\) busy\.controller\.abort\(\); \};/, "Stop only aborts: no request of its own");
+    assert.match(app, /reasoning_effort: finishing \? "none" : settings\.thinking/, "the finishing request has thinking off");
+  },
+  the_composer_attaches_first_and_adds_the_preview_later() {
+    const app = require("node:fs").readFileSync(path.join(__dirname, "web", "app.js"), "utf8");
+    const onload = app.slice(app.indexOf("r.onload = () => {\n        const url = r.result;"), app.indexOf("r.readAsDataURL(f);"));
+    assert.ok(onload.length > 0, "the picture reader's onload");
+    assert.ok(onload.indexOf("attachments.push(entry)") < onload.indexOf("StrataHistory.makeThumb(url, thumbDeps)"), "attached before the preview");
+    assert.doesNotMatch(onload, /await/, "nothing waits for the preview");
+    assert.match(app, /const shownSrc = im\.url \|\| \(StrataHistory\.validThumb\(im\.thumb\) \? im\.thumb : ""\);/);
   },
 });
 

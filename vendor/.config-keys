@@ -19,6 +19,7 @@ command
 cors_origins
 cwd
 diffusion_model
+draft_costs
 drafting
 effort_position
 elastic
@@ -59,6 +60,7 @@ model
 model_name
 native
 need_mib
+noise
 open_browser
 out_dir
 parallel
@@ -91,13 +93,14 @@ threads
 timeout_s
 tokenizer
 tool_call_recovery
+tool_markup_retry
 trusted_origins
 type
 uma
 undeclared_tool_calls
 url
-user_args
 vae
+vae_decoder
 vision
 vram_elastic
 vram_segment_mib
